@@ -549,6 +549,7 @@ public:
         gStereoMode.store(stereoMode);
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
+        seekCallback_ = env_->GetMethodID(cls, "onNativeSeekGesture", "(IFF)V");
         env_->DeleteLocalRef(cls);
     }
 
@@ -566,6 +567,7 @@ private:
     JNIEnv* env_;
     jobject activity_;
     jmethodID frameCallback_ = nullptr;
+    jmethodID seekCallback_ = nullptr;
     EglState egl_;
     JavaVideoSurface videoSurface_;
     XrInstance instance_ = XR_NULL_HANDLE;
@@ -604,6 +606,9 @@ private:
     XrTime lastPointerCallback_ = 0;
     XrTime lastScrollCallback_ = 0;
     float lastScrollValue_ = 0.0f;
+    int horizontalSeekDirection_ = 0;
+    XrTime horizontalSeekStarted_ = 0;
+    XrTime lastHorizontalSeekCallback_ = 0;
     int draggingHand_ = -1;
     float dragYawOffset_ = 0.0f;
     float dragPitchOffset_ = 0.0f;
@@ -1182,6 +1187,60 @@ private:
         env_->DeleteLocalRef(cls);
     }
 
+    void notifySeek(int direction, float u, float v) {
+        if (seekCallback_) {
+            env_->CallVoidMethod(
+                activity_,
+                seekCallback_,
+                static_cast<jint>(direction),
+                static_cast<jfloat>(u),
+                static_cast<jfloat>(v));
+        }
+    }
+
+    void resetHorizontalSeek() {
+        horizontalSeekDirection_ = 0;
+        horizontalSeekStarted_ = 0;
+        lastHorizontalSeekCallback_ = 0;
+    }
+
+    bool updateHorizontalSeek(
+        const XrVector2f& stick,
+        float u,
+        float v,
+        XrTime displayTime) {
+        const float horizontal = stick.x;
+        const float vertical = stick.y;
+        const bool deliberatelyHorizontal =
+            std::abs(horizontal) >= 0.72f &&
+            std::abs(horizontal) > std::abs(vertical) * 1.35f;
+        const int direction = deliberatelyHorizontal ? (horizontal > 0.0f ? 1 : -1) : 0;
+
+        if (direction == 0) {
+            if (std::abs(horizontal) <= 0.35f) resetHorizontalSeek();
+            return horizontalSeekDirection_ != 0;
+        }
+
+        if (direction != horizontalSeekDirection_) {
+            horizontalSeekDirection_ = direction;
+            horizontalSeekStarted_ = displayTime;
+            lastHorizontalSeekCallback_ = displayTime;
+            notifySeek(direction, u, v);
+            return true;
+        }
+
+        constexpr XrDuration kInitialRepeatDelay = 650'000'000;
+        constexpr XrDuration kRepeatInterval = 300'000'000;
+        if (
+            displayTime - horizontalSeekStarted_ >= kInitialRepeatDelay &&
+            displayTime - lastHorizontalSeekCallback_ >= kRepeatInterval
+        ) {
+            lastHorizontalSeekCallback_ = displayTime;
+            notifySeek(direction, u, v);
+        }
+        return true;
+    }
+
     void notifyFrame(XrTime displayTime) {
         if (frameCallback_) {
             env_->CallVoidMethod(activity_, frameCallback_, static_cast<jlong>(displayTime));
@@ -1262,6 +1321,7 @@ private:
             const Vec3 direction = normalized(rotateVector(location.pose.orientation, {0, 0, -1}));
 
             if (!gMenuInteractive.load() && draggingHand_ == hand && isDown) {
+                resetHorizontalSeek();
                 Vec3 target{};
                 if (!intersectRayWithSphere(origin, direction, dragRadius_, &target)) continue;
                 const float targetYaw = std::atan2(target.x, -target.z);
@@ -1346,6 +1406,21 @@ private:
                     &u,
                     &v);
             }
+            if (inside) {
+                get.action = thumbstickAction_;
+                XrActionStateVector2f stick{XR_TYPE_ACTION_STATE_VECTOR2F};
+                xrGetActionStateVector2f(session_, &get, &stick);
+                if (
+                    stick.isActive &&
+                    updateHorizontalSeek(stick.currentState, u, v, displayTime)
+                ) {
+                    pointerVisible_ = true;
+                    pointerOrigin_ = origin;
+                    pointerHit_ = hit;
+                    return;
+                }
+                if (!stick.isActive) resetHorizontalSeek();
+            }
             if (gMenuInteractive.load()) {
                 if (menuPointerHand_ == hand && isDown) {
                     lastMenuPointerU_ = u;
@@ -1414,6 +1489,7 @@ private:
                 }
             }
         }
+        resetHorizontalSeek();
     }
 
     void renderFrame() {

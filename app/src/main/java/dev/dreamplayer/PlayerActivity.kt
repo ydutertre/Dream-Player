@@ -592,6 +592,44 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
+    @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativeSeekGesture(direction: Int, u: Float, v: Float) {
+        runOnUiThread {
+            if (
+                direction == 0 ||
+                !mediaLoaded ||
+                !::player.isInitialized ||
+                uiScreen != UiScreen.PLAYBACK
+            ) {
+                return@runOnUiThread
+            }
+            val px = u * UI_WIDTH
+            val py = v * UI_HEIGHT
+            if (uiVisible) {
+                val overToolbar = PLAYBACK_TOOLBAR_BOUNDS.contains(px, py)
+                val overPopover = playbackPopoverBounds(playbackPopover)?.contains(px, py) == true
+                val overControl = uiButtons.any { it.bounds.contains(px, py) }
+                if (overToolbar || overPopover || overControl) return@runOnUiThread
+            }
+
+            val oldPosition = player.currentPosition.coerceAtLeast(0L)
+            val maximum = player.duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+            val newPosition = if (direction < 0) {
+                (oldPosition - JOYSTICK_SEEK_STEP_MS).coerceAtLeast(0L)
+            } else {
+                (oldPosition + JOYSTICK_SEEK_STEP_MS).coerceAtMost(maximum)
+            }
+            if (newPosition == oldPosition) return@runOnUiThread
+            player.seekTo(newPosition)
+            playbackCompleted = false
+            showOsd(
+                "${if (direction < 0) "−10 seconds" else "+10 seconds"}  •  " +
+                    formatTime(newPosition),
+                1_500L,
+            )
+        }
+    }
+
     @Suppress("unused") // Called once per OpenXR display frame from the render thread.
     fun onNativeFrame(frameTimeNanos: Long) {
         latestBrowserFrameNanos = frameTimeNanos
@@ -4852,6 +4890,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
     companion object {
         private const val REQUEST_VIDEO = 4001
+        private const val JOYSTICK_SEEK_STEP_MS = 10_000L
         private const val REQUEST_MEDIA_PERMISSION = 4002
         private const val RECENT_MEDIA_LIMIT = 6
         private const val BROWSER_VISIBLE_ROWS = 7
