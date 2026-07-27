@@ -48,7 +48,7 @@ std::atomic<float> gHlgSystemGamma{0.8459066f};
 std::atomic<float> gHdrSourcePeakNits{1000.0f};
 std::atomic<float> gHdrMaxFallNits{0.0f};
 // 0 = legacy hard clip, 1 = luminance/hue-direction preserving compression.
-std::atomic<int> gGamutMappingMode{1};
+std::atomic<int> gGamutMappingMode{0};
 std::atomic<float> gSceneBrightness{0.5f};
 std::atomic<bool> gSwapEyes{false};
 std::atomic<float> gScreenX{0.0f};

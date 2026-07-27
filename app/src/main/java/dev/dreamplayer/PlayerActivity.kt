@@ -78,7 +78,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var detectedHdrStaticMetadata = HdrStaticMetadata.NONE
     private var hdrMetadataMode = HdrMetadataMode.AUTO
     private var hdrManualPeakNits = DEFAULT_HDR_SOURCE_PEAK_NITS
-    private var gamutMappingMode = GamutMappingMode.PERCEPTUAL
+    private var gamutMappingMode = GamutMappingMode.CLIP
     private var currentMediaHasSavedPictureSettings = false
     private var hdrDefaultExposureApplied = false
     private var audioSyncMs = 0
@@ -326,7 +326,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
         companion object {
             fun fromWire(value: Int): GamutMappingMode =
-                entries.firstOrNull { it.wireValue == value } ?: PERCEPTUAL
+                entries.firstOrNull { it.wireValue == value } ?: CLIP
         }
     }
 
@@ -398,7 +398,7 @@ class PlayerActivity : Activity(), Player.Listener {
         gamutMappingMode = GamutMappingMode.fromWire(
             picturePreferences.getInt(
                 PREF_GAMUT_MAPPING_MODE,
-                GamutMappingMode.PERCEPTUAL.wireValue,
+                GamutMappingMode.CLIP.wireValue,
             )
         )
         loadCinemaTunings(picturePreferences)
@@ -3714,7 +3714,7 @@ class PlayerActivity : Activity(), Player.Listener {
                         pictureSaturation != DEFAULT_PICTURE_SATURATION ||
                         pictureVibrance != DEFAULT_PICTURE_VIBRANCE ||
                         hdrMetadataMode != HdrMetadataMode.AUTO ||
-                        gamutMappingMode != GamutMappingMode.PERCEPTUAL ||
+                        gamutMappingMode != GamutMappingMode.CLIP ||
                         decoderMode != DecoderMode.AUTO,
                 )
 
