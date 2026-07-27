@@ -2726,6 +2726,7 @@ class PlayerActivity : Activity(), Player.Listener {
             maximum: Float,
             y: Float,
             logarithmic: Boolean = false,
+            valueLabelX: Float = 1768f,
         ) {
             val bounds = RectF(
                 SETTINGS_SLIDER_LEFT,
@@ -2742,7 +2743,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 ((value - minimum) / (maximum - minimum)).coerceIn(0f, 1f)
             }
             text(label, 975f, y + 9f, 24f, Paint.Align.LEFT)
-            text(valueLabel, 1768f, y + 9f, 22f, Paint.Align.RIGHT, colorTextMuted)
+            text(valueLabel, valueLabelX, y + 9f, 22f, Paint.Align.RIGHT, colorTextMuted)
             canvas.drawRoundRect(
                 SETTINGS_SLIDER_LEFT, y - 5f, SETTINGS_SLIDER_RIGHT, y + 5f,
                 5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorOutline },
@@ -4092,28 +4093,25 @@ class PlayerActivity : Activity(), Player.Listener {
                                 HDR_SOURCE_PEAK_NITS_MAX,
                                 325f,
                                 logarithmic = true,
+                                valueLabelX = 1800f,
                             )
                         }
-                        text("BT.2020 gamut mapping", 975f, 420f, 24f, Paint.Align.LEFT)
+                        text("BT.2020 gamut mapping", 975f, 370f, 24f, Paint.Align.LEFT)
                         button(
                             "gamut_mapping_perceptual", "Perceptual",
-                            RectF(1200f, 385f, 1520f, 445f),
+                            RectF(1200f, 390f, 1520f, 450f),
                             gamutMappingMode == GamutMappingMode.PERCEPTUAL,
                             fontSize = 21f,
                         )
                         button(
                             "gamut_mapping_clip", "Clip",
-                            RectF(1530f, 385f, 1860f, 445f),
+                            RectF(1530f, 390f, 1860f, 450f),
                             gamutMappingMode == GamutMappingMode.CLIP,
                             fontSize = 21f,
                         )
                         text(
                             "Perceptual preserves luminance and color direction near the BT.709 boundary.",
                             975f, 495f, 20f, Paint.Align.LEFT, colorTextMuted,
-                        )
-                        text(
-                            "Clip reproduces the previous hard-clamped output for comparison.",
-                            975f, 530f, 20f, Paint.Align.LEFT, colorTextMuted,
                         )
                         button(
                             "color_pipeline_back", "Back",
