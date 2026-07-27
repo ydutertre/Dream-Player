@@ -1,5 +1,14 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
+}
+
+val releaseSigningPropertiesFile = rootProject.file("release-signing/keystore.properties")
+val releaseSigningProperties = Properties().apply {
+    if (releaseSigningPropertiesFile.exists()) {
+        releaseSigningPropertiesFile.inputStream().use(::load)
+    }
 }
 
 android {
@@ -10,8 +19,8 @@ android {
         applicationId = "dev.dreamplayer"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.0-beta.1"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -28,6 +37,26 @@ android {
     buildFeatures {
         prefab = true
         buildConfig = true
+    }
+
+    signingConfigs {
+        if (releaseSigningPropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(releaseSigningProperties.getProperty("storeFile"))
+                storePassword = releaseSigningProperties.getProperty("storePassword")
+                keyAlias = releaseSigningProperties.getProperty("keyAlias")
+                keyPassword = releaseSigningProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            if (releaseSigningPropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+            isMinifyEnabled = false
+        }
     }
 
     compileOptions {
