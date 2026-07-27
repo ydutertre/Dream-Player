@@ -544,8 +544,10 @@ struct Swapchain {
 
 class Renderer {
 public:
-    Renderer(JNIEnv* env, jobject activity, int stereoMode)
-        : env_(env), activity_(activity) {
+    Renderer(JNIEnv* env, jobject activity, int stereoMode, float renderResolutionScale)
+        : env_(env),
+          activity_(activity),
+          renderResolutionScale_(std::clamp(renderResolutionScale, 1.0f, 2.0f)) {
         gStereoMode.store(stereoMode);
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
@@ -568,6 +570,7 @@ private:
     jobject activity_;
     jmethodID frameCallback_ = nullptr;
     jmethodID seekCallback_ = nullptr;
+    float renderResolutionScale_ = 1.0f;
     EglState egl_;
     JavaVideoSurface videoSurface_;
     XrInstance instance_ = XR_NULL_HANDLE;
@@ -788,10 +791,39 @@ private:
              format == GL_SRGB8_ALPHA8 ? " (GL_SRGB8_ALPHA8)" :
              format == GL_RGBA8 ? " (GL_RGBA8)" : "");
         swapchains_.resize(viewConfigs_.size());
+        float effectiveScale = renderResolutionScale_;
+        for (const auto& viewConfig : viewConfigs_) {
+            const float maximumWidthScale =
+                    static_cast<float>(viewConfig.maxImageRectWidth) /
+                    static_cast<float>(viewConfig.recommendedImageRectWidth);
+            const float maximumHeightScale =
+                    static_cast<float>(viewConfig.maxImageRectHeight) /
+                    static_cast<float>(viewConfig.recommendedImageRectHeight);
+            effectiveScale = std::min(
+                    effectiveScale,
+                    std::min(maximumWidthScale, maximumHeightScale));
+        }
+        effectiveScale = std::max(1.0f, effectiveScale);
+        LOGI("OpenXR render resolution scale requested=%.2f effective=%.2f",
+             renderResolutionScale_, effectiveScale);
         for (size_t i = 0; i < swapchains_.size(); ++i) {
             auto& chain = swapchains_[i];
-            chain.width = static_cast<int32_t>(viewConfigs_[i].recommendedImageRectWidth);
-            chain.height = static_cast<int32_t>(viewConfigs_[i].recommendedImageRectHeight);
+            chain.width = std::min(
+                    static_cast<int32_t>(viewConfigs_[i].maxImageRectWidth),
+                    static_cast<int32_t>(std::lround(
+                            static_cast<float>(viewConfigs_[i].recommendedImageRectWidth) *
+                            effectiveScale)));
+            chain.height = std::min(
+                    static_cast<int32_t>(viewConfigs_[i].maxImageRectHeight),
+                    static_cast<int32_t>(std::lround(
+                            static_cast<float>(viewConfigs_[i].recommendedImageRectHeight) *
+                            effectiveScale)));
+            LOGI("OpenXR view %zu swapchain %dx%d (recommended=%ux%u, maximum=%ux%u)",
+                 i, chain.width, chain.height,
+                 viewConfigs_[i].recommendedImageRectWidth,
+                 viewConfigs_[i].recommendedImageRectHeight,
+                 viewConfigs_[i].maxImageRectWidth,
+                 viewConfigs_[i].maxImageRectHeight);
             XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
             info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
             info.format = format;
@@ -1852,10 +1884,15 @@ private:
 } // namespace
 
 extern "C" JNIEXPORT void JNICALL
-Java_dev_dreamplayer_PlayerActivity_nativeRun(JNIEnv* env, jclass, jobject activity, jint stereoMode) {
+Java_dev_dreamplayer_PlayerActivity_nativeRun(
+        JNIEnv* env,
+        jclass,
+        jobject activity,
+        jint stereoMode,
+        jfloat renderResolutionScale) {
     gStop.store(false);
     try {
-        Renderer renderer(env, activity, stereoMode);
+        Renderer renderer(env, activity, stereoMode, renderResolutionScale);
         renderer.run();
     } catch (const std::exception& error) {
         LOGE("OpenXR failure: %s", error.what());

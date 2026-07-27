@@ -76,6 +76,7 @@ class PlayerActivity : Activity(), Player.Listener {
     )
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
     private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
+    private var renderResolutionScale = DEFAULT_RENDER_RESOLUTION_SCALE
     private var screenCurvature = DEFAULT_SCREEN_CURVATURE
     private var detectedVideoTransfer = VideoTransfer.SDR
     private var detectedVideoPrimaries = VideoPrimaries.BT709
@@ -267,7 +268,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private enum class PlaybackPopover {
-        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
+        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE, RENDER_QUALITY,
     }
 
     private enum class PictureMode(val wireValue: Int) {
@@ -397,6 +398,9 @@ class PlayerActivity : Activity(), Player.Listener {
             .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
             .coerceIn(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX)
         val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        renderResolutionScale = picturePreferences
+            .getFloat(PREF_RENDER_RESOLUTION_SCALE, DEFAULT_RENDER_RESOLUTION_SCALE)
+            .coerceIn(RENDER_RESOLUTION_SCALE_MIN, RENDER_RESOLUTION_SCALE_MAX)
         gamutMappingMode = GamutMappingMode.fromWire(
             picturePreferences.getInt(
                 PREF_GAMUT_MAPPING_MODE,
@@ -425,7 +429,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
         nativeThread = Thread({
             nativeStarted = true
-            nativeRun(this, spec.stereoMode.wireValue)
+            nativeRun(this, spec.stereoMode.wireValue, renderResolutionScale)
             nativeStarted = false
         }, "DreamPlayer-OpenXR").also { it.start() }
 
@@ -1957,7 +1961,8 @@ class PlayerActivity : Activity(), Player.Listener {
         PlaybackPopover.PROJECTION -> PLAYBACK_PROJECTION_POPOVER_BOUNDS
         PlaybackPopover.SETTINGS,
         PlaybackPopover.CINEMA,
-        PlaybackPopover.COLOR_PIPELINE -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
+        PlaybackPopover.COLOR_PIPELINE,
+        PlaybackPopover.RENDER_QUALITY -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
         PlaybackPopover.NONE -> null
     }
 
@@ -2201,6 +2206,16 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
+            id == "render_quality" -> {
+                playbackPopover = PlaybackPopover.RENDER_QUALITY
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "render_quality_back" -> {
+                playbackPopover = PlaybackPopover.SETTINGS
+                hoveredButton = null
+                renderVrMenu()
+            }
             id == "settings_picture" -> {
                 playbackPopover = PlaybackPopover.NONE
                 uiScreen = UiScreen.PICTURE
@@ -2393,14 +2408,38 @@ class PlayerActivity : Activity(), Player.Listener {
                                 .apply()
                         }
                     }
+                    "resolution_scale" -> {
+                        val unsnapped = lerp(
+                            RENDER_RESOLUTION_SCALE_MIN,
+                            RENDER_RESOLUTION_SCALE_MAX,
+                            fraction,
+                        )
+                        renderResolutionScale = (
+                            kotlin.math.round(unsnapped / RENDER_RESOLUTION_SCALE_STEP) *
+                                RENDER_RESOLUTION_SCALE_STEP
+                            ).coerceIn(
+                                RENDER_RESOLUTION_SCALE_MIN,
+                                RENDER_RESOLUTION_SCALE_MAX,
+                            )
+                        if (persist) {
+                            getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                                .putFloat(PREF_RENDER_RESOLUTION_SCALE, renderResolutionScale)
+                                .apply()
+                        }
+                    }
                 }
                 val cinemaSlider =
                     slider == "tone_depth" ||
                         slider == "midtones" ||
                         slider == "color_intensity"
-                val globalOnlySlider = slider == "scene" || slider == "tone_peak"
+                val globalOnlySlider =
+                    slider == "scene" ||
+                        slider == "tone_peak" ||
+                        slider == "resolution_scale"
                 if (cinemaSlider) {
                     applyCinemaSettings(persist)
+                } else if (slider == "resolution_scale") {
+                    if (persist) showOsd("Render resolution applies next time Dream Player starts")
                 } else {
                     applyPictureSettings(persist && !globalOnlySlider)
                 }
@@ -2437,6 +2476,12 @@ class PlayerActivity : Activity(), Player.Listener {
                             .putFloat(PREF_SCENE_BRIGHTNESS, sceneBrightness)
                             .apply()
                     }
+                    "resolution_scale" -> {
+                        renderResolutionScale = DEFAULT_RENDER_RESOLUTION_SCALE
+                        getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                            .putFloat(PREF_RENDER_RESOLUTION_SCALE, renderResolutionScale)
+                            .apply()
+                    }
                 }
                 if (slider == "exposure") {
                     hdrDefaultExposureApplied =
@@ -2451,6 +2496,8 @@ class PlayerActivity : Activity(), Player.Listener {
                     applyVideoColorPipeline()
                 } else if (cinemaSlider) {
                     applyCinemaSettings()
+                } else if (slider == "resolution_scale") {
+                    showOsd("Render resolution applies next time Dream Player starts")
                 } else {
                     applyPictureSettings(
                         persist = slider != "scene" && slider != "tone_peak"
@@ -3902,9 +3949,10 @@ class PlayerActivity : Activity(), Player.Listener {
                 )
                 iconButton(
                     "settings", "Settings", standardBounds(1756f),
-                    playbackPopover == PlaybackPopover.SETTINGS ||
+                        playbackPopover == PlaybackPopover.SETTINGS ||
                         playbackPopover == PlaybackPopover.CINEMA ||
                         playbackPopover == PlaybackPopover.COLOR_PIPELINE ||
+                        playbackPopover == PlaybackPopover.RENDER_QUALITY ||
                         pictureMode != PictureMode.AUTO ||
                         pictureBrightness != DEFAULT_PICTURE_BRIGHTNESS ||
                         pictureExposure != defaultExposureForCurrentColorMode() ||
@@ -4177,13 +4225,18 @@ class PlayerActivity : Activity(), Player.Listener {
                         )
                         button(
                             "cinema_tune", "Tune",
-                            RectF(1210f, 605f, 1415f, 660f),
-                            fontSize = 20f,
+                            RectF(975f, 605f, 1185f, 660f),
+                            fontSize = 19f,
                         )
                         button(
                             "color_pipeline", "HDR / gamut",
-                            RectF(1425f, 605f, 1635f, 660f),
-                            fontSize = 19f,
+                            RectF(1195f, 605f, 1405f, 660f),
+                            fontSize = 18f,
+                        )
+                        button(
+                            "render_quality", "Resolution",
+                            RectF(1415f, 605f, 1635f, 660f),
+                            fontSize = 18f,
                         )
                         button(
                             "picture_reset", "Reset sliders",
@@ -4312,6 +4365,39 @@ class PlayerActivity : Activity(), Player.Listener {
                         )
                         button(
                             "color_pipeline_back", "Back",
+                            RectF(1530f, 590f, 1860f, 650f),
+                            fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.RENDER_QUALITY -> {
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Render resolution", 1814f)
+                        text(
+                            "Supersamples both eyes before the OpenXR compositor displays them.",
+                            975f, 132f, 21f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_resolution_scale", "Resolution scale",
+                            "%.2fx".format(Locale.US, renderResolutionScale),
+                            renderResolutionScale,
+                            RENDER_RESOLUTION_SCALE_MIN,
+                            RENDER_RESOLUTION_SCALE_MAX,
+                            245f,
+                        )
+                        text(
+                            "Higher values can sharpen 4K and 3D video, subtitles, and curved screens.",
+                            975f, 345f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            "GPU work grows quickly: 1.5x uses 2.25x pixels; 2.0x uses 4x pixels.",
+                            975f, 385f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            "The OpenXR runtime may clamp the selected value. Applies after restarting the app.",
+                            975f, 425f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "render_quality_back", "Back",
                             RectF(1530f, 590f, 1860f, 650f),
                             fontSize = 22f,
                         )
@@ -4952,6 +5038,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PICTURE_PREFS = "picture-preferences"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
+        private const val PREF_RENDER_RESOLUTION_SCALE = "render-resolution-scale"
         private const val PREF_GAMUT_MAPPING_MODE = "gamut-mapping-mode"
         // Legacy single-profile keys are retained only to migrate existing tuning.
         private const val PREF_CINEMA_TONE_DEPTH = "cinema-tone-depth"
@@ -4965,6 +5052,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
         private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
+        private const val DEFAULT_RENDER_RESOLUTION_SCALE = 1f
         private const val DEFAULT_CINEMA_TONE_DEPTH = 0.22f
         private const val DEFAULT_PQ_CINEMA_TONE_DEPTH = 0f
         private const val DEFAULT_CINEMA_MIDTONE_EV = 0.15f
@@ -4986,6 +5074,9 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val SCENE_BRIGHTNESS_MAX = 1f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
+        private const val RENDER_RESOLUTION_SCALE_MIN = 1f
+        private const val RENDER_RESOLUTION_SCALE_MAX = 2f
+        private const val RENDER_RESOLUTION_SCALE_STEP = 0.05f
         private const val DEFAULT_HDR_SOURCE_PEAK_NITS = 1_000f
         private const val HDR_SOURCE_PEAK_NITS_MIN = 100f
         private const val HDR_SOURCE_PEAK_NITS_MAX = 10_000f
@@ -5035,7 +5126,11 @@ class PlayerActivity : Activity(), Player.Listener {
         private val PLAYBACK_SETTINGS_POPOVER_BOUNDS = RectF(930f, 45f, 1898f, 675f)
         init { System.loadLibrary("dreamplayer") }
 
-        @JvmStatic private external fun nativeRun(activity: PlayerActivity, stereoMode: Int)
+        @JvmStatic private external fun nativeRun(
+            activity: PlayerActivity,
+            stereoMode: Int,
+            renderResolutionScale: Float,
+        )
         @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
         @JvmStatic private external fun nativeRequestStop()
         @JvmStatic private external fun nativeSetVideoAspect(aspect: Float)
