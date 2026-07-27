@@ -385,23 +385,32 @@ GLuint compileShader(GLenum type, const char* source) {
 }
 
 GLuint makeProgram(const char* vertex, const char* fragment) {
-    GLuint vs = compileShader(GL_VERTEX_SHADER, vertex);
-    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragment);
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
-    glLinkProgram(program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    GLint ok = GL_FALSE;
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[1024]{};
-        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
-        glDeleteProgram(program);
-        throw std::runtime_error(std::string("Program link failed: ") + log);
+    GLuint vs = 0;
+    GLuint fs = 0;
+    GLuint program = 0;
+    try {
+        vs = compileShader(GL_VERTEX_SHADER, vertex);
+        fs = compileShader(GL_FRAGMENT_SHADER, fragment);
+        program = glCreateProgram();
+        glAttachShader(program, vs);
+        glAttachShader(program, fs);
+        glLinkProgram(program);
+        GLint ok = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            char log[1024]{};
+            glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+            throw std::runtime_error(std::string("Program link failed: ") + log);
+        }
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return program;
+    } catch (...) {
+        if (program) glDeleteProgram(program);
+        if (fs) glDeleteShader(fs);
+        if (vs) glDeleteShader(vs);
+        throw;
     }
-    return program;
 }
 
 struct EglState {
@@ -443,6 +452,9 @@ struct EglState {
         if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
         eglTerminate(display);
         display = EGL_NO_DISPLAY;
+        config = nullptr;
+        context = EGL_NO_CONTEXT;
+        surface = EGL_NO_SURFACE;
     }
 };
 
@@ -510,12 +522,16 @@ struct JavaVideoSurface {
     }
 
     void destroy(JNIEnv* env) {
-        if (surface) env->CallVoidMethod(surface, releaseSurface);
-        if (surfaceTexture) env->CallVoidMethod(surfaceTexture, releaseTexture);
+        if (surface && releaseSurface) env->CallVoidMethod(surface, releaseSurface);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (surfaceTexture && releaseTexture) env->CallVoidMethod(surfaceTexture, releaseTexture);
+        if (env->ExceptionCheck()) env->ExceptionClear();
         if (surface) env->DeleteGlobalRef(surface);
         if (surfaceTexture) env->DeleteGlobalRef(surfaceTexture);
         if (activity) env->DeleteGlobalRef(activity);
         surface = surfaceTexture = activity = nullptr;
+        vm = nullptr;
+        updateTexImage = getTransformMatrix = releaseTexture = releaseSurface = nullptr;
     }
 };
 
@@ -536,13 +552,14 @@ public:
         env_->DeleteLocalRef(cls);
     }
 
+    ~Renderer() { shutdown(); }
+
     void run() {
         egl_.create();
         initializeOpenXr();
         initializeGraphics();
         videoSurface_.create(env_, activity_, videoTexture_);
         loop();
-        shutdown();
     }
 
 private:
@@ -593,6 +610,7 @@ private:
     float dragRadius_ = 2.4f;
     Vec3 dragStartCenter_{};
     bool dragMoved_ = false;
+    bool shutdownComplete_ = false;
 
     void initializeOpenXr() {
         PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
@@ -1719,15 +1737,27 @@ private:
         gSubtitleDirty = false;
     }
 
-    void shutdown() {
+    void shutdown() noexcept {
+        if (shutdownComplete_) return;
+        shutdownComplete_ = true;
         videoSurface_.destroy(env_);
-        if (sessionRunning_) xrEndSession(session_);
+        if (sessionRunning_ && session_) xrEndSession(session_);
+        sessionRunning_ = false;
         for (auto& chain : swapchains_) if (chain.handle) xrDestroySwapchain(chain.handle);
         for (auto& aimSpace : aimSpaces_) if (aimSpace) xrDestroySpace(aimSpace);
         if (space_) xrDestroySpace(space_);
         if (session_) xrDestroySession(session_);
         if (actionSet_) xrDestroyActionSet(actionSet_);
         if (instance_) xrDestroyInstance(instance_);
+        swapchains_.clear();
+        aimSpaces_.fill(XR_NULL_HANDLE);
+        space_ = XR_NULL_HANDLE;
+        session_ = XR_NULL_HANDLE;
+        actionSet_ = XR_NULL_HANDLE;
+        aimAction_ = XR_NULL_HANDLE;
+        selectAction_ = XR_NULL_HANDLE;
+        thumbstickAction_ = XR_NULL_HANDLE;
+        instance_ = XR_NULL_HANDLE;
         if (videoProgram_) glDeleteProgram(videoProgram_);
         if (subtitleProgram_) glDeleteProgram(subtitleProgram_);
         if (pointerProgram_) glDeleteProgram(pointerProgram_);
@@ -1736,6 +1766,9 @@ private:
         if (framebuffer_) glDeleteFramebuffers(1, &framebuffer_);
         if (vertexBuffer_) glDeleteBuffers(1, &vertexBuffer_);
         if (vertexArray_) glDeleteVertexArrays(1, &vertexArray_);
+        videoProgram_ = subtitleProgram_ = pointerProgram_ = 0;
+        videoTexture_ = subtitleTexture_ = 0;
+        framebuffer_ = vertexBuffer_ = vertexArray_ = 0;
         egl_.destroy();
     }
 };
@@ -1753,6 +1786,15 @@ Java_dev_dreamplayer_PlayerActivity_nativeRun(JNIEnv* env, jclass, jobject activ
         jclass cls = env->GetObjectClass(activity);
         jmethodID callback = env->GetMethodID(cls, "onNativeExit", "(Ljava/lang/String;)V");
         jstring text = env->NewStringUTF(error.what());
+        env->CallVoidMethod(activity, callback, text);
+        env->DeleteLocalRef(text);
+        env->DeleteLocalRef(cls);
+    } catch (...) {
+        constexpr const char* reason = "Unknown native rendering failure";
+        LOGE("%s", reason);
+        jclass cls = env->GetObjectClass(activity);
+        jmethodID callback = env->GetMethodID(cls, "onNativeExit", "(Ljava/lang/String;)V");
+        jstring text = env->NewStringUTF(reason);
         env->CallVoidMethod(activity, callback, text);
         env->DeleteLocalRef(text);
         env->DeleteLocalRef(cls);

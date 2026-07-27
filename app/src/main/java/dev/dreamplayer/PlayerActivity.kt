@@ -24,6 +24,7 @@ import android.view.Surface
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
@@ -39,6 +40,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlaybackException
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -57,6 +59,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private lateinit var message: TextView
     private var nativeThread: Thread? = null
     @Volatile private var nativeStarted = false
+    private var activityResumed = false
+    private var resumePlaybackOnForeground = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentStereoMode = StereoMode.MONO
     private var pictureMode = PictureMode.AUTO
@@ -161,6 +165,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private var healthAnchorElapsedMs = 0L
     private var healthAnchorPositionMs = 0L
     private var abnormalClockSamples = 0
+    private var decoderFallbackPending = false
+    private var mediaLoadGeneration = 0
     private val stateSaver = object : Runnable {
         override fun run() {
             if (mediaLoaded) {
@@ -226,21 +232,15 @@ class PlayerActivity : Activity(), Player.Listener {
                             val correctedPosition = (
                                 healthAnchorPositionMs + elapsedMs - healthAnchorElapsedMs
                             ).coerceIn(0L, positionMs)
-                            val returnState = playbackBrowserReturn
-                            val currentSpec = spec
                             Log.w(
                                 "DreamPlayerDecoder",
                                 "Abnormal hardware clock detected; retrying with software video " +
                                     "at ${formatTime(correctedPosition)}",
                             )
-                            mediaStateStore.saveDecoderAutoSoftware(currentSpec, true)
-                            loadMedia(
-                                currentSpec,
-                                returnState,
-                                resumeOverrideMs = correctedPosition,
-                                autoSoftwareFallback = true,
+                            scheduleSoftwareDecoderFallback(
+                                correctedPosition,
+                                "Hardware timing issue detected",
                             )
-                            showOsd("Hardware timing issue detected\nUsing software decoder", 5_000L)
                             return
                         }
                     } else {
@@ -408,10 +408,8 @@ class PlayerActivity : Activity(), Player.Listener {
             smbDisplayHost = it.host
             rememberSmbCredentials = true
         }
-        spec = runCatching { PlaybackSpec.from(intent) }.getOrElse {
-            val uri = intent.data?.toString().orEmpty()
-            PlaybackSpec(uri, uri.substringAfterLast('/').ifBlank { "Library" }, StereoMode.MONO)
-        }
+        spec = playbackSpecFromIntent(intent)
+            ?: PlaybackSpec("", "Library", StereoMode.MONO)
         currentStereoMode = spec.stereoMode
         hideSystemUi()
         message = TextView(this).apply {
@@ -431,6 +429,27 @@ class PlayerActivity : Activity(), Player.Listener {
 
         if (spec.uri.isNotBlank()) loadMedia(spec)
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val newSpec = playbackSpecFromIntent(intent) ?: return
+        if (newSpec.uri.isBlank() || isFinishing || isDestroyed) return
+        resumePlaybackOnForeground = true
+        loadMedia(newSpec)
+    }
+
+    private fun playbackSpecFromIntent(source: Intent): PlaybackSpec? =
+        runCatching { PlaybackSpec.from(source) }.getOrNull()
+            ?: source.data?.toString()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { uri ->
+                    PlaybackSpec(
+                        uri,
+                        Uri.parse(uri).lastPathSegment ?: "Video",
+                        StereoMode.MONO,
+                    )
+                }
 
     @Suppress("unused") // Called from JNI after the GL external texture is ready.
     fun onNativeVideoSurface(surface: Surface) {
@@ -870,6 +889,8 @@ class PlayerActivity : Activity(), Player.Listener {
         resumeOverrideMs: Long? = null,
         autoSoftwareFallback: Boolean = false,
     ) {
+        mediaLoadGeneration++
+        decoderFallbackPending = false
         if (mediaLoaded) {
             releaseCurrentPlayer(saveState = true)
         }
@@ -1019,7 +1040,8 @@ class PlayerActivity : Activity(), Player.Listener {
             Log.i("DreamPlayerState", "Resuming ${newSpec.title} at ${formatTime(position)}")
         }
         player.prepare()
-        player.playWhenReady = true
+        player.playWhenReady = activityResumed
+        resumePlaybackOnForeground = !activityResumed
         mediaLoaded = true
         if (resumeOverrideMs != null) {
             saveCurrentMediaState(positionOverrideMs = resumeOverrideMs)
@@ -1372,11 +1394,15 @@ class PlayerActivity : Activity(), Player.Listener {
     fun onNativeExit(reason: String) {
         runOnUiThread {
             if (reason.isNotBlank()) {
-                message.text = reason
-                message.visibility = View.VISIBLE
-            } else {
-                finish()
+                Log.e("DreamPlayerOpenXR", reason)
+                Toast.makeText(
+                    this,
+                    "Dream Player VR stopped: $reason",
+                    Toast.LENGTH_LONG,
+                ).show()
             }
+            if (mediaLoaded) releaseCurrentPlayer(saveState = true)
+            finishAndRemoveTask()
         }
     }
 
@@ -1517,9 +1543,75 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     override fun onPlayerError(error: PlaybackException) {
+        if (
+            decoderMode == DecoderMode.AUTO &&
+            effectiveDecoderMode == DecoderMode.HARDWARE &&
+            isVideoDecoderFailure(error) &&
+            scheduleSoftwareDecoderFallback(
+                player.currentPosition.coerceAtLeast(0L),
+                "Hardware decoder failed (${error.errorCodeName})",
+            )
+        ) {
+            Log.w(
+                "DreamPlayerDecoder",
+                "Hardware video decoder error; scheduling software retry",
+                error,
+            )
+            return
+        }
         message.text = "Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}"
         message.visibility = View.VISIBLE
         showOsd("Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}", 10_000L)
+    }
+
+    private fun isVideoDecoderFailure(error: PlaybackException): Boolean {
+        val exoError = error as? ExoPlaybackException ?: return false
+        if (exoError.type != ExoPlaybackException.TYPE_RENDERER) return false
+        val rendererIsVideo =
+            MimeTypes.isVideo(exoError.rendererFormat?.sampleMimeType) ||
+                exoError.rendererName?.contains("video", ignoreCase = true) == true
+        if (!rendererIsVideo) return false
+        return error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+            error.errorCode == PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED ||
+            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
+            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+    }
+
+    private fun scheduleSoftwareDecoderFallback(positionMs: Long, reason: String): Boolean {
+        if (
+            decoderFallbackPending ||
+            !mediaLoaded ||
+            decoderMode != DecoderMode.AUTO ||
+            effectiveDecoderMode != DecoderMode.HARDWARE
+        ) {
+            return false
+        }
+        decoderFallbackPending = true
+        val generation = mediaLoadGeneration
+        val failedSpec = spec
+        val returnState = playbackBrowserReturn
+        mainHandler.post {
+            if (
+                !mediaLoaded ||
+                generation != mediaLoadGeneration ||
+                spec != failedSpec ||
+                decoderMode != DecoderMode.AUTO ||
+                effectiveDecoderMode != DecoderMode.HARDWARE
+            ) {
+                decoderFallbackPending = false
+                return@post
+            }
+            mediaStateStore.saveDecoderAutoSoftware(failedSpec, true)
+            loadMedia(
+                failedSpec,
+                returnState,
+                resumeOverrideMs = positionMs,
+                autoSoftwareFallback = true,
+            )
+            showOsd("$reason\nUsing software decoder", 5_000L)
+        }
+        return true
     }
 
     override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -4633,14 +4725,37 @@ class PlayerActivity : Activity(), Player.Listener {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         hideSystemUi()
         nativeSetResumed(true)
+        if (
+            resumePlaybackOnForeground &&
+            mediaLoaded &&
+            ::player.isInitialized
+        ) {
+            resumePlaybackOnForeground = false
+            player.play()
+        }
     }
 
     override fun onPause() {
+        activityResumed = false
+        pausePlaybackForBackground()
         saveCurrentMediaState()
         nativeSetResumed(false)
         super.onPause()
+    }
+
+    override fun onStop() {
+        pausePlaybackForBackground()
+        saveCurrentMediaState()
+        super.onStop()
+    }
+
+    private fun pausePlaybackForBackground() {
+        if (!mediaLoaded || !::player.isInitialized) return
+        if (player.playWhenReady) resumePlaybackOnForeground = true
+        player.pause()
     }
 
     override fun onDestroy() {
