@@ -1967,29 +1967,61 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPictureSettings(
     JNIEnv*, jclass, jint pictureMode, jfloat brightness, jfloat exposure,
     jfloat contrast, jfloat saturation, jfloat vibrance,
     jfloat toneMapPeakNits, jfloat sceneBrightness) {
+    // Every value here ultimately lands in a fragment-shader uniform that
+    // colors the whole frame, and toneMapPeakNits/sceneBrightness are
+    // persisted to disk and reapplied on every future launch regardless of
+    // which file is playing. std::clamp() does NOT sanitize NaN (NaN
+    // comparisons are always false, so the value passes through unchanged),
+    // so a single non-finite value here can permanently blacken playback
+    // for every file until app storage is cleared. Reject non-finite
+    // inputs instead of clamping them, mirroring the isfinite() guards
+    // already used by nativeSetVideoColorInfo/nativeSetScreenTransform/etc.
     if (pictureMode >= 0 && pictureMode <= 4) gPictureMode.store(pictureMode);
-    gPictureBrightness.store(std::clamp(brightness, -0.016f, 0.016f));
-    gPictureExposure.store(std::clamp(exposure, -3.0f, 3.0f));
-    gPictureContrast.store(std::clamp(contrast, 0.6f, 1.4f));
-    gPictureSaturation.store(std::clamp(saturation, 0.7f, 1.3f));
-    gPictureVibrance.store(std::clamp(vibrance, -1.0f, 1.0f));
-    const float clampedPeakNits =
-        std::clamp(static_cast<float>(toneMapPeakNits), 50.0f, 5000.0f);
-    gToneMapPeakNits.store(clampedPeakNits);
-    // ITU-R BT.2390 extended HLG display-gamma model for peak
-    // luminances outside the usual reference-display range.
-    gHlgSystemGamma.store(
-        1.2f * std::pow(1.111f, std::log2(clampedPeakNits / 1000.0f)));
-    gSceneBrightness.store(std::clamp(sceneBrightness, 0.0f, 1.0f));
+    if (std::isfinite(brightness)) {
+        gPictureBrightness.store(std::clamp(brightness, -0.016f, 0.016f));
+    }
+    if (std::isfinite(exposure)) {
+        gPictureExposure.store(std::clamp(exposure, -3.0f, 3.0f));
+    }
+    if (std::isfinite(contrast)) {
+        gPictureContrast.store(std::clamp(contrast, 0.6f, 1.4f));
+    }
+    if (std::isfinite(saturation)) {
+        gPictureSaturation.store(std::clamp(saturation, 0.7f, 1.3f));
+    }
+    if (std::isfinite(vibrance)) {
+        gPictureVibrance.store(std::clamp(vibrance, -1.0f, 1.0f));
+    }
+    if (std::isfinite(toneMapPeakNits)) {
+        const float clampedPeakNits =
+            std::clamp(static_cast<float>(toneMapPeakNits), 50.0f, 5000.0f);
+        gToneMapPeakNits.store(clampedPeakNits);
+        // ITU-R BT.2390 extended HLG display-gamma model for peak
+        // luminances outside the usual reference-display range.
+        gHlgSystemGamma.store(
+            1.2f * std::pow(1.111f, std::log2(clampedPeakNits / 1000.0f)));
+    }
+    if (std::isfinite(sceneBrightness)) {
+        gSceneBrightness.store(std::clamp(sceneBrightness, 0.0f, 1.0f));
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetCinemaSettings(
     JNIEnv*, jclass, jfloat toneDepth, jfloat midtoneEv,
     jfloat colorIntensity) {
-    gCinemaToneDepth.store(std::clamp(toneDepth, 0.0f, 1.0f));
-    gCinemaMidtoneEv.store(std::clamp(midtoneEv, -1.0f, 1.0f));
-    gCinemaColorIntensity.store(std::clamp(colorIntensity, 0.4f, 1.6f));
+    // See nativeSetPictureSettings above: these are global, persisted, and
+    // applied to every file, so a non-finite value must never reach the
+    // shader uniforms or get echoed back into SharedPreferences.
+    if (std::isfinite(toneDepth)) {
+        gCinemaToneDepth.store(std::clamp(toneDepth, 0.0f, 1.0f));
+    }
+    if (std::isfinite(midtoneEv)) {
+        gCinemaMidtoneEv.store(std::clamp(midtoneEv, -1.0f, 1.0f));
+    }
+    if (std::isfinite(colorIntensity)) {
+        gCinemaColorIntensity.store(std::clamp(colorIntensity, 0.4f, 1.6f));
+    }
     LOGI("Display profile: Cinema, depth=%.3f, midtones=%+.3f EV, color=%.3f",
          gCinemaToneDepth.load(),
          gCinemaMidtoneEv.load(),

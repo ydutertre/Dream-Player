@@ -393,10 +393,10 @@ class PlayerActivity : Activity(), Player.Listener {
         mediaStateStore = MediaStateStore(this)
         sceneBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
-            .coerceIn(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX)
+            .sanitized(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, DEFAULT_SCENE_BRIGHTNESS)
         toneMapPeakNits = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
-            .coerceIn(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX)
+            .sanitized(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX, DEFAULT_TONE_MAP_PEAK_NITS)
         val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
         renderResolutionScale = picturePreferences
             .getFloat(PREF_RENDER_RESOLUTION_SCALE, DEFAULT_RENDER_RESOLUTION_SCALE)
@@ -2326,6 +2326,11 @@ class PlayerActivity : Activity(), Player.Listener {
                     (pointerX - SETTINGS_SLIDER_LEFT) /
                         (SETTINGS_SLIDER_RIGHT - SETTINGS_SLIDER_LEFT)
                 ).coerceIn(0f, 1f)
+                // coerceIn() does not sanitize NaN (comparisons against NaN
+                // are always false, so a NaN fraction passes through
+                // unchanged). A non-finite pointerX must never turn into a
+                // persisted, permanently-applied HDR setting.
+                if (!fraction.isFinite()) return
                 hdrManualPeakNits = logarithmicLerp(
                     HDR_SOURCE_PEAK_NITS_MIN,
                     HDR_SOURCE_PEAK_NITS_MAX,
@@ -2365,6 +2370,10 @@ class PlayerActivity : Activity(), Player.Listener {
                     if (inSettingsPopover) SETTINGS_SLIDER_RIGHT else PICTURE_SLIDER_RIGHT
                 val fraction =
                     ((pointerX - sliderLeft) / (sliderRight - sliderLeft)).coerceIn(0f, 1f)
+                // See the manual_peak branch above: coerceIn() lets NaN
+                // through unchanged, so guard explicitly before it can be
+                // lerped into a picture/cinema value and persisted.
+                if (!fraction.isFinite()) return
                 val slider = id.substringAfter("slider_")
                 val cinemaTuning = activeCinemaTuning()
                 when (slider) {
@@ -4830,11 +4839,17 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun loadCinemaTunings(preferences: android.content.SharedPreferences) {
         val legacyToneDepth =
             preferences.getFloat(PREF_CINEMA_TONE_DEPTH, DEFAULT_CINEMA_TONE_DEPTH)
+                .sanitized(CINEMA_TONE_DEPTH_MIN, CINEMA_TONE_DEPTH_MAX, DEFAULT_CINEMA_TONE_DEPTH)
         val legacyMidtoneEv =
             preferences.getFloat(PREF_CINEMA_MIDTONE_EV, DEFAULT_CINEMA_MIDTONE_EV)
+                .sanitized(CINEMA_MIDTONE_EV_MIN, CINEMA_MIDTONE_EV_MAX, DEFAULT_CINEMA_MIDTONE_EV)
         val legacyColorIntensity =
             preferences.getFloat(
                 PREF_CINEMA_COLOR_INTENSITY,
+                DEFAULT_CINEMA_COLOR_INTENSITY,
+            ).sanitized(
+                CINEMA_COLOR_INTENSITY_MIN,
+                CINEMA_COLOR_INTENSITY_MAX,
                 DEFAULT_CINEMA_COLOR_INTENSITY,
             )
         VideoTransfer.entries.forEach { transfer ->
@@ -4844,11 +4859,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 if (transfer == VideoTransfer.PQ) defaults.toneDepth else legacyToneDepth
             cinemaTunings[transfer] = CinemaTuning(
                 preferences.getFloat("$prefix-tone-depth", migratedToneDepth)
-                    .coerceIn(CINEMA_TONE_DEPTH_MIN, CINEMA_TONE_DEPTH_MAX),
+                    .sanitized(CINEMA_TONE_DEPTH_MIN, CINEMA_TONE_DEPTH_MAX, migratedToneDepth),
                 preferences.getFloat("$prefix-midtone-ev", legacyMidtoneEv)
-                    .coerceIn(CINEMA_MIDTONE_EV_MIN, CINEMA_MIDTONE_EV_MAX),
+                    .sanitized(CINEMA_MIDTONE_EV_MIN, CINEMA_MIDTONE_EV_MAX, legacyMidtoneEv),
                 preferences.getFloat("$prefix-color-intensity", legacyColorIntensity)
-                    .coerceIn(CINEMA_COLOR_INTENSITY_MIN, CINEMA_COLOR_INTENSITY_MAX),
+                    .sanitized(
+                        CINEMA_COLOR_INTENSITY_MIN,
+                        CINEMA_COLOR_INTENSITY_MAX,
+                        legacyColorIntensity,
+                    ),
             )
         }
     }
@@ -4892,6 +4911,14 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun lerp(minimum: Float, maximum: Float, fraction: Float): Float =
         minimum + (maximum - minimum) * fraction
+
+    // Float.coerceIn() does NOT sanitize NaN: comparisons against NaN are
+    // always false, so a NaN receiver passes through coerceIn() unchanged.
+    // Use this instead whenever a value came from persisted storage or
+    // pointer/controller input, so a corrupted or degenerate value can't
+    // silently become a permanent, globally-applied setting.
+    private fun Float.sanitized(minimum: Float, maximum: Float, fallback: Float): Float =
+        if (isFinite()) coerceIn(minimum, maximum) else fallback
 
     private fun logarithmicLerp(minimum: Float, maximum: Float, fraction: Float): Float {
         val logMinimum = kotlin.math.ln(minimum)
