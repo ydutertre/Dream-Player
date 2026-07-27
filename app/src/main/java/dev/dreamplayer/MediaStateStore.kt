@@ -1,0 +1,453 @@
+package dev.dreamplayer
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
+import android.net.Uri
+import java.security.MessageDigest
+import java.util.Locale
+
+/**
+ * Persistent per-file state. Most columns are intentionally nullable: later QoL
+ * phases can add values without replacing the database or changing media IDs.
+ */
+class MediaStateStore(context: Context) :
+    SQLiteOpenHelper(context.applicationContext, DATABASE_NAME, null, DATABASE_VERSION) {
+
+    data class ScreenTransform(
+        val x: Float,
+        val y: Float,
+        val z: Float,
+        val halfHeight: Float,
+    )
+
+    data class PlaybackState(
+        val positionMs: Long?,
+        val durationMs: Long?,
+        val screenTransform: ScreenTransform?,
+        val subtitleFingerprint: String?,
+        val subtitleSyncMs: Int?,
+        val subtitleDepthMeters: Float?,
+        val audioSyncMs: Int?,
+        val audioTrackFingerprint: String?,
+        val pictureSettings: PictureSettings?,
+        val decoderMode: Int?,
+        val decoderAutoSoftware: Boolean,
+        val screenCurvature: Float?,
+    )
+
+    data class PictureSettings(
+        val mode: Int,
+        val brightness: Float,
+        val exposure: Float,
+        val contrast: Float,
+        val saturation: Float,
+        val vibrance: Float,
+    )
+
+    data class ProjectionPreference(
+        val mode: StereoMode,
+        val manuallySelected: Boolean,
+    )
+
+    data class RecentMedia(
+        val uri: String,
+        val title: String,
+        val positionMs: Long?,
+        val durationMs: Long?,
+        val lastPlayedAt: Long,
+        val smbShare: String?,
+    )
+
+    override fun onCreate(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE media_state (
+                media_id TEXT PRIMARY KEY NOT NULL,
+                canonical_location TEXT NOT NULL,
+                title TEXT,
+                stereo_mode INTEGER,
+                stereo_manual INTEGER NOT NULL DEFAULT 0,
+                position_ms INTEGER,
+                duration_ms INTEGER,
+                screen_x REAL,
+                screen_y REAL,
+                screen_z REAL,
+                screen_half_height REAL,
+                subtitle_fingerprint TEXT,
+                subtitle_sync_ms INTEGER,
+                subtitle_depth_meters REAL,
+                picture_mode INTEGER,
+                brightness REAL,
+                exposure REAL,
+                contrast REAL,
+                saturation REAL,
+                vibrance REAL,
+                shadows REAL,
+                highlights REAL,
+                audio_sync_ms INTEGER,
+                audio_track_fingerprint TEXT,
+                decoder_mode INTEGER,
+                decoder_auto_software INTEGER NOT NULL DEFAULT 0,
+                screen_curvature REAL,
+                playback_uri TEXT,
+                smb_share TEXT,
+                last_played_at INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX media_state_updated_at ON media_state(updated_at)")
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN audio_sync_ms INTEGER")
+        }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN audio_track_fingerprint TEXT")
+        }
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN saturation REAL")
+        }
+        if (oldVersion < 5) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN decoder_mode INTEGER")
+        }
+        if (oldVersion < 6) {
+            db.execSQL(
+                "ALTER TABLE media_state ADD COLUMN decoder_auto_software INTEGER NOT NULL DEFAULT 0"
+            )
+        }
+        if (oldVersion < 7) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN subtitle_sync_ms INTEGER")
+        }
+        if (oldVersion < 8) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN subtitle_depth_meters REAL")
+        }
+        if (oldVersion < 9) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN screen_curvature REAL")
+        }
+        if (oldVersion < 10) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN playback_uri TEXT")
+            db.execSQL("ALTER TABLE media_state ADD COLUMN smb_share TEXT")
+            db.execSQL("ALTER TABLE media_state ADD COLUMN last_played_at INTEGER")
+            db.execSQL(
+                "UPDATE media_state SET playback_uri = canonical_location " +
+                    "WHERE playback_uri IS NULL"
+            )
+            db.execSQL(
+                "UPDATE media_state SET last_played_at = updated_at " +
+                    "WHERE last_played_at IS NULL AND position_ms IS NOT NULL"
+            )
+        }
+        if (oldVersion < 11) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN shadows REAL")
+            db.execSQL("ALTER TABLE media_state ADD COLUMN highlights REAL")
+        }
+        if (oldVersion < 12) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN vibrance REAL")
+        }
+    }
+
+    fun listRecent(limit: Int = 6): List<RecentMedia> {
+        if (limit <= 0) return emptyList()
+        readableDatabase.query(
+            "media_state",
+            arrayOf(
+                "COALESCE(playback_uri, canonical_location)",
+                "title",
+                "position_ms",
+                "duration_ms",
+                "last_played_at",
+                "smb_share",
+                "canonical_location",
+            ),
+            "last_played_at IS NOT NULL",
+            null,
+            null,
+            null,
+            "last_played_at DESC",
+            limit.toString(),
+        ).use { cursor ->
+            val recent = ArrayList<RecentMedia>(cursor.count)
+            while (cursor.moveToNext()) {
+                val storedUri = cursor.getString(0)
+                val storedParsed = Uri.parse(storedUri)
+                val canonical = cursor.getString(6)
+                val canonicalParsed = Uri.parse(canonical)
+                val legacySmbShare = canonicalParsed.pathSegments.firstOrNull()
+                val uri = if (
+                    storedParsed.scheme.equals("smb", ignoreCase = true) &&
+                    cursor.isNull(5) &&
+                    legacySmbShare != null
+                ) {
+                    Uri.Builder()
+                        .scheme("smb")
+                        .authority(storedParsed.host)
+                        .apply {
+                            canonicalParsed.pathSegments.drop(1).forEach(::appendPath)
+                        }
+                        .build()
+                        .toString()
+                } else {
+                    storedUri
+                }
+                val parsed = Uri.parse(uri)
+                recent += RecentMedia(
+                    uri = uri,
+                    title = if (cursor.isNull(1)) {
+                        Uri.parse(uri).lastPathSegment ?: "Video"
+                    } else {
+                        cursor.getString(1)
+                    },
+                    positionMs = if (cursor.isNull(2)) null else cursor.getLong(2),
+                    durationMs = if (cursor.isNull(3)) null else cursor.getLong(3),
+                    lastPlayedAt = cursor.getLong(4),
+                    smbShare = if (!parsed.scheme.equals("smb", ignoreCase = true)) {
+                        null
+                    } else if (!cursor.isNull(5)) {
+                        cursor.getString(5)
+                    } else {
+                        legacySmbShare
+                    },
+                )
+            }
+            return recent
+        }
+    }
+
+    fun markPlayed(spec: PlaybackSpec) {
+        upsert(
+            spec,
+            ContentValues().apply { put("last_played_at", System.currentTimeMillis()) },
+        )
+    }
+
+    fun loadProjection(spec: PlaybackSpec): ProjectionPreference? {
+        val identity = MediaIdentity.from(spec)
+        readableDatabase.query(
+            "media_state",
+            arrayOf("stereo_mode", "stereo_manual"),
+            "media_id = ?",
+            arrayOf(identity.id),
+            null,
+            null,
+            null,
+            "1",
+        ).use { cursor ->
+            if (!cursor.moveToFirst() || cursor.isNull(0)) return null
+            return ProjectionPreference(
+                mode = StereoMode.fromWire(cursor.getInt(0)),
+                manuallySelected = cursor.getInt(1) != 0,
+            )
+        }
+    }
+
+    fun loadPlaybackState(spec: PlaybackSpec): PlaybackState? {
+        val identity = MediaIdentity.from(spec)
+        readableDatabase.query(
+            "media_state",
+            arrayOf(
+                "position_ms", "duration_ms",
+                "screen_x", "screen_y", "screen_z", "screen_half_height",
+                "subtitle_fingerprint", "subtitle_sync_ms", "subtitle_depth_meters",
+                "audio_sync_ms", "audio_track_fingerprint",
+                "picture_mode", "brightness", "exposure", "contrast", "saturation",
+                "vibrance",
+                "decoder_mode",
+                "decoder_auto_software",
+                "screen_curvature",
+            ),
+            "media_id = ?",
+            arrayOf(identity.id),
+            null,
+            null,
+            null,
+            "1",
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            val transform = if ((2..5).all { !cursor.isNull(it) }) {
+                ScreenTransform(
+                    cursor.getFloat(2),
+                    cursor.getFloat(3),
+                    cursor.getFloat(4),
+                    cursor.getFloat(5),
+                )
+            } else null
+            return PlaybackState(
+                positionMs = if (cursor.isNull(0)) null else cursor.getLong(0),
+                durationMs = if (cursor.isNull(1)) null else cursor.getLong(1),
+                screenTransform = transform,
+                subtitleFingerprint = if (cursor.isNull(6)) null else cursor.getString(6),
+                subtitleSyncMs = if (cursor.isNull(7)) null else cursor.getInt(7),
+                subtitleDepthMeters = if (cursor.isNull(8)) null else cursor.getFloat(8),
+                audioSyncMs = if (cursor.isNull(9)) null else cursor.getInt(9),
+                audioTrackFingerprint = if (cursor.isNull(10)) null else cursor.getString(10),
+                pictureSettings = if ((11..14).all { !cursor.isNull(it) }) {
+                    PictureSettings(
+                        mode = cursor.getInt(11),
+                        brightness = cursor.getFloat(12),
+                        exposure = cursor.getFloat(13),
+                        contrast = cursor.getFloat(14),
+                        saturation = if (cursor.isNull(15)) 1f else cursor.getFloat(15),
+                        vibrance = if (cursor.isNull(16)) 0f else cursor.getFloat(16),
+                    )
+                } else null,
+                decoderMode = if (cursor.isNull(17)) null else cursor.getInt(17),
+                decoderAutoSoftware = !cursor.isNull(18) && cursor.getInt(18) != 0,
+                screenCurvature = if (cursor.isNull(19)) null else cursor.getFloat(19),
+            )
+        }
+    }
+
+    fun saveProjection(spec: PlaybackSpec, mode: StereoMode, manuallySelected: Boolean = true) {
+        val identity = MediaIdentity.from(spec)
+        val values = ContentValues().apply {
+            put("media_id", identity.id)
+            put("canonical_location", identity.canonicalLocation)
+            put("title", spec.title)
+            put("stereo_mode", mode.wireValue)
+            put("stereo_manual", if (manuallySelected) 1 else 0)
+            put("updated_at", System.currentTimeMillis())
+        }
+        upsert(spec, values)
+    }
+
+    fun savePlaybackState(
+        spec: PlaybackSpec,
+        positionMs: Long,
+        durationMs: Long?,
+        transform: ScreenTransform,
+    ) {
+        val values = ContentValues().apply {
+            put("position_ms", positionMs.coerceAtLeast(0L))
+            if (durationMs != null && durationMs > 0L) put("duration_ms", durationMs)
+            put("screen_x", transform.x)
+            put("screen_y", transform.y)
+            put("screen_z", transform.z)
+            put("screen_half_height", transform.halfHeight)
+        }
+        upsert(spec, values)
+    }
+
+    fun saveSubtitle(spec: PlaybackSpec, fingerprint: String) {
+        upsert(spec, ContentValues().apply { put("subtitle_fingerprint", fingerprint) })
+    }
+
+    fun saveSubtitleSync(spec: PlaybackSpec, delayMs: Int) {
+        upsert(spec, ContentValues().apply { put("subtitle_sync_ms", delayMs) })
+    }
+
+    fun saveSubtitleDepth(spec: PlaybackSpec, depthMeters: Float) {
+        upsert(spec, ContentValues().apply { put("subtitle_depth_meters", depthMeters) })
+    }
+
+    fun saveScreenCurvature(spec: PlaybackSpec, curvature: Float) {
+        upsert(spec, ContentValues().apply { put("screen_curvature", curvature) })
+    }
+
+    fun saveAudioSync(spec: PlaybackSpec, delayMs: Int) {
+        upsert(spec, ContentValues().apply { put("audio_sync_ms", delayMs) })
+    }
+
+    fun saveAudioTrack(spec: PlaybackSpec, fingerprint: String) {
+        upsert(spec, ContentValues().apply { put("audio_track_fingerprint", fingerprint) })
+    }
+
+    fun savePictureSettings(spec: PlaybackSpec, settings: PictureSettings) {
+        upsert(spec, ContentValues().apply {
+            put("picture_mode", settings.mode)
+            put("brightness", settings.brightness)
+            put("exposure", settings.exposure)
+            put("contrast", settings.contrast)
+            put("saturation", settings.saturation)
+            put("vibrance", settings.vibrance)
+        })
+    }
+
+    fun saveDecoderMode(spec: PlaybackSpec, mode: Int) {
+        upsert(spec, ContentValues().apply { put("decoder_mode", mode) })
+    }
+
+    fun saveDecoderAutoSoftware(spec: PlaybackSpec, enabled: Boolean) {
+        upsert(spec, ContentValues().apply {
+            put("decoder_auto_software", if (enabled) 1 else 0)
+        })
+    }
+
+    private fun upsert(spec: PlaybackSpec, values: ContentValues) {
+        val identity = MediaIdentity.from(spec)
+        values.put("media_id", identity.id)
+        values.put("canonical_location", identity.canonicalLocation)
+        values.put("playback_uri", spec.uri)
+        spec.smb?.share?.let { values.put("smb_share", it) }
+        values.put("title", spec.title)
+        values.put("updated_at", System.currentTimeMillis())
+        val db = writableDatabase
+        val updated = db.update("media_state", values, "media_id = ?", arrayOf(identity.id))
+        if (updated == 0) db.insertOrThrow("media_state", null, values)
+    }
+
+    companion object {
+        private const val DATABASE_NAME = "media-state.db"
+        private const val DATABASE_VERSION = 12
+    }
+}
+
+data class MediaIdentity(
+    val id: String,
+    val canonicalLocation: String,
+) {
+    companion object {
+        fun from(spec: PlaybackSpec): MediaIdentity {
+            val parsed = Uri.parse(spec.uri)
+            val canonical = if (parsed.scheme.equals("smb", ignoreCase = true)) {
+                val host = (spec.smb?.host ?: parsed.host).orEmpty().trim().lowercase(Locale.ROOT)
+                val share = spec.smb?.share.orEmpty().trim().trim('/', '\\').lowercase(Locale.ROOT)
+                val path = parsed.pathSegments
+                    .joinToString("/")
+                    .trim('/')
+                    .lowercase(Locale.ROOT)
+                "smb://$host/$share/$path".trimEnd('/')
+            } else {
+                parsed.buildUpon()
+                    .fragment(null)
+                    .build()
+                    .normalizeScheme()
+                    .toString()
+            }
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(canonical.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            return MediaIdentity(digest, canonical)
+        }
+    }
+}
+
+object FilenameProjectionDetector {
+    fun detect(filename: String): StereoMode? {
+        val stem = filename.substringBeforeLast('.', filename)
+        val tokens = stem.uppercase(Locale.ROOT)
+            .split(Regex("[^A-Z0-9]+"))
+            .filter(String::isNotBlank)
+            .toSet()
+        val compact = tokens.joinToString("")
+
+        fun has(vararg values: String) = values.any { value ->
+            value in tokens || (value.length >= 3 && compact.contains(value))
+        }
+
+        return when {
+            has("FSBS", "FULLSBS", "FULLSIDEBYSIDE") -> StereoMode.SBS
+            has("FOU", "FTB", "FULLOU", "FULLTB", "FULLOVERUNDER", "FULLTOPBOTTOM") ->
+                StereoMode.OVER_UNDER
+            has("HSBS", "HALFSBS", "HALFSIDEBYSIDE", "SBS", "SIDEBYSIDE") ->
+                StereoMode.HALF_SBS
+            has("HOU", "HTB", "HALFOU", "HALFTB", "HALFOVERUNDER", "HALFTOPBOTTOM", "OU", "TB", "OVERUNDER", "TOPBOTTOM") ->
+                StereoMode.HALF_OVER_UNDER
+            "2D" in tokens -> StereoMode.MONO
+            else -> null
+        }
+    }
+}

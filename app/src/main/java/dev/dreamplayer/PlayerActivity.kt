@@ -1,0 +1,4544 @@
+package dev.dreamplayer
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.net.Uri
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.Build
+import android.os.SystemClock
+import android.util.Log
+import android.view.KeyEvent
+import android.view.Surface
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.TextView
+import androidx.media3.common.C
+import androidx.media3.common.Format
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
+import androidx.media3.common.text.Cue
+import androidx.media3.common.text.CueGroup
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
+import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMilliseconds
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+@UnstableApi
+class PlayerActivity : Activity(), Player.Listener {
+    private var spec = PlaybackSpec("", "Library", StereoMode.MONO)
+    private lateinit var player: ExoPlayer
+    private lateinit var message: TextView
+    private var nativeThread: Thread? = null
+    @Volatile private var nativeStarted = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var currentStereoMode = StereoMode.MONO
+    private var pictureMode = PictureMode.AUTO
+    private var pictureBrightness = DEFAULT_PICTURE_BRIGHTNESS
+    private var pictureExposure = DEFAULT_PICTURE_EXPOSURE
+    private var pictureContrast = DEFAULT_PICTURE_CONTRAST
+    private var pictureSaturation = DEFAULT_PICTURE_SATURATION
+    private var pictureVibrance = DEFAULT_PICTURE_VIBRANCE
+    private val cinemaTunings = mutableMapOf(
+        VideoTransfer.SDR to defaultCinemaTuning(VideoTransfer.SDR),
+        VideoTransfer.PQ to defaultCinemaTuning(VideoTransfer.PQ),
+        VideoTransfer.HLG to defaultCinemaTuning(VideoTransfer.HLG),
+    )
+    private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
+    private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
+    private var screenCurvature = DEFAULT_SCREEN_CURVATURE
+    private var detectedVideoTransfer = VideoTransfer.SDR
+    private var detectedVideoPrimaries = VideoPrimaries.BT709
+    private var currentMediaHasSavedPictureSettings = false
+    private var hdrDefaultExposureApplied = false
+    private var audioSyncMs = 0
+    private lateinit var audioSyncProcessor: AudioSyncAudioProcessor
+    private var swapEyes = false
+    private var lastVideoSize = VideoSize.UNKNOWN
+    private var latestCues: List<Cue> = emptyList()
+    private var subtitleChoices: List<SubtitleChoice> = listOf(
+        SubtitleChoice("Auto", null, -1, SUBTITLE_AUTO),
+        SubtitleChoice("Off", null, -1, SUBTITLE_OFF),
+    )
+    private var subtitleChoiceIndex = 0
+    private var pendingSubtitleFingerprint: String? = null
+    private var subtitleSyncMs = 0
+    private var subtitleDepthMeters = DEFAULT_2D_SUBTITLE_DEPTH_METERS
+    private var subtitleDepthIsCustom = false
+    private var audioChoices: List<AudioChoice> = listOf(
+        AudioChoice("Auto", null, -1, AUDIO_AUTO),
+    )
+    private var audioChoiceIndex = 0
+    private var pendingAudioFingerprint: String? = null
+    private var osdGeneration = 0
+    private var videoSurface: Surface? = null
+    private var mediaLoaded = false
+    private var playbackCompleted = false
+    private var uiScreen = UiScreen.LIBRARY
+    private var playbackPopover = PlaybackPopover.NONE
+    private var uiVisible = true
+    private var controlsAutoHideAtMs = 0L
+    private var uiButtons: List<UiButton> = emptyList()
+    private var hoveredButton: String? = null
+    private var activeSlider: String? = null
+    private var transientMessage: String? = null
+    private val io = Executors.newSingleThreadExecutor()
+    private var recentMedia: List<MediaStateStore.RecentMedia> = emptyList()
+    private var currentMediaMarkedPlayed = false
+    private var localVideos: List<LocalVideo> = emptyList()
+    private var localFolder: String? = null
+    private var browserScrollOffset = 0f
+    private var browserJoystickInput = 0f
+    private var browserScrollVelocity = 0f
+    private var browserScrollFrameNanos = 0L
+    @Volatile private var browserScrollMoving = false
+    private val browserFramePending = AtomicBoolean(false)
+    @Volatile private var latestBrowserFrameNanos = 0L
+    private var browserScrollbarDragging = false
+    private var browserScrollbarGrabOffset = 0f
+    private var subtitleTrackScrollOffset = 0f
+    private var audioTrackScrollOffset = 0f
+    private var trackListJoystickInput = 0f
+    private var trackListScrollVelocity = 0f
+    private var trackListScrollFrameNanos = 0L
+    @Volatile private var trackListScrollMoving = false
+    private var trackListScrollbarDragging = false
+    private var trackListScrollbarGrabOffset = 0f
+    private var pointerUiX = 0f
+    private var pointerUiY = 0f
+    private var localFolderListScrollOffset = 0f
+    private var smbServers: List<SmbServer> = emptyList()
+    private var smbServerListScrollOffset = 0f
+    private var smbCredentials = SmbCredentials("", "", "", "", "")
+    private var smbDisplayHost = ""
+    private var smbShares: List<String> = emptyList()
+    private var smbEntries: List<SmbEntry> = emptyList()
+    private var smbPath = ""
+    private var smbShareListScrollOffset = 0f
+    private val smbNavigationStack = ArrayDeque<SmbNavigationState>()
+    private var menuBitmap: Bitmap? = null
+    private var keyboardField = KeyboardField.HOST
+    private var keyboardSymbols = false
+    private var keyboardUppercase = false
+    private lateinit var smbCredentialStore: SmbCredentialStore
+    private lateinit var mediaStateStore: MediaStateStore
+    private var rememberSmbCredentials = false
+    private var playbackBrowserReturn: BrowserReturnState? = null
+    private var decoderMode = DecoderMode.AUTO
+    private var effectiveDecoderMode = DecoderMode.HARDWARE
+    private var healthLastElapsedMs = 0L
+    private var healthLastPositionMs = 0L
+    private var healthAnchorElapsedMs = 0L
+    private var healthAnchorPositionMs = 0L
+    private var abnormalClockSamples = 0
+    private val stateSaver = object : Runnable {
+        override fun run() {
+            if (mediaLoaded) {
+                saveCurrentMediaState()
+                mainHandler.postDelayed(this, STATE_SAVE_INTERVAL_MS)
+            }
+        }
+    }
+    private val uiTicker = object : Runnable {
+        override fun run() {
+            if (uiVisible && uiScreen == UiScreen.PLAYBACK && mediaLoaded) {
+                val now = SystemClock.elapsedRealtime()
+                val interactionActive =
+                    playbackPopover != PlaybackPopover.NONE ||
+                        activeSlider != null ||
+                        browserScrollMoving ||
+                        trackListScrollMoving ||
+                        browserScrollbarDragging ||
+                        trackListScrollbarDragging
+                if (
+                    controlsAutoHideAtMs > 0L &&
+                    now >= controlsAutoHideAtMs &&
+                    player.isPlaying &&
+                    !interactionActive
+                ) {
+                    hideControls()
+                    return
+                }
+                if (interactionActive && now >= controlsAutoHideAtMs) {
+                    armControlsAutoHide()
+                }
+                renderVrMenu()
+                mainHandler.postDelayed(this, 1_000L)
+            }
+        }
+    }
+    private val playbackHealthMonitor = object : Runnable {
+        override fun run() {
+            if (!mediaLoaded) return
+            if (
+                decoderMode == DecoderMode.AUTO &&
+                effectiveDecoderMode == DecoderMode.HARDWARE &&
+                player.isPlaying &&
+                player.playbackParameters.speed == 1f
+            ) {
+                val elapsedMs = SystemClock.elapsedRealtime()
+                val positionMs = player.currentPosition
+                if (healthLastElapsedMs == 0L) {
+                    healthAnchorElapsedMs = elapsedMs
+                    healthAnchorPositionMs = positionMs
+                } else {
+                    val wallDelta = elapsedMs - healthLastElapsedMs
+                    val mediaDelta = positionMs - healthLastPositionMs
+                    if (wallDelta in 700L..1_400L && mediaDelta >= 0L) {
+                        val ratio = mediaDelta.toDouble() / wallDelta
+                        abnormalClockSamples =
+                            if (ratio in AUTO_FALLBACK_RATIO_MIN..AUTO_FALLBACK_RATIO_MAX) {
+                                abnormalClockSamples + 1
+                            } else {
+                                0
+                            }
+                        if (abnormalClockSamples >= AUTO_FALLBACK_SAMPLE_COUNT) {
+                            val correctedPosition = (
+                                healthAnchorPositionMs + elapsedMs - healthAnchorElapsedMs
+                            ).coerceIn(0L, positionMs)
+                            val returnState = playbackBrowserReturn
+                            val currentSpec = spec
+                            Log.w(
+                                "DreamPlayerDecoder",
+                                "Abnormal hardware clock detected; retrying with software video " +
+                                    "at ${formatTime(correctedPosition)}",
+                            )
+                            mediaStateStore.saveDecoderAutoSoftware(currentSpec, true)
+                            loadMedia(
+                                currentSpec,
+                                returnState,
+                                resumeOverrideMs = correctedPosition,
+                                autoSoftwareFallback = true,
+                            )
+                            showOsd("Hardware timing issue detected\nUsing software decoder", 5_000L)
+                            return
+                        }
+                    } else {
+                        abnormalClockSamples = 0
+                        healthAnchorElapsedMs = elapsedMs
+                        healthAnchorPositionMs = positionMs
+                    }
+                }
+                healthLastElapsedMs = elapsedMs
+                healthLastPositionMs = positionMs
+            } else {
+                resetPlaybackHealthMonitor()
+            }
+            mainHandler.postDelayed(this, 1_000L)
+        }
+    }
+
+    private enum class UiScreen {
+        LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
+        SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
+        PLAYBACK, PROJECTION, PICTURE, DECODER, AUDIO_SYNC, AUDIO_TRACKS, SUBTITLES,
+    }
+
+    private enum class PlaybackPopover {
+        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA,
+    }
+
+    private enum class PictureMode(val wireValue: Int) {
+        ORIGINAL(0),
+        AUTO(1),
+        FORCE_SDR(2),
+        FORCE_PQ(3),
+        FORCE_HLG(4);
+
+        companion object {
+            fun fromWire(value: Int): PictureMode =
+                entries.firstOrNull { it.wireValue == value } ?: AUTO
+        }
+    }
+
+    private enum class DecoderMode(val wireValue: Int, val label: String) {
+        AUTO(0, "Auto"),
+        HARDWARE(1, "Hardware"),
+        SOFTWARE(2, "Software");
+
+        companion object {
+            fun fromWire(value: Int): DecoderMode =
+                entries.firstOrNull { it.wireValue == value } ?: AUTO
+        }
+    }
+
+    private enum class VideoTransfer(val wireValue: Int, val label: String) {
+        SDR(0, "SDR"),
+        PQ(1, "HDR10 / PQ"),
+        HLG(2, "HDR / HLG"),
+    }
+
+    private data class CinemaTuning(
+        var toneDepth: Float,
+        var midtoneEv: Float,
+        var colorIntensity: Float,
+    )
+
+    private enum class VideoPrimaries(val wireValue: Int) {
+        BT709(0),
+        BT2020(1),
+    }
+
+    private enum class KeyboardField { HOST, USERNAME, PASSWORD, DOMAIN }
+
+    private sealed interface BrowserReturnState {
+        data class Local(
+            val folder: String,
+            val scrollOffset: Float,
+        ) : BrowserReturnState
+
+        data class Smb(
+            val credentials: SmbCredentials,
+            val path: String,
+            val entries: List<SmbEntry>,
+            val scrollOffset: Float,
+        ) : BrowserReturnState
+    }
+
+    private data class SmbNavigationState(
+        val path: String,
+        val entries: List<SmbEntry>,
+        val scrollOffset: Float,
+    )
+
+    private data class UiButton(
+        val id: String,
+        val label: String,
+        val bounds: RectF,
+        val selected: Boolean = false,
+    )
+
+    private data class SubtitleChoice(
+        val label: String,
+        val group: Tracks.Group?,
+        val trackIndex: Int,
+        val fingerprint: String,
+    )
+
+    private data class AudioChoice(
+        val label: String,
+        val group: Tracks.Group?,
+        val trackIndex: Int,
+        val fingerprint: String,
+    )
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        smbCredentialStore = SmbCredentialStore(this)
+        mediaStateStore = MediaStateStore(this)
+        sceneBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+            .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
+            .coerceIn(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX)
+        toneMapPeakNits = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+            .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
+            .coerceIn(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX)
+        val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        loadCinemaTunings(picturePreferences)
+        applyCinemaSettings(persist = false)
+        smbCredentialStore.load()?.let {
+            smbCredentials = it
+            smbDisplayHost = it.host
+            rememberSmbCredentials = true
+        }
+        spec = runCatching { PlaybackSpec.from(intent) }.getOrElse {
+            val uri = intent.data?.toString().orEmpty()
+            PlaybackSpec(uri, uri.substringAfterLast('/').ifBlank { "Library" }, StereoMode.MONO)
+        }
+        currentStereoMode = spec.stereoMode
+        hideSystemUi()
+        message = TextView(this).apply {
+            text = "Starting OpenXR…"
+            setTextColor(Color.WHITE)
+            textSize = 22f
+            gravity = android.view.Gravity.CENTER
+            setBackgroundColor(Color.BLACK)
+        }
+        setContentView(FrameLayout(this).apply { addView(message) })
+
+        nativeThread = Thread({
+            nativeStarted = true
+            nativeRun(this, spec.stereoMode.wireValue)
+            nativeStarted = false
+        }, "DreamPlayer-OpenXR").also { it.start() }
+
+        if (spec.uri.isNotBlank()) loadMedia(spec)
+    }
+
+    @Suppress("unused") // Called from JNI after the GL external texture is ready.
+    fun onNativeVideoSurface(surface: Surface) {
+        runOnUiThread {
+            videoSurface = surface
+            if (mediaLoaded) player.setVideoSurface(surface)
+            message.visibility = View.GONE
+            if (mediaLoaded) showControls(8_000L) else showLibrary()
+        }
+    }
+
+    @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativePointer(u: Float, v: Float, pointerState: Int) {
+        runOnUiThread {
+            val pressed = pointerState == POINTER_PRESSED
+            val held = pointerState == POINTER_HELD
+            val released = pointerState == POINTER_RELEASED
+            if (!uiVisible) {
+                if (pressed && mediaLoaded) showControls(0L)
+                return@runOnUiThread
+            }
+            val px = u * UI_WIDTH
+            val py = v * UI_HEIGHT
+            pointerUiX = px
+            pointerUiY = py
+            val target = uiButtons.lastOrNull { it.bounds.contains(px, py) }
+            val hoverTarget = when {
+                target?.id == BROWSER_SCROLLBAR_ID ||
+                    target?.id == TRACK_LIST_SCROLLBAR_ID -> target
+                isBrowserListScreen() && browserScrollMoving -> null
+                trackListScrollMoving && isTrackListButton(target?.id) -> null
+                else -> target
+            }
+            if (activeSlider == null && hoveredButton != hoverTarget?.id) {
+                hoveredButton = hoverTarget?.id
+                if (uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+                Log.i("DreamPlayerUI", "Hover: ${hoverTarget?.id ?: "none"}")
+                renderVrMenu()
+            }
+            if (pressed) {
+                if (uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+                if (target != null) {
+                    Log.i("DreamPlayerUI", "Click: ${target.id}")
+                    if (target.id == BROWSER_SCROLLBAR_ID) {
+                        stopBrowserScroll()
+                        activeSlider = target.id
+                        browserScrollbarDragging = true
+                        browserScrollbarGrabOffset =
+                            py - browserScrollbarThumbBounds().centerY()
+                        handleBrowserScrollbarDrag(py)
+                    } else if (target.id == TRACK_LIST_SCROLLBAR_ID) {
+                        stopTrackListScroll()
+                        activeSlider = target.id
+                        trackListScrollbarDragging = true
+                        trackListScrollbarGrabOffset =
+                            py - trackListScrollbarThumbBounds().centerY()
+                        handleTrackListScrollbarDrag(py)
+                    } else if (isSlider(target.id)) {
+                        activeSlider = target.id
+                        handleUiAction(target.id, px, persist = false)
+                    } else {
+                        handleUiAction(target.id, px)
+                    }
+                } else if (mediaLoaded && uiScreen == UiScreen.PLAYBACK) {
+                    if (playbackPopover != PlaybackPopover.NONE) {
+                        val popoverBounds = playbackPopoverBounds(playbackPopover)
+                        if (popoverBounds == null || !popoverBounds.contains(px, py)) {
+                            stopTrackListScroll()
+                            playbackPopover = PlaybackPopover.NONE
+                            hoveredButton = null
+                            armControlsAutoHide()
+                            renderVrMenu()
+                        }
+                    } else if (!PLAYBACK_TOOLBAR_BOUNDS.contains(px, py)) {
+                        hideControls()
+                    }
+                }
+            } else if (held) {
+                activeSlider?.let {
+                    if (uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+                    if (it == BROWSER_SCROLLBAR_ID) handleBrowserScrollbarDrag(py)
+                    else if (it == TRACK_LIST_SCROLLBAR_ID) handleTrackListScrollbarDrag(py)
+                    else handleUiAction(it, px, persist = false)
+                }
+            } else if (released) {
+                activeSlider?.let { slider ->
+                    if (uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+                    if (slider == BROWSER_SCROLLBAR_ID) {
+                        handleBrowserScrollbarDrag(py)
+                        browserScrollbarDragging = false
+                    } else if (slider == TRACK_LIST_SCROLLBAR_ID) {
+                        handleTrackListScrollbarDrag(py)
+                        trackListScrollbarDragging = false
+                    } else {
+                        handleUiAction(slider, px, persist = true)
+                    }
+                    activeSlider = null
+                    hoveredButton = if (slider == BROWSER_SCROLLBAR_ID) slider else target?.id
+                    renderVrMenu()
+                }
+            }
+        }
+    }
+
+    @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativeScroll(amount: Float) {
+        runOnUiThread {
+            if (isTrackListPointed()) {
+                stopBrowserScroll()
+                if (trackListScrollbarDragging) return@runOnUiThread
+                val nextInput =
+                    if (kotlin.math.abs(amount) >= BROWSER_JOYSTICK_DEAD_ZONE) amount else 0f
+                if (nextInput != 0f && !trackListScrollMoving) {
+                    trackListScrollMoving = true
+                    hoveredButton = null
+                    renderVrMenu()
+                }
+                if (nextInput != 0f) armControlsAutoHide()
+                trackListJoystickInput = nextInput
+                return@runOnUiThread
+            }
+            if (trackListScrollMoving) {
+                trackListJoystickInput = 0f
+            }
+            if (!isBrowserListScreen()) {
+                stopBrowserScroll()
+                return@runOnUiThread
+            }
+            if (browserScrollbarDragging) return@runOnUiThread
+            val nextInput = if (kotlin.math.abs(amount) >= BROWSER_JOYSTICK_DEAD_ZONE) amount else 0f
+            if (nextInput != 0f && !browserScrollMoving) {
+                browserScrollMoving = true
+                hoveredButton = null
+                renderVrMenu()
+            }
+            if (nextInput != 0f && uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+            browserJoystickInput = nextInput
+        }
+    }
+
+    @Suppress("unused") // Called once per OpenXR display frame from the render thread.
+    fun onNativeFrame(frameTimeNanos: Long) {
+        latestBrowserFrameNanos = frameTimeNanos
+        if (
+            (!browserScrollMoving && !trackListScrollMoving) ||
+            !browserFramePending.compareAndSet(false, true)
+        ) return
+        runOnUiThread {
+            try {
+                if (browserScrollMoving) updateBrowserScrollFrame(latestBrowserFrameNanos)
+                if (trackListScrollMoving) updateTrackListScrollFrame(latestBrowserFrameNanos)
+            } finally {
+                browserFramePending.set(false)
+            }
+        }
+    }
+
+    private fun isBrowserListScreen(): Boolean = when (uiScreen) {
+        UiScreen.LOCAL_FOLDERS,
+        UiScreen.LOCAL_FILES,
+        UiScreen.SMB_SERVERS,
+        UiScreen.SMB_SHARES,
+        UiScreen.SMB_FILES -> true
+        else -> false
+    }
+
+    private fun browserItemCount(): Int = when (uiScreen) {
+        UiScreen.LOCAL_FOLDERS -> localVideos.map { it.folder }.distinct().size
+        UiScreen.LOCAL_FILES -> localVideos.count { it.folder == localFolder }
+        UiScreen.SMB_SERVERS -> smbServers.size
+        UiScreen.SMB_SHARES -> smbShares.size
+        UiScreen.SMB_FILES -> smbEntries.size
+        else -> 0
+    }
+
+    private fun browserMaximumScroll(): Float =
+        (browserItemCount() - BROWSER_VISIBLE_ROWS).coerceAtLeast(0).toFloat()
+
+    private fun updateBrowserScrollFrame(frameTimeNanos: Long) {
+        if (!isBrowserListScreen() || browserScrollbarDragging) {
+            browserJoystickInput = 0f
+            browserScrollVelocity = 0f
+            browserScrollMoving = false
+            browserScrollFrameNanos = 0L
+            return
+        }
+        if (browserScrollFrameNanos == 0L) {
+            browserScrollFrameNanos = frameTimeNanos
+            return
+        }
+        val elapsedSeconds = (
+            (frameTimeNanos - browserScrollFrameNanos) / 1_000_000_000f
+        ).coerceIn(0.001f, 0.05f)
+        browserScrollFrameNanos = frameTimeNanos
+
+        if (browserJoystickInput != 0f) {
+            val normalized = (
+                (kotlin.math.abs(browserJoystickInput) - BROWSER_JOYSTICK_DEAD_ZONE) /
+                    (1f - BROWSER_JOYSTICK_DEAD_ZONE)
+            ).coerceIn(0f, 1f)
+            val shapedInput = kotlin.math.sign(browserJoystickInput) * normalized * normalized
+            val targetVelocity = -shapedInput * BROWSER_MAX_SCROLL_ROWS_PER_SECOND
+            val response = 1f - kotlin.math.exp(-BROWSER_SCROLL_ACCELERATION * elapsedSeconds)
+            browserScrollVelocity += (targetVelocity - browserScrollVelocity) * response
+        } else {
+            browserScrollVelocity *=
+                kotlin.math.exp(-BROWSER_SCROLL_FRICTION * elapsedSeconds)
+            if (kotlin.math.abs(browserScrollVelocity) < BROWSER_SCROLL_STOP_VELOCITY) {
+                browserScrollVelocity = 0f
+            }
+        }
+
+        val maximum = browserMaximumScroll()
+        val previous = browserScrollOffset
+        browserScrollOffset =
+            (browserScrollOffset + browserScrollVelocity * elapsedSeconds).coerceIn(0f, maximum)
+        if (
+            browserScrollOffset == 0f && browserScrollVelocity < 0f ||
+            browserScrollOffset == maximum && browserScrollVelocity > 0f
+        ) {
+            browserScrollVelocity = 0f
+        }
+        val stillMoving = browserJoystickInput != 0f || browserScrollVelocity != 0f
+        browserScrollMoving = stillMoving
+        if (browserScrollOffset != previous) {
+            hoveredButton = null
+            renderVrMenu()
+        }
+        if (!stillMoving) {
+            browserScrollFrameNanos = 0L
+        }
+    }
+
+    private fun stopBrowserScroll() {
+        browserJoystickInput = 0f
+        browserScrollVelocity = 0f
+        browserScrollMoving = false
+        browserScrollFrameNanos = 0L
+        browserFramePending.set(false)
+    }
+
+    private fun browserScrollbarThumbBounds(): RectF {
+        val maximum = browserMaximumScroll()
+        val itemCount = browserItemCount()
+        if (maximum <= 0f || itemCount <= 0) return RectF(BROWSER_SCROLLBAR_TRACK)
+        val thumbHeight = (
+            BROWSER_SCROLLBAR_TRACK.height() * BROWSER_VISIBLE_ROWS / itemCount.toFloat()
+        ).coerceAtLeast(BROWSER_SCROLLBAR_MIN_THUMB_HEIGHT)
+        val thumbTop = BROWSER_SCROLLBAR_TRACK.top +
+            (BROWSER_SCROLLBAR_TRACK.height() - thumbHeight) *
+            (browserScrollOffset.coerceIn(0f, maximum) / maximum)
+        return RectF(
+            BROWSER_SCROLLBAR_TRACK.left,
+            thumbTop,
+            BROWSER_SCROLLBAR_TRACK.right,
+            thumbTop + thumbHeight,
+        )
+    }
+
+    private fun handleBrowserScrollbarDrag(pointerY: Float) {
+        val maximum = browserMaximumScroll()
+        if (maximum <= 0f) return
+        val thumb = browserScrollbarThumbBounds()
+        val travel = BROWSER_SCROLLBAR_TRACK.height() - thumb.height()
+        if (travel <= 0f) return
+        val centerY = (
+            pointerY - browserScrollbarGrabOffset
+        ).coerceIn(
+            BROWSER_SCROLLBAR_TRACK.top + thumb.height() / 2f,
+            BROWSER_SCROLLBAR_TRACK.bottom - thumb.height() / 2f,
+        )
+        val fraction = (
+            (centerY - thumb.height() / 2f - BROWSER_SCROLLBAR_TRACK.top) / travel
+        ).coerceIn(0f, 1f)
+        browserScrollOffset = maximum * fraction
+        hoveredButton = BROWSER_SCROLLBAR_ID
+        renderVrMenu()
+    }
+
+    private fun isTrackPopoverOpen(): Boolean =
+        uiVisible &&
+            uiScreen == UiScreen.PLAYBACK &&
+            playbackPopover in setOf(PlaybackPopover.SUBTITLES, PlaybackPopover.AUDIO)
+
+    private fun isTrackListPointed(): Boolean =
+        isTrackPopoverOpen() && TRACK_LIST_POINTER_BOUNDS.contains(pointerUiX, pointerUiY)
+
+    private fun isTrackListButton(id: String?): Boolean =
+        id == TRACK_LIST_SCROLLBAR_ID ||
+            id?.startsWith("subtitle_") == true && !id.startsWith("subtitle_sync_") ||
+            id?.startsWith("audio_track_") == true
+
+    private fun trackListItemCount(): Int = when (playbackPopover) {
+        PlaybackPopover.SUBTITLES -> subtitleChoices.size
+        PlaybackPopover.AUDIO -> audioChoices.size
+        else -> 0
+    }
+
+    private fun trackListScrollOffset(): Float = when (playbackPopover) {
+        PlaybackPopover.SUBTITLES -> subtitleTrackScrollOffset
+        PlaybackPopover.AUDIO -> audioTrackScrollOffset
+        else -> 0f
+    }
+
+    private fun setTrackListScrollOffset(value: Float) {
+        val adjusted = value.coerceIn(0f, trackListMaximumScroll())
+        when (playbackPopover) {
+            PlaybackPopover.SUBTITLES -> subtitleTrackScrollOffset = adjusted
+            PlaybackPopover.AUDIO -> audioTrackScrollOffset = adjusted
+            else -> Unit
+        }
+    }
+
+    private fun trackListMaximumScroll(): Float =
+        (trackListItemCount() - TRACK_LIST_VISIBLE_ROWS).coerceAtLeast(0).toFloat()
+
+    private fun ensureSelectedTrackVisible() {
+        val selected = when (playbackPopover) {
+            PlaybackPopover.SUBTITLES -> subtitleChoiceIndex
+            PlaybackPopover.AUDIO -> audioChoiceIndex
+            else -> return
+        }
+        val current = trackListScrollOffset()
+        val next = when {
+            selected < current -> selected.toFloat()
+            selected >= current + TRACK_LIST_VISIBLE_ROWS ->
+                (selected - TRACK_LIST_VISIBLE_ROWS + 1).toFloat()
+            else -> current
+        }
+        setTrackListScrollOffset(next)
+    }
+
+    private fun updateTrackListScrollFrame(frameTimeNanos: Long) {
+        if (!isTrackPopoverOpen() || trackListScrollbarDragging) {
+            stopTrackListScroll()
+            return
+        }
+        if (trackListScrollFrameNanos == 0L) {
+            trackListScrollFrameNanos = frameTimeNanos
+            return
+        }
+        val elapsedSeconds = (
+            (frameTimeNanos - trackListScrollFrameNanos) / 1_000_000_000f
+        ).coerceIn(0.001f, 0.05f)
+        trackListScrollFrameNanos = frameTimeNanos
+
+        if (trackListJoystickInput != 0f) {
+            val normalized = (
+                (kotlin.math.abs(trackListJoystickInput) - BROWSER_JOYSTICK_DEAD_ZONE) /
+                    (1f - BROWSER_JOYSTICK_DEAD_ZONE)
+            ).coerceIn(0f, 1f)
+            val shapedInput =
+                kotlin.math.sign(trackListJoystickInput) * normalized * normalized
+            val targetVelocity = -shapedInput * TRACK_LIST_MAX_SCROLL_ROWS_PER_SECOND
+            val response =
+                1f - kotlin.math.exp(-BROWSER_SCROLL_ACCELERATION * elapsedSeconds)
+            trackListScrollVelocity +=
+                (targetVelocity - trackListScrollVelocity) * response
+        } else {
+            trackListScrollVelocity *=
+                kotlin.math.exp(-BROWSER_SCROLL_FRICTION * elapsedSeconds)
+            if (kotlin.math.abs(trackListScrollVelocity) < BROWSER_SCROLL_STOP_VELOCITY) {
+                trackListScrollVelocity = 0f
+            }
+        }
+
+        val maximum = trackListMaximumScroll()
+        val previous = trackListScrollOffset()
+        val next =
+            (previous + trackListScrollVelocity * elapsedSeconds).coerceIn(0f, maximum)
+        setTrackListScrollOffset(next)
+        if (
+            next == 0f && trackListScrollVelocity < 0f ||
+            next == maximum && trackListScrollVelocity > 0f
+        ) {
+            trackListScrollVelocity = 0f
+        }
+        val stillMoving = trackListJoystickInput != 0f || trackListScrollVelocity != 0f
+        trackListScrollMoving = stillMoving
+        if (next != previous) {
+            hoveredButton = null
+            renderVrMenu()
+        }
+        if (!stillMoving) trackListScrollFrameNanos = 0L
+    }
+
+    private fun stopTrackListScroll() {
+        trackListJoystickInput = 0f
+        trackListScrollVelocity = 0f
+        trackListScrollMoving = false
+        trackListScrollFrameNanos = 0L
+        browserFramePending.set(false)
+    }
+
+    private fun trackListScrollbarThumbBounds(): RectF {
+        val maximum = trackListMaximumScroll()
+        val itemCount = trackListItemCount()
+        if (maximum <= 0f || itemCount <= 0) return RectF(TRACK_LIST_SCROLLBAR_TRACK)
+        val thumbHeight = (
+            TRACK_LIST_SCROLLBAR_TRACK.height() *
+                TRACK_LIST_VISIBLE_ROWS / itemCount.toFloat()
+        ).coerceAtLeast(TRACK_LIST_SCROLLBAR_MIN_THUMB_HEIGHT)
+        val thumbTop = TRACK_LIST_SCROLLBAR_TRACK.top +
+            (TRACK_LIST_SCROLLBAR_TRACK.height() - thumbHeight) *
+            (trackListScrollOffset().coerceIn(0f, maximum) / maximum)
+        return RectF(
+            TRACK_LIST_SCROLLBAR_TRACK.left,
+            thumbTop,
+            TRACK_LIST_SCROLLBAR_TRACK.right,
+            thumbTop + thumbHeight,
+        )
+    }
+
+    private fun handleTrackListScrollbarDrag(pointerY: Float) {
+        val maximum = trackListMaximumScroll()
+        if (maximum <= 0f) return
+        val thumb = trackListScrollbarThumbBounds()
+        val travel = TRACK_LIST_SCROLLBAR_TRACK.height() - thumb.height()
+        if (travel <= 0f) return
+        val centerY = (
+            pointerY - trackListScrollbarGrabOffset
+        ).coerceIn(
+            TRACK_LIST_SCROLLBAR_TRACK.top + thumb.height() / 2f,
+            TRACK_LIST_SCROLLBAR_TRACK.bottom - thumb.height() / 2f,
+        )
+        val fraction = (
+            (centerY - thumb.height() / 2f - TRACK_LIST_SCROLLBAR_TRACK.top) / travel
+        ).coerceIn(0f, 1f)
+        setTrackListScrollOffset(maximum * fraction)
+        hoveredButton = TRACK_LIST_SCROLLBAR_ID
+        renderVrMenu()
+    }
+
+    private fun loadMedia(
+        newSpec: PlaybackSpec,
+        browserReturn: BrowserReturnState? = null,
+        resumeOverrideMs: Long? = null,
+        autoSoftwareFallback: Boolean = false,
+    ) {
+        if (mediaLoaded) {
+            releaseCurrentPlayer(saveState = true)
+        }
+        latestCues = emptyList()
+        playbackBrowserReturn = browserReturn
+        playbackCompleted = false
+        currentMediaMarkedPlayed = false
+        subtitleChoices = listOf(
+            SubtitleChoice("Auto", null, -1, SUBTITLE_AUTO),
+            SubtitleChoice("Off", null, -1, SUBTITLE_OFF),
+        )
+        subtitleChoiceIndex = 0
+        subtitleTrackScrollOffset = 0f
+        audioChoices = listOf(AudioChoice("Auto", null, -1, AUDIO_AUTO))
+        audioChoiceIndex = 0
+        audioTrackScrollOffset = 0f
+        nativeSetSubtitle(renderSubtitle(emptyList()))
+        val savedPlaybackState = mediaStateStore.loadPlaybackState(newSpec)
+        decoderMode = DecoderMode.fromWire(
+            savedPlaybackState?.decoderMode ?: DecoderMode.AUTO.wireValue
+        )
+        effectiveDecoderMode = when {
+            decoderMode == DecoderMode.SOFTWARE -> DecoderMode.SOFTWARE
+            decoderMode == DecoderMode.AUTO &&
+                (autoSoftwareFallback || savedPlaybackState?.decoderAutoSoftware == true) ->
+                DecoderMode.SOFTWARE
+            else -> DecoderMode.HARDWARE
+        }
+        val savedPicture = savedPlaybackState?.pictureSettings
+        currentMediaHasSavedPictureSettings = savedPicture != null
+        hdrDefaultExposureApplied = false
+        pictureMode = PictureMode.fromWire(savedPicture?.mode ?: PictureMode.AUTO.wireValue)
+        pictureBrightness = savedPicture?.brightness
+            ?.coerceIn(PICTURE_BRIGHTNESS_MIN, PICTURE_BRIGHTNESS_MAX)
+            ?: DEFAULT_PICTURE_BRIGHTNESS
+        pictureExposure = savedPicture?.exposure
+            ?.coerceIn(PICTURE_EXPOSURE_MIN, PICTURE_EXPOSURE_MAX)
+            ?: DEFAULT_PICTURE_EXPOSURE
+        pictureContrast = savedPicture?.contrast
+            ?.coerceIn(PICTURE_CONTRAST_MIN, PICTURE_CONTRAST_MAX)
+            ?: DEFAULT_PICTURE_CONTRAST
+        pictureSaturation = savedPicture?.saturation
+            ?.coerceIn(PICTURE_SATURATION_MIN, PICTURE_SATURATION_MAX)
+            ?: DEFAULT_PICTURE_SATURATION
+        pictureVibrance = savedPicture?.vibrance
+            ?.coerceIn(PICTURE_VIBRANCE_MIN, PICTURE_VIBRANCE_MAX)
+            ?: DEFAULT_PICTURE_VIBRANCE
+        applyPictureSettings(persist = false)
+        pendingSubtitleFingerprint = savedPlaybackState?.subtitleFingerprint
+        subtitleSyncMs = savedPlaybackState?.subtitleSyncMs
+            ?.coerceIn(-MAX_SUBTITLE_SYNC_MS, MAX_SUBTITLE_SYNC_MS)
+            ?: 0
+        pendingAudioFingerprint = savedPlaybackState?.audioTrackFingerprint
+        val savedProjection = mediaStateStore.loadProjection(newSpec)
+            ?.takeIf { it.manuallySelected }
+            ?.mode
+        val detectedProjection = FilenameProjectionDetector.detect(newSpec.title)
+        currentStereoMode = savedProjection
+            ?: if (newSpec.projectionExplicit) newSpec.stereoMode
+            else detectedProjection ?: StereoMode.MONO
+        spec = newSpec.copy(stereoMode = currentStereoMode)
+        if (newSpec.projectionExplicit && savedProjection == null) {
+            mediaStateStore.saveProjection(spec, currentStereoMode)
+        }
+        Log.i(
+            "DreamPlayerState",
+            "Projection for ${newSpec.title}: $currentStereoMode " +
+                "(source=${when {
+                    savedProjection != null -> "saved"
+                    newSpec.projectionExplicit -> "explicit"
+                    detectedProjection != null -> "filename"
+                    else -> "default"
+                }}, mediaId=${MediaIdentity.from(spec).id.take(12)})",
+        )
+        nativeSetStereoMode(currentStereoMode.wireValue)
+        subtitleDepthIsCustom = savedPlaybackState?.subtitleDepthMeters != null
+        subtitleDepthMeters = savedPlaybackState?.subtitleDepthMeters
+            ?.coerceIn(SUBTITLE_DEPTH_MIN_METERS, SUBTITLE_DEPTH_MAX_METERS)
+            ?: defaultSubtitleDepth(currentStereoMode)
+        nativeSetSubtitleDepth(subtitleDepthMeters)
+        screenCurvature = savedPlaybackState?.screenCurvature
+            ?.coerceIn(SCREEN_CURVATURE_MIN, SCREEN_CURVATURE_MAX)
+            ?: DEFAULT_SCREEN_CURVATURE
+        nativeSetScreenCurvature(screenCurvature)
+        val transform = savedPlaybackState?.screenTransform ?: DEFAULT_SCREEN_TRANSFORM
+        nativeSetScreenTransform(transform.x, transform.y, transform.z, transform.halfHeight)
+        audioSyncMs = savedPlaybackState?.audioSyncMs
+            ?.coerceIn(-AudioSyncAudioProcessor.MAX_DELAY_MS, AudioSyncAudioProcessor.MAX_DELAY_MS)
+            ?: 0
+        audioSyncProcessor = AudioSyncAudioProcessor(audioSyncMs)
+        val dataSourceFactory = if (newSpec.uri.startsWith("smb://")) {
+            SmbDataSource.Factory(requireNotNull(newSpec.smb))
+        } else {
+            DefaultDataSource.Factory(this)
+        }
+        val renderersFactory = object : NextRenderersFactory(this@PlayerActivity) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean,
+            ): AudioSink = DefaultAudioSink.Builder(context)
+                .setAudioProcessors(arrayOf(StereoDownmixAudioProcessor(), audioSyncProcessor))
+                .setEnableFloatOutput(false)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .build()
+        }.apply {
+            // PfD's platform DTS decoder exposes 8 KiB input buffers, which are smaller than
+            // valid DTS-HD access units in some Blu-ray remuxes. Prefer FFmpeg for DTS audio only;
+            // video and every other audio codec retain their existing renderer order.
+            setPreferFfmpegForDts(true)
+            setExtensionRendererMode(
+                if (effectiveDecoderMode == DecoderMode.SOFTWARE) {
+                    DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+                } else {
+                    DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
+                }
+            )
+        }
+        player = ExoPlayer.Builder(this, renderersFactory)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+            .build()
+            .also { it.addListener(this) }
+        player.subtitleDelayMilliseconds = subtitleSyncMs.toLong()
+        videoSurface?.let(player::setVideoSurface)
+        val item = MediaItem.Builder().setUri(Uri.parse(newSpec.uri)).apply {
+            newSpec.subtitleUri?.let { subtitleUri ->
+                setSubtitleConfigurations(
+                    listOf(
+                        MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitleUri))
+                            .setMimeType(subtitleMime(subtitleUri))
+                            .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                            .build()
+                    )
+                )
+            }
+        }.build()
+        player.setMediaItem(item)
+        (resumeOverrideMs ?: resumePosition(savedPlaybackState))?.let { position ->
+            player.seekTo(position)
+            Log.i("DreamPlayerState", "Resuming ${newSpec.title} at ${formatTime(position)}")
+        }
+        player.prepare()
+        player.playWhenReady = true
+        mediaLoaded = true
+        if (resumeOverrideMs != null) {
+            saveCurrentMediaState(positionOverrideMs = resumeOverrideMs)
+        }
+        mainHandler.removeCallbacks(stateSaver)
+        mainHandler.postDelayed(stateSaver, STATE_SAVE_INTERVAL_MS)
+        resetPlaybackHealthMonitor()
+        mainHandler.removeCallbacks(playbackHealthMonitor)
+        mainHandler.postDelayed(playbackHealthMonitor, 1_000L)
+        nativeSetVideoAvailable(true)
+        showControls(8_000L)
+    }
+
+    private fun releaseCurrentPlayer(saveState: Boolean) {
+        if (!mediaLoaded) return
+        if (saveState) saveCurrentMediaState()
+        mainHandler.removeCallbacks(stateSaver)
+        mainHandler.removeCallbacks(playbackHealthMonitor)
+        mediaLoaded = false
+        nativeSetVideoAvailable(false)
+
+        // Do not explicitly detach the external OpenXR surface here. On PfD,
+        // clearVideoSurface() blocks until Media3's detach timeout and leaves the
+        // ANativeWindow connected, preventing every subsequent decoder from using it.
+        // Direct release tears down the renderer and disconnects its codec cleanly.
+        player.release()
+    }
+
+    private fun showLibrary() {
+        nativeSetVideoAvailable(false)
+        recentMedia = mediaStateStore.listRecent(RECENT_MEDIA_LIMIT)
+        uiScreen = UiScreen.LIBRARY
+        playbackPopover = PlaybackPopover.NONE
+        uiVisible = true
+        hoveredButton = null
+        mainHandler.removeCallbacks(uiTicker)
+        renderVrMenu()
+    }
+
+    private fun playRecent(index: Int) {
+        val recent = recentMedia.getOrNull(index) ?: return
+        val parsed = Uri.parse(recent.uri)
+        if (!parsed.scheme.equals("smb", ignoreCase = true)) {
+            transientMessage = null
+            loadMedia(PlaybackSpec(recent.uri, recent.title, StereoMode.MONO))
+            return
+        }
+
+        val host = parsed.host.orEmpty()
+        val share = recent.smbShare.orEmpty()
+        if (host.isBlank() || share.isBlank()) {
+            transientMessage = "Cannot open recent SMB file: its server or share is missing"
+            renderVrMenu()
+            return
+        }
+
+        val saved = smbCredentialStore.load()
+            ?.takeIf { hostsMatch(it.host, host) }
+        val credentials = (saved ?: SmbCredentials(host, share, "", "", ""))
+            .copy(host = host, share = share)
+        val path = parsed.pathSegments.joinToString("\\")
+        transientMessage = "Opening ${recent.title}..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                SmbRepository(credentials).use { repository ->
+                    repository.open(path).use { /* Opening proves authentication and file access. */ }
+                }
+            }.onSuccess {
+                runOnUiThread {
+                    smbCredentials = credentials
+                    smbDisplayHost = host
+                    rememberSmbCredentials = saved != null
+                    transientMessage = null
+                    loadMedia(
+                        PlaybackSpec(
+                            recent.uri,
+                            recent.title,
+                            StereoMode.MONO,
+                            smb = credentials,
+                        )
+                    )
+                }
+            }.onFailure { error ->
+                runOnUiThread {
+                    transientMessage =
+                        "Could not open recent SMB file: ${friendlySmbError(error)}"
+                    hoveredButton = null
+                    renderVrMenu()
+                }
+            }
+        }
+    }
+
+    private fun returnToSourceBrowser() {
+        val destination = playbackBrowserReturn
+        playbackBrowserReturn = null
+        playbackPopover = PlaybackPopover.NONE
+        uiVisible = true
+        hoveredButton = null
+        transientMessage = null
+        mainHandler.removeCallbacks(uiTicker)
+        when (destination) {
+            is BrowserReturnState.Local -> {
+                localFolder = destination.folder
+                browserScrollOffset = destination.scrollOffset
+                uiScreen = UiScreen.LOCAL_FILES
+                renderVrMenu()
+            }
+            is BrowserReturnState.Smb -> {
+                smbCredentials = destination.credentials
+                smbPath = destination.path
+                smbEntries = destination.entries
+                browserScrollOffset = destination.scrollOffset
+                uiScreen = UiScreen.SMB_FILES
+                renderVrMenu()
+            }
+            null -> showLibrary()
+        }
+    }
+
+    private fun openLocalBrowser() {
+        val permission = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_VIDEO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(permission), REQUEST_MEDIA_PERMISSION)
+            return
+        }
+        loadLocalVideos()
+    }
+
+    private fun loadLocalVideos() {
+        transientMessage = "Scanning local videos..."
+        renderVrMenu()
+        io.execute {
+            runCatching { LocalVideoRepository(this).list() }
+                .onSuccess { videos ->
+                    runOnUiThread {
+                        localVideos = videos
+                        localFolder = null
+                        browserScrollOffset = 0f
+                        localFolderListScrollOffset = 0f
+                        transientMessage = null
+                        uiScreen = UiScreen.LOCAL_FOLDERS
+                        hoveredButton = null
+                        renderVrMenu()
+                    }
+                }
+                .onFailure { error -> runOnUiThread {
+                    transientMessage = "Local library error: ${error.message.orEmpty()}"
+                    showLibrary()
+                } }
+        }
+    }
+
+    private fun discoverSmbServers() {
+        uiScreen = UiScreen.SMB_SERVERS
+        browserScrollOffset = 0f
+        smbServerListScrollOffset = 0f
+        transientMessage = "Scanning the local network for SMB servers..."
+        hoveredButton = null
+        renderVrMenu()
+        io.execute {
+            runCatching { SmbDiscovery(this).discover() }
+                .onSuccess { servers -> runOnUiThread {
+                    val remembered = smbCredentials.host.takeIf { rememberSmbCredentials && it.isNotBlank() }
+                    smbServers = (listOfNotNull(remembered?.let(::SmbServer)) + servers).distinctBy { it.host }
+                    transientMessage = if (smbServers.isEmpty()) "No SMB servers found; use Add server" else null
+                    renderVrMenu()
+                } }
+                .onFailure { error -> runOnUiThread {
+                    transientMessage = "SMB discovery error: ${error.message.orEmpty()}"
+                    renderVrMenu()
+                } }
+        }
+    }
+
+    private fun showSmbLogin(
+        host: String = smbCredentials.host,
+        displayHost: String = smbDisplayHost.ifBlank { host },
+        errorMessage: String? = null,
+    ) {
+        smbDisplayHost = displayHost.ifBlank { host }
+        smbCredentials = if (host == smbCredentials.host) smbCredentials.copy(share = "")
+        else SmbCredentials(host, "", "", "", "")
+        uiScreen = UiScreen.SMB_LOGIN
+        hoveredButton = null
+        transientMessage = errorMessage
+        renderVrMenu()
+    }
+
+    private fun openSmbServer(server: SmbServer) {
+        smbDisplayHost = server.displayName
+        val saved = smbCredentialStore.load()
+        val savedMatches = saved != null && sequenceOf(
+            server.host,
+            server.displayName,
+        ).any { candidate -> hostsMatch(saved.host, candidate) }
+        if (savedMatches) {
+            rememberSmbCredentials = true
+            smbCredentials = requireNotNull(saved).copy(host = server.host, share = "")
+            connectSmb(autoLogin = true)
+        } else {
+            showSmbLogin(server.host, server.displayName)
+        }
+    }
+
+    private fun hostsMatch(first: String, second: String): Boolean {
+        fun normalized(value: String) = value.trim()
+            .trimEnd('.')
+            .lowercase(Locale.ROOT)
+            .removeSuffix(".local")
+        val left = normalized(first)
+        val right = normalized(second)
+        if (left == right) return true
+        val ipv4 = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
+        return !ipv4.matches(left) && !ipv4.matches(right) &&
+            left.substringBefore('.') == right.substringBefore('.')
+    }
+
+    private fun connectSmb(autoLogin: Boolean = false) {
+        if (smbCredentials.host.isBlank()) {
+            transientMessage = "Enter a server hostname or IP address"
+            renderVrMenu()
+            return
+        }
+        if (smbDisplayHost.isBlank()) smbDisplayHost = smbCredentials.host
+        transientMessage = "Connecting to ${smbCredentials.host}..."
+        renderVrMenu()
+        val credentials = smbCredentials.copy(share = "")
+        io.execute {
+            runCatching { SmbShareBrowser().listShares(credentials) }
+                .onSuccess { shares -> runOnUiThread {
+                    smbCredentials = credentials
+                    if (rememberSmbCredentials) smbCredentialStore.save(credentials)
+                    else smbCredentialStore.clear()
+                    smbShares = shares
+                    browserScrollOffset = 0f
+                    smbShareListScrollOffset = 0f
+                    smbNavigationStack.clear()
+                    transientMessage = if (shares.isEmpty()) "No accessible shares were returned" else null
+                    uiScreen = UiScreen.SMB_SHARES
+                    hoveredButton = null
+                    renderVrMenu()
+                } }
+                .onFailure { error -> runOnUiThread {
+                    val message = "SMB login failed: ${friendlySmbError(error)}"
+                    if (autoLogin) {
+                        showSmbLogin(
+                            host = credentials.host,
+                            displayHost = smbDisplayHost,
+                            errorMessage = message,
+                        )
+                    } else {
+                        transientMessage = message
+                        renderVrMenu()
+                    }
+                } }
+        }
+    }
+
+    private fun browseSmb(
+        path: String,
+        restoreScrollOffset: Float = 0f,
+        rollbackNavigationOnFailure: Boolean = false,
+    ) {
+        val credentials = smbCredentials
+        transientMessage = "Loading ${if (path.isBlank()) credentials.share else path}..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                SmbRepository(credentials).use { repository ->
+                    repository.list(path).filter { it.isDirectory || isVideoFile(it.name) }
+                }
+            }.onSuccess { entries -> runOnUiThread {
+                smbPath = path
+                smbEntries = entries
+                browserScrollOffset = restoreScrollOffset
+                transientMessage = null
+                uiScreen = UiScreen.SMB_FILES
+                hoveredButton = null
+                renderVrMenu()
+            } }.onFailure { error -> runOnUiThread {
+                if (rollbackNavigationOnFailure && smbNavigationStack.isNotEmpty()) {
+                    smbNavigationStack.removeLast()
+                }
+                transientMessage = "SMB folder error: ${friendlySmbError(error)}"
+                renderVrMenu()
+            } }
+        }
+    }
+
+    private fun friendlySmbError(error: Throwable): String {
+        val message = generateSequence(error) { it.cause }.mapNotNull { it.message }.firstOrNull().orEmpty()
+        return when {
+            message.contains("logon", true) || message.contains("access", true) -> "check username, password, and domain"
+            message.contains("timed out", true) || message.contains("connect", true) -> "server did not respond"
+            else -> message.ifBlank { error.javaClass.simpleName }
+        }.take(100)
+    }
+
+    private fun isVideoFile(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in setOf(
+        "mkv", "mp4", "m4v", "mov", "avi", "webm", "ts", "m2ts", "mts", "mpg", "mpeg", "wmv",
+    )
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_MEDIA_PERMISSION) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) loadLocalVideos()
+            else {
+                transientMessage = "Video permission is required for the in-VR library"
+                showLibrary()
+            }
+        }
+    }
+
+    private fun chooseLocalVideo() {
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "video/*"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            },
+            REQUEST_VIDEO,
+        )
+    }
+
+    @Deprecated("Activity result API retained because this activity must stay a native VR Activity")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_VIDEO || resultCode != RESULT_OK) {
+            if (!mediaLoaded) showLibrary()
+            return
+        }
+        val uri = data?.data ?: return
+        runCatching {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        loadMedia(PlaybackSpec(uri.toString(), uri.lastPathSegment ?: "Video", currentStereoMode))
+    }
+
+    @Suppress("unused") // Called from JNI if the runtime exits or initialization fails.
+    fun onNativeExit(reason: String) {
+        runOnUiThread {
+            if (reason.isNotBlank()) {
+                message.text = reason
+                message.visibility = View.VISIBLE
+            } else {
+                finish()
+            }
+        }
+    }
+
+    override fun onCues(cueGroup: CueGroup) {
+        latestCues = cueGroup.cues
+        cueGroup.cues.firstOrNull { it.bitmap != null }?.let { cue ->
+            Log.i(
+                "DreamPlayerSubtitle",
+                "Bitmap cue ${cue.bitmap?.width}x${cue.bitmap?.height} " +
+                    "position=${cue.position} line=${cue.line} " +
+                    "size=${cue.size} bitmapHeight=${cue.bitmapHeight}",
+            )
+        }
+        if (!uiVisible) applySubtitleCues(latestCues)
+    }
+
+    override fun onTracksChanged(tracks: Tracks) {
+        val discovered = mutableListOf(
+            SubtitleChoice("Auto", null, -1, SUBTITLE_AUTO),
+            SubtitleChoice("Off", null, -1, SUBTITLE_OFF),
+        )
+        val fingerprintOccurrences = mutableMapOf<String, Int>()
+        tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { group ->
+            for (trackIndex in 0 until group.length) {
+                val format = group.getTrackFormat(trackIndex)
+                val name = listOfNotNull(
+                    format.label?.takeIf { it.isNotBlank() },
+                    format.language?.takeIf { it.isNotBlank() },
+                ).distinct().joinToString(" - ").ifBlank { "Subtitle ${discovered.size - 1}" }
+                val baseFingerprint = subtitleFingerprint(format)
+                val occurrence = fingerprintOccurrences.getOrDefault(baseFingerprint, 0)
+                fingerprintOccurrences[baseFingerprint] = occurrence + 1
+                discovered += SubtitleChoice(name, group, trackIndex, "$baseFingerprint#$occurrence")
+            }
+        }
+        val discoveredAudio = mutableListOf(AudioChoice("Auto", null, -1, AUDIO_AUTO))
+        val audioFingerprintOccurrences = mutableMapOf<String, Int>()
+        tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }.forEachIndexed { groupIndex, group ->
+            for (trackIndex in 0 until group.length) {
+                val format = group.getTrackFormat(trackIndex)
+                val supported = group.isTrackSupported(trackIndex)
+                Log.i(
+                    "DreamPlayerAudio",
+                    "group=$groupIndex track=$trackIndex selected=${group.isTrackSelected(trackIndex)} " +
+                        "supported=$supported mime=${format.sampleMimeType} " +
+                        "codecs=${format.codecs} channels=${format.channelCount} rate=${format.sampleRate}",
+                )
+                if (supported) {
+                    val baseFingerprint = audioFingerprint(format)
+                    val occurrence = audioFingerprintOccurrences.getOrDefault(baseFingerprint, 0)
+                    audioFingerprintOccurrences[baseFingerprint] = occurrence + 1
+                    discoveredAudio += AudioChoice(
+                        label = audioTrackLabel(format, discoveredAudio.size),
+                        group = group,
+                        trackIndex = trackIndex,
+                        fingerprint = "$baseFingerprint#$occurrence",
+                    )
+                }
+            }
+        }
+        var selectedVideoFormat: Format? = null
+        tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }.forEachIndexed { groupIndex, group ->
+            for (trackIndex in 0 until group.length) {
+                val format = group.getTrackFormat(trackIndex)
+                val color = format.colorInfo
+                if (group.isTrackSelected(trackIndex)) selectedVideoFormat = format
+                Log.i(
+                    "DreamPlayerVideo",
+                    "group=$groupIndex track=$trackIndex selected=${group.isTrackSelected(trackIndex)} " +
+                        "mime=${format.sampleMimeType} size=${format.width}x${format.height} " +
+                        "space=${color?.colorSpace} range=${color?.colorRange} transfer=${color?.colorTransfer}",
+                )
+            }
+        }
+        selectedVideoFormat?.let(::applyVideoColorInfo)
+        subtitleChoices = discovered
+        val savedFingerprint = pendingSubtitleFingerprint
+        if (savedFingerprint != null) {
+            val restoredIndex = discovered.indexOfFirst { it.fingerprint == savedFingerprint }
+            if (restoredIndex >= 0) {
+                applySubtitle(restoredIndex, persist = false)
+                pendingSubtitleFingerprint = null
+                Log.i("DreamPlayerState", "Restored subtitle: ${discovered[restoredIndex].label}")
+            }
+        } else if (subtitleChoiceIndex !in discovered.indices) {
+            subtitleChoiceIndex = 0
+        }
+        audioChoices = discoveredAudio
+        val savedAudioFingerprint = pendingAudioFingerprint
+        if (savedAudioFingerprint != null) {
+            val restoredIndex = discoveredAudio.indexOfFirst { it.fingerprint == savedAudioFingerprint }
+            if (restoredIndex >= 0) {
+                pendingAudioFingerprint = null
+                applyAudioTrack(restoredIndex, persist = false)
+                Log.i("DreamPlayerState", "Restored audio: ${discoveredAudio[restoredIndex].label}")
+            }
+        } else {
+            audioChoiceIndex = discoveredAudio.indexOfFirst { choice ->
+                choice.group?.isTrackSelected(choice.trackIndex) == true
+            }.takeIf { it >= 0 } ?: 0
+        }
+        if (
+            uiVisible && (
+                uiScreen == UiScreen.SUBTITLES ||
+                    uiScreen == UiScreen.AUDIO_TRACKS ||
+                    (
+                        uiScreen == UiScreen.PLAYBACK &&
+                            playbackPopover in setOf(
+                                PlaybackPopover.SUBTITLES,
+                                PlaybackPopover.AUDIO,
+                            )
+                        )
+                )
+        ) {
+            if (isTrackPopoverOpen()) ensureSelectedTrackVisible()
+            renderVrMenu()
+        }
+    }
+
+    override fun onPlaybackStateChanged(playbackState: Int) {
+        if (
+            playbackState == Player.STATE_READY &&
+            mediaLoaded &&
+            !currentMediaMarkedPlayed &&
+            spec.uri.isNotBlank()
+        ) {
+            mediaStateStore.markPlayed(spec)
+            currentMediaMarkedPlayed = true
+        }
+        if (playbackState == Player.STATE_ENDED && mediaLoaded) {
+            playbackCompleted = true
+            saveCurrentMediaState(positionOverrideMs = 0L)
+        }
+    }
+
+    override fun onIsPlayingChanged(isPlaying: Boolean) {
+        if (isPlaying) playbackCompleted = false
+    }
+
+    override fun onPlayerError(error: PlaybackException) {
+        message.text = "Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}"
+        message.visibility = View.VISIBLE
+        showOsd("Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}", 10_000L)
+    }
+
+    override fun onVideoSizeChanged(videoSize: VideoSize) {
+        if (videoSize.width <= 0 || videoSize.height <= 0) return
+        lastVideoSize = videoSize
+        updateVideoAspect()
+    }
+
+    private fun updateVideoAspect() {
+        val videoSize = lastVideoSize
+        if (videoSize.width <= 0 || videoSize.height <= 0) return
+        val pixelAspect = if (videoSize.pixelWidthHeightRatio > 0f) videoSize.pixelWidthHeightRatio else 1f
+        val fullAspect = videoSize.width * pixelAspect / videoSize.height
+        val eyeAspect = when (currentStereoMode) {
+            StereoMode.MONO -> fullAspect
+            StereoMode.SBS -> fullAspect / 2f
+            StereoMode.OVER_UNDER -> fullAspect * 2f
+            StereoMode.HALF_SBS,
+            StereoMode.HALF_OVER_UNDER -> fullAspect
+        }
+        nativeSetVideoAspect(eyeAspect)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
+        return when (event.keyCode) {
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_BUTTON_A -> {
+                if (!mediaLoaded) {
+                    chooseLocalVideo()
+                } else {
+                    if (player.isPlaying) player.pause() else player.play()
+                    showOsd(if (player.isPlaying) "Playing" else "Paused")
+                }
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (!mediaLoaded) return true
+                player.seekTo((player.currentPosition - 10_000L).coerceAtLeast(0L))
+                showOsd("Seek -10 seconds")
+                true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (!mediaLoaded) return true
+                player.seekTo(player.currentPosition + 10_000L)
+                showOsd("Seek +10 seconds")
+                true
+            }
+            KeyEvent.KEYCODE_BUTTON_X,
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                cycleStereoMode()
+                true
+            }
+            KeyEvent.KEYCODE_BUTTON_Y,
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                cycleSubtitle()
+                true
+            }
+            KeyEvent.KEYCODE_MENU -> {
+                showControls(8_000L)
+                true
+            }
+            KeyEvent.KEYCODE_BUTTON_B -> {
+                finish()
+                true
+            }
+            else -> super.dispatchKeyEvent(event)
+        }
+    }
+
+    private fun cycleStereoMode() {
+        currentStereoMode = when (currentStereoMode) {
+            StereoMode.MONO -> StereoMode.SBS
+            StereoMode.SBS -> StereoMode.HALF_SBS
+            StereoMode.HALF_SBS -> StereoMode.OVER_UNDER
+            StereoMode.OVER_UNDER -> StereoMode.HALF_OVER_UNDER
+            StereoMode.HALF_OVER_UNDER -> StereoMode.MONO
+        }
+        nativeSetStereoMode(currentStereoMode.wireValue)
+        applyDefaultSubtitleDepthForProjection()
+        mediaStateStore.saveProjection(spec, currentStereoMode)
+        updateVideoAspect()
+        showControls(0L)
+    }
+
+    private fun cycleSubtitle() {
+        if (!mediaLoaded) {
+            showOsd("No video loaded")
+            return
+        }
+        applySubtitle((subtitleChoiceIndex + 1) % subtitleChoices.size)
+        showControls(0L)
+    }
+
+    private fun applySubtitle(index: Int, persist: Boolean = true) {
+        subtitleChoiceIndex = index.coerceIn(subtitleChoices.indices)
+        val choice = subtitleChoices[subtitleChoiceIndex]
+        val builder = player.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+        when (subtitleChoiceIndex) {
+            0 -> Unit
+            1 -> builder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+            else -> choice.group?.let {
+                builder.setOverrideForType(TrackSelectionOverride(it.mediaTrackGroup, choice.trackIndex))
+            }
+        }
+        player.trackSelectionParameters = builder.build()
+        if (persist) {
+            pendingSubtitleFingerprint = null
+            mediaStateStore.saveSubtitle(spec, choice.fingerprint)
+        }
+    }
+
+    private fun subtitleFingerprint(format: Format): String {
+        fun normalized(value: String?) = value.orEmpty().trim().lowercase(Locale.ROOT)
+        return listOf(
+            normalized(format.language),
+            normalized(format.label),
+            normalized(format.sampleMimeType),
+            format.roleFlags.toString(),
+            format.selectionFlags.toString(),
+        ).joinToString("|")
+    }
+
+    private fun audioFingerprint(format: Format): String {
+        fun normalized(value: String?) = value.orEmpty().trim().lowercase(Locale.ROOT)
+        return listOf(
+            normalized(format.language),
+            normalized(format.label),
+            normalized(format.sampleMimeType),
+            normalized(format.codecs),
+            format.channelCount.toString(),
+            format.sampleRate.toString(),
+            format.roleFlags.toString(),
+        ).joinToString("|")
+    }
+
+    private fun audioTrackLabel(format: Format, fallbackIndex: Int): String {
+        val channelLabel = when (format.channelCount) {
+            1 -> "Mono"
+            2 -> "Stereo"
+            6 -> "5.1"
+            8 -> "7.1"
+            C.LENGTH_UNSET -> null
+            else -> "${format.channelCount} ch"
+        }
+        val codecLabel = format.codecs
+            ?.substringBefore('.')
+            ?.uppercase(Locale.ROOT)
+            ?: format.sampleMimeType?.substringAfter('/')?.uppercase(Locale.ROOT)
+        return listOfNotNull(
+            format.label?.takeIf(String::isNotBlank),
+            format.language?.takeIf(String::isNotBlank)?.uppercase(Locale.ROOT),
+            channelLabel,
+            codecLabel,
+        ).distinct().joinToString(" • ").ifBlank { "Audio track $fallbackIndex" }
+    }
+
+    private fun applyAudioTrack(index: Int, persist: Boolean = true) {
+        audioChoiceIndex = index.coerceIn(audioChoices.indices)
+        val choice = audioChoices[audioChoiceIndex]
+        val builder = player.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_AUDIO)
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+        if (audioChoiceIndex > 0) {
+            choice.group?.let {
+                builder.setOverrideForType(TrackSelectionOverride(it.mediaTrackGroup, choice.trackIndex))
+            }
+        }
+        player.trackSelectionParameters = builder.build()
+        if (persist) {
+            pendingAudioFingerprint = null
+            mediaStateStore.saveAudioTrack(spec, choice.fingerprint)
+        }
+    }
+
+    private fun stereoLabel() = when (currentStereoMode) {
+        StereoMode.MONO -> "2D"
+        StereoMode.SBS -> "Full SBS"
+        StereoMode.HALF_SBS -> "Half SBS"
+        StereoMode.OVER_UNDER -> "Full OU"
+        StereoMode.HALF_OVER_UNDER -> "Half OU"
+    }
+
+    private fun showControls(durationMs: Long) {
+        if (!mediaLoaded) {
+            showLibrary()
+            return
+        }
+        uiScreen = UiScreen.PLAYBACK
+        stopTrackListScroll()
+        playbackPopover = PlaybackPopover.NONE
+        uiVisible = true
+        hoveredButton = null
+        armControlsAutoHide(durationMs)
+        renderVrMenu()
+        mainHandler.removeCallbacks(uiTicker)
+        mainHandler.postDelayed(uiTicker, 1_000L)
+    }
+
+    private fun hideControls() {
+        if (!mediaLoaded) return
+        stopTrackListScroll()
+        playbackPopover = PlaybackPopover.NONE
+        uiVisible = false
+        controlsAutoHideAtMs = 0L
+        hoveredButton = null
+        mainHandler.removeCallbacks(uiTicker)
+        nativeSetMenuInteractive(false)
+        applySubtitleCues(latestCues)
+    }
+
+    private fun togglePlaybackPopover(popover: PlaybackPopover) {
+        if (!mediaLoaded) return
+        stopTrackListScroll()
+        uiScreen = UiScreen.PLAYBACK
+        playbackPopover = if (playbackPopover == popover) {
+            PlaybackPopover.NONE
+        } else {
+            popover
+        }
+        if (isTrackPopoverOpen()) ensureSelectedTrackVisible()
+        armControlsAutoHide()
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun armControlsAutoHide(durationMs: Long = PLAYBACK_AUTO_HIDE_MS) {
+        val delay = if (durationMs > 0L) durationMs else PLAYBACK_AUTO_HIDE_MS
+        controlsAutoHideAtMs = SystemClock.elapsedRealtime() + delay
+    }
+
+    private fun playbackPopoverBounds(popover: PlaybackPopover): RectF? = when (popover) {
+        PlaybackPopover.SUBTITLES,
+        PlaybackPopover.AUDIO -> PLAYBACK_LEFT_POPOVER_BOUNDS
+        PlaybackPopover.PROJECTION -> PLAYBACK_PROJECTION_POPOVER_BOUNDS
+        PlaybackPopover.SETTINGS,
+        PlaybackPopover.CINEMA -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
+        PlaybackPopover.NONE -> null
+    }
+
+    private fun showOsd(text: String, durationMs: Long = 3_000L) {
+        transientMessage = text.replace('\n', ' ')
+        if (mediaLoaded) showControls(0L) else showLibrary()
+        val generation = ++osdGeneration
+        mainHandler.postDelayed({
+            if (osdGeneration == generation) {
+                transientMessage = null
+                if (uiVisible) renderVrMenu()
+            }
+        }, durationMs)
+    }
+
+    private fun handleUiAction(id: String, pointerX: Float, persist: Boolean = true) {
+        when {
+            id.startsWith("recent_") ->
+                playRecent(id.removePrefix("recent_").toInt())
+            id == "open_local" -> openLocalBrowser()
+            id == "open_smb" -> discoverSmbServers()
+            id == "smb_add_server" -> showSmbLogin("", "")
+            id == "smb_discover_again" -> discoverSmbServers()
+            id == "smb_servers_back" -> showLibrary()
+            id.startsWith("smb_server_") -> {
+                val server = smbServers[id.removePrefix("smb_server_").toInt()]
+                smbServerListScrollOffset = browserScrollOffset
+                openSmbServer(server)
+            }
+            id.startsWith("smb_field_") -> {
+                keyboardField = when (id.removePrefix("smb_field_")) {
+                    "user" -> KeyboardField.USERNAME
+                    "password" -> KeyboardField.PASSWORD
+                    "domain" -> KeyboardField.DOMAIN
+                    else -> KeyboardField.HOST
+                }
+                keyboardSymbols = false
+                keyboardUppercase = false
+                uiScreen = UiScreen.SMB_KEYBOARD
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "smb_connect" -> connectSmb()
+            id == "smb_remember" -> {
+                rememberSmbCredentials = !rememberSmbCredentials
+                if (!rememberSmbCredentials) smbCredentialStore.clear()
+                renderVrMenu()
+            }
+            id == "smb_login_back" -> {
+                uiScreen = UiScreen.SMB_SERVERS
+                browserScrollOffset = smbServerListScrollOffset
+                transientMessage = null
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id.startsWith("smb_share_") -> {
+                val share = smbShares[id.removePrefix("smb_share_").toInt()]
+                smbShareListScrollOffset = browserScrollOffset
+                smbCredentials = smbCredentials.copy(share = share)
+                smbNavigationStack.clear()
+                browseSmb("")
+            }
+            id == "smb_shares_back" -> {
+                smbShareListScrollOffset = browserScrollOffset
+                uiScreen = UiScreen.SMB_SERVERS
+                browserScrollOffset = smbServerListScrollOffset
+                transientMessage = null
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "smb_files_back" -> {
+                val parent = if (smbNavigationStack.isEmpty()) null
+                else smbNavigationStack.removeLast()
+                if (parent != null) {
+                    smbPath = parent.path
+                    smbEntries = parent.entries
+                    browserScrollOffset = parent.scrollOffset
+                    transientMessage = null
+                    hoveredButton = null
+                    renderVrMenu()
+                } else {
+                    uiScreen = UiScreen.SMB_SHARES
+                    browserScrollOffset = smbShareListScrollOffset
+                    hoveredButton = null
+                    renderVrMenu()
+                }
+            }
+            id.startsWith("smb_entry_") -> {
+                val entry = smbEntries[id.removePrefix("smb_entry_").toInt()]
+                if (entry.isDirectory) {
+                    smbNavigationStack.addLast(
+                        SmbNavigationState(smbPath, smbEntries.toList(), browserScrollOffset)
+                    )
+                    browseSmb(entry.path, rollbackNavigationOnFailure = true)
+                } else {
+                    val uri = Uri.Builder()
+                        .scheme("smb")
+                        .authority(smbCredentials.host)
+                        .apply { entry.path.split('\\').filter { it.isNotEmpty() }.forEach(::appendPath) }
+                        .build()
+                        .toString()
+                    loadMedia(
+                        PlaybackSpec(uri, entry.name, StereoMode.MONO, smb = smbCredentials),
+                        BrowserReturnState.Smb(
+                            credentials = smbCredentials,
+                            path = smbPath,
+                            entries = smbEntries.toList(),
+                            scrollOffset = browserScrollOffset,
+                        ),
+                    )
+                }
+            }
+            id == "key_symbols" -> {
+                keyboardSymbols = !keyboardSymbols
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "key_case" -> {
+                keyboardUppercase = !keyboardUppercase
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "key_backspace" -> {
+                setKeyboardValue(keyboardValue().dropLast(1))
+                renderVrMenu()
+            }
+            id == "key_clear" -> {
+                setKeyboardValue("")
+                renderVrMenu()
+            }
+            id == "key_space" -> {
+                setKeyboardValue(keyboardValue() + " ")
+                renderVrMenu()
+            }
+            id == "key_done" || id == "key_cancel" -> {
+                uiScreen = UiScreen.SMB_LOGIN
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id.startsWith("key_char_") -> {
+                val character = id.removePrefix("key_char_").toInt().toChar()
+                if (keyboardValue().length < 64) setKeyboardValue(keyboardValue() + character)
+                renderVrMenu()
+            }
+            id == "exit" -> finish()
+            id == "local_back" -> {
+                if (uiScreen == UiScreen.LOCAL_FILES) {
+                    uiScreen = UiScreen.LOCAL_FOLDERS
+                    localFolder = null
+                    browserScrollOffset = localFolderListScrollOffset
+                    hoveredButton = null
+                    renderVrMenu()
+                } else showLibrary()
+            }
+            id.startsWith("folder_") -> {
+                val folders = localVideos.map { it.folder }.distinct().sortedWith(String.CASE_INSENSITIVE_ORDER)
+                localFolderListScrollOffset = browserScrollOffset
+                localFolder = folders[id.removePrefix("folder_").toInt()]
+                uiScreen = UiScreen.LOCAL_FILES
+                browserScrollOffset = 0f
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id.startsWith("video_") -> {
+                val video = localVideos[id.removePrefix("video_").toInt()]
+                loadMedia(
+                    PlaybackSpec(video.uri.toString(), video.name, StereoMode.MONO),
+                    BrowserReturnState.Local(
+                        folder = requireNotNull(localFolder),
+                        scrollOffset = browserScrollOffset,
+                    ),
+                )
+            }
+            id == "back_library" -> {
+                if (mediaLoaded) {
+                    releaseCurrentPlayer(saveState = true)
+                }
+                returnToSourceBrowser()
+            }
+            id == "seek_back" -> {
+                player.seekTo((player.currentPosition - 10_000L).coerceAtLeast(0L))
+                renderVrMenu()
+            }
+            id == "seek_forward" -> {
+                player.seekTo((player.currentPosition + 10_000L).coerceAtMost(player.duration.coerceAtLeast(0L)))
+                renderVrMenu()
+            }
+            id == "play_pause" -> {
+                if (player.isPlaying) player.pause() else player.play()
+                renderVrMenu()
+            }
+            id == "projection" -> {
+                togglePlaybackPopover(PlaybackPopover.PROJECTION)
+            }
+            id == "picture" -> {
+                uiScreen = UiScreen.PICTURE
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "decoder" -> {
+                uiScreen = UiScreen.DECODER
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "audio_sync" -> {
+                uiScreen = UiScreen.AUDIO_SYNC
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "audio_tracks" -> {
+                uiScreen = UiScreen.AUDIO_TRACKS
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "audio" -> {
+                togglePlaybackPopover(PlaybackPopover.AUDIO)
+            }
+            id == "subtitles" -> {
+                togglePlaybackPopover(PlaybackPopover.SUBTITLES)
+            }
+            id == "settings" -> {
+                togglePlaybackPopover(PlaybackPopover.SETTINGS)
+            }
+            id == "cinema_tune" -> {
+                playbackPopover = PlaybackPopover.CINEMA
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "cinema_back" -> {
+                playbackPopover = PlaybackPopover.SETTINGS
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "settings_picture" -> {
+                playbackPopover = PlaybackPopover.NONE
+                uiScreen = UiScreen.PICTURE
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "settings_decoder" -> {
+                playbackPopover = PlaybackPopover.NONE
+                uiScreen = UiScreen.DECODER
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "popover_audio_sync" -> {
+                playbackPopover = PlaybackPopover.NONE
+                uiScreen = UiScreen.AUDIO_SYNC
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "subtitle_depth_slider" -> {
+                val fraction = (
+                    (pointerX - SUBTITLE_DEPTH_SLIDER_LEFT) /
+                        (SUBTITLE_DEPTH_SLIDER_RIGHT - SUBTITLE_DEPTH_SLIDER_LEFT)
+                ).coerceIn(0f, 1f)
+                setSubtitleDepth(
+                    lerp(
+                        SUBTITLE_DEPTH_MIN_METERS,
+                        SUBTITLE_DEPTH_MAX_METERS,
+                        fraction,
+                    ),
+                    persist,
+                )
+                renderVrMenu()
+            }
+            id.startsWith("subtitle_sync_") -> {
+                val delta = when (id) {
+                    "subtitle_sync_earlier_500" -> -500
+                    "subtitle_sync_earlier_100" -> -100
+                    "subtitle_sync_later_100" -> 100
+                    "subtitle_sync_later_500" -> 500
+                    else -> -subtitleSyncMs
+                }
+                setSubtitleSync(subtitleSyncMs + delta)
+                renderVrMenu()
+            }
+            id == "screen_curvature_slider" -> {
+                val fraction = (
+                    (pointerX - SCREEN_CURVATURE_SLIDER_LEFT) /
+                        (SCREEN_CURVATURE_SLIDER_RIGHT - SCREEN_CURVATURE_SLIDER_LEFT)
+                ).coerceIn(0f, 1f)
+                setScreenCurvature(
+                    lerp(SCREEN_CURVATURE_MIN, SCREEN_CURVATURE_MAX, fraction),
+                    persist,
+                )
+                renderVrMenu()
+            }
+            id == "seek_bar" -> {
+                val duration = player.duration
+                if (duration > 0) {
+                    val fraction = ((pointerX - PLAYBACK_SEEK_LEFT) /
+                        (PLAYBACK_SEEK_RIGHT - PLAYBACK_SEEK_LEFT)).coerceIn(0f, 1f)
+                    player.seekTo((duration * fraction).toLong())
+                    renderVrMenu()
+                }
+            }
+            id.startsWith("mode_") -> {
+                currentStereoMode = when (id) {
+                    "mode_full_sbs" -> StereoMode.SBS
+                    "mode_half_sbs" -> StereoMode.HALF_SBS
+                    "mode_full_ou" -> StereoMode.OVER_UNDER
+                    "mode_half_ou" -> StereoMode.HALF_OVER_UNDER
+                    else -> StereoMode.MONO
+                }
+                nativeSetStereoMode(currentStereoMode.wireValue)
+                applyDefaultSubtitleDepthForProjection()
+                mediaStateStore.saveProjection(spec, currentStereoMode)
+                updateVideoAspect()
+                renderVrMenu()
+            }
+            id == "swap_eyes" -> {
+                swapEyes = !swapEyes
+                nativeSetSwapEyes(swapEyes)
+                renderVrMenu()
+            }
+            id.startsWith("picture_mode_") -> {
+                val selectedMode = when (id) {
+                    "picture_mode_original" -> PictureMode.ORIGINAL
+                    "picture_mode_sdr" -> PictureMode.FORCE_SDR
+                    "picture_mode_pq" -> PictureMode.FORCE_PQ
+                    "picture_mode_hlg" -> PictureMode.FORCE_HLG
+                    else -> PictureMode.AUTO
+                }
+                if (
+                    (selectedMode == PictureMode.FORCE_PQ ||
+                        selectedMode == PictureMode.FORCE_HLG) &&
+                    !currentMediaHasSavedPictureSettings &&
+                    !hdrDefaultExposureApplied
+                ) {
+                    pictureExposure = DEFAULT_HDR_EXPOSURE
+                    hdrDefaultExposureApplied = true
+                }
+                pictureMode = selectedMode
+                applyPictureSettings()
+                applyCinemaSettings(persist = false)
+                renderVrMenu()
+            }
+            id.startsWith("picture_slider_") || id.startsWith("settings_slider_") -> {
+                val inSettingsPopover = id.startsWith("settings_slider_")
+                val sliderLeft =
+                    if (inSettingsPopover) SETTINGS_SLIDER_LEFT else PICTURE_SLIDER_LEFT
+                val sliderRight =
+                    if (inSettingsPopover) SETTINGS_SLIDER_RIGHT else PICTURE_SLIDER_RIGHT
+                val fraction =
+                    ((pointerX - sliderLeft) / (sliderRight - sliderLeft)).coerceIn(0f, 1f)
+                val slider = id.substringAfter("slider_")
+                val cinemaTuning = activeCinemaTuning()
+                when (slider) {
+                    "brightness" -> pictureBrightness =
+                        lerp(PICTURE_BRIGHTNESS_MIN, PICTURE_BRIGHTNESS_MAX, fraction)
+                    "exposure" -> pictureExposure =
+                        lerp(PICTURE_EXPOSURE_MIN, PICTURE_EXPOSURE_MAX, fraction)
+                    "contrast" -> pictureContrast =
+                        lerp(PICTURE_CONTRAST_MIN, PICTURE_CONTRAST_MAX, fraction)
+                    "saturation" -> pictureSaturation =
+                        lerp(PICTURE_SATURATION_MIN, PICTURE_SATURATION_MAX, fraction)
+                    "vibrance" -> pictureVibrance =
+                        lerp(PICTURE_VIBRANCE_MIN, PICTURE_VIBRANCE_MAX, fraction)
+                    "tone_depth" -> cinemaTuning.toneDepth =
+                        lerp(CINEMA_TONE_DEPTH_MIN, CINEMA_TONE_DEPTH_MAX, fraction)
+                    "midtones" -> cinemaTuning.midtoneEv =
+                        lerp(CINEMA_MIDTONE_EV_MIN, CINEMA_MIDTONE_EV_MAX, fraction)
+                    "color_intensity" -> cinemaTuning.colorIntensity =
+                        lerp(
+                            CINEMA_COLOR_INTENSITY_MIN,
+                            CINEMA_COLOR_INTENSITY_MAX,
+                            fraction,
+                        )
+                    "tone_peak" -> {
+                        toneMapPeakNits = logarithmicLerp(
+                            TONE_MAP_PEAK_NITS_MIN,
+                            TONE_MAP_PEAK_NITS_MAX,
+                            fraction,
+                        )
+                        if (persist) {
+                            getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                                .putFloat(PREF_TONE_MAP_PEAK_NITS, toneMapPeakNits)
+                                .apply()
+                        }
+                    }
+                    "scene" -> {
+                        sceneBrightness = lerp(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, fraction)
+                        if (persist) {
+                            getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                                .putFloat(PREF_SCENE_BRIGHTNESS, sceneBrightness)
+                                .apply()
+                        }
+                    }
+                }
+                val cinemaSlider =
+                    slider == "tone_depth" ||
+                        slider == "midtones" ||
+                        slider == "color_intensity"
+                val globalOnlySlider = slider == "scene" || slider == "tone_peak"
+                if (cinemaSlider) {
+                    applyCinemaSettings(persist)
+                } else {
+                    applyPictureSettings(persist && !globalOnlySlider)
+                }
+                renderVrMenu()
+            }
+            id.startsWith("picture_reset_") -> {
+                val slider = id.substringAfter("picture_reset_")
+                val cinemaTuning = activeCinemaTuning()
+                when (slider) {
+                    "brightness" -> pictureBrightness = DEFAULT_PICTURE_BRIGHTNESS
+                    "exposure" -> pictureExposure = defaultExposureForCurrentColorMode()
+                    "contrast" -> pictureContrast = DEFAULT_PICTURE_CONTRAST
+                    "saturation" -> pictureSaturation = DEFAULT_PICTURE_SATURATION
+                    "vibrance" -> pictureVibrance = DEFAULT_PICTURE_VIBRANCE
+                    "tone_depth" ->
+                        cinemaTuning.toneDepth =
+                            defaultCinemaTuning(activeCinemaTransfer()).toneDepth
+                    "midtones" -> cinemaTuning.midtoneEv = DEFAULT_CINEMA_MIDTONE_EV
+                    "color_intensity" ->
+                        cinemaTuning.colorIntensity = DEFAULT_CINEMA_COLOR_INTENSITY
+                    "tone_peak" -> {
+                        toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
+                        getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                            .putFloat(PREF_TONE_MAP_PEAK_NITS, toneMapPeakNits)
+                            .apply()
+                    }
+                    "scene" -> {
+                        sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
+                        getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                            .putFloat(PREF_SCENE_BRIGHTNESS, sceneBrightness)
+                            .apply()
+                    }
+                }
+                if (slider == "exposure") {
+                    hdrDefaultExposureApplied =
+                        pictureExposure == DEFAULT_HDR_EXPOSURE &&
+                            currentColorModeIsHdr()
+                }
+                val cinemaSlider =
+                    slider == "tone_depth" ||
+                        slider == "midtones" ||
+                        slider == "color_intensity"
+                if (cinemaSlider) {
+                    applyCinemaSettings()
+                } else {
+                    applyPictureSettings(
+                        persist = slider != "scene" && slider != "tone_peak"
+                    )
+                }
+                renderVrMenu()
+            }
+            id == "cinema_reset" -> {
+                val transfer = activeCinemaTransfer()
+                cinemaTunings[transfer] = defaultCinemaTuning(transfer)
+                applyCinemaSettings()
+                renderVrMenu()
+            }
+            id == "picture_reset" -> {
+                pictureBrightness = DEFAULT_PICTURE_BRIGHTNESS
+                pictureExposure = defaultExposureForCurrentColorMode()
+                hdrDefaultExposureApplied =
+                    pictureExposure == DEFAULT_HDR_EXPOSURE &&
+                        currentColorModeIsHdr()
+                pictureContrast = DEFAULT_PICTURE_CONTRAST
+                pictureSaturation = DEFAULT_PICTURE_SATURATION
+                pictureVibrance = DEFAULT_PICTURE_VIBRANCE
+                applyPictureSettings()
+                renderVrMenu()
+            }
+            id.startsWith("decoder_") -> {
+                val selectedMode = when (id) {
+                    "decoder_hardware" -> DecoderMode.HARDWARE
+                    "decoder_software" -> DecoderMode.SOFTWARE
+                    else -> DecoderMode.AUTO
+                }
+                val requestedEffectiveMode = when (selectedMode) {
+                    DecoderMode.SOFTWARE -> DecoderMode.SOFTWARE
+                    DecoderMode.AUTO,
+                    DecoderMode.HARDWARE -> DecoderMode.HARDWARE
+                }
+                val position = player.currentPosition
+                decoderMode = selectedMode
+                mediaStateStore.saveDecoderMode(spec, selectedMode.wireValue)
+                if (selectedMode == DecoderMode.AUTO) {
+                    // Explicitly choosing Auto asks it to probe hardware again.
+                    mediaStateStore.saveDecoderAutoSoftware(spec, false)
+                }
+                if (effectiveDecoderMode == requestedEffectiveMode) {
+                    renderVrMenu()
+                    showOsd("Decoder: ${selectedMode.label}", 3_000L)
+                    return
+                }
+                loadMedia(
+                    spec,
+                    playbackBrowserReturn,
+                    resumeOverrideMs = position,
+                    autoSoftwareFallback = false,
+                )
+                showOsd("Decoder: ${selectedMode.label}", 3_000L)
+            }
+            id.startsWith("sync_") -> {
+                val delta = when (id) {
+                    "sync_earlier_100" -> -100
+                    "sync_earlier_25" -> -25
+                    "sync_later_25" -> 25
+                    "sync_later_100" -> 100
+                    else -> -audioSyncMs
+                }
+                setAudioSync(audioSyncMs + delta)
+                renderVrMenu()
+            }
+            id.startsWith("subtitle_") -> {
+                applySubtitle(id.removePrefix("subtitle_").toInt())
+                ensureSelectedTrackVisible()
+                renderVrMenu()
+            }
+            id.startsWith("audio_track_") -> {
+                applyAudioTrack(id.removePrefix("audio_track_").toInt())
+                ensureSelectedTrackVisible()
+                renderVrMenu()
+            }
+            id == "modal_back" -> showControls(0L)
+        }
+    }
+
+    private fun setAudioSync(valueMs: Int) {
+        val adjusted = valueMs.coerceIn(
+            -AudioSyncAudioProcessor.MAX_DELAY_MS,
+            AudioSyncAudioProcessor.MAX_DELAY_MS,
+        )
+        if (adjusted == audioSyncMs) return
+        audioSyncMs = adjusted
+        audioSyncProcessor.setDelayMs(adjusted)
+        mediaStateStore.saveAudioSync(spec, adjusted)
+        // Re-seeking flushes the PCM processor so the new offset starts at a
+        // clean media boundary instead of changing halfway through a buffer.
+        val position = player.currentPosition
+        player.seekTo(position)
+        Log.i("DreamPlayerAudio", "Audio sync set to ${adjusted}ms")
+    }
+
+    private fun setSubtitleSync(valueMs: Int) {
+        val adjusted = valueMs.coerceIn(-MAX_SUBTITLE_SYNC_MS, MAX_SUBTITLE_SYNC_MS)
+        if (adjusted == subtitleSyncMs) return
+        subtitleSyncMs = adjusted
+        player.subtitleDelayMilliseconds = adjusted.toLong()
+        mediaStateStore.saveSubtitleSync(spec, adjusted)
+        // Re-evaluate the currently active cue immediately, including when advancing it.
+        player.seekTo(player.currentPosition)
+        Log.i("DreamPlayerSubtitle", "Subtitle sync set to ${adjusted}ms")
+    }
+
+    private fun defaultSubtitleDepth(mode: StereoMode): Float =
+        if (mode == StereoMode.MONO) {
+            DEFAULT_2D_SUBTITLE_DEPTH_METERS
+        } else {
+            DEFAULT_3D_SUBTITLE_DEPTH_METERS
+        }
+
+    private fun applyDefaultSubtitleDepthForProjection() {
+        if (subtitleDepthIsCustom) return
+        subtitleDepthMeters = defaultSubtitleDepth(currentStereoMode)
+        nativeSetSubtitleDepth(subtitleDepthMeters)
+    }
+
+    private fun setSubtitleDepth(valueMeters: Float, persist: Boolean) {
+        val adjusted =
+            valueMeters.coerceIn(SUBTITLE_DEPTH_MIN_METERS, SUBTITLE_DEPTH_MAX_METERS)
+        subtitleDepthMeters = adjusted
+        nativeSetSubtitleDepth(adjusted)
+        if (persist) {
+            subtitleDepthIsCustom = true
+            mediaStateStore.saveSubtitleDepth(spec, adjusted)
+            Log.i("DreamPlayerSubtitle", "Subtitle depth set to ${adjusted}m")
+        }
+    }
+
+    private fun setScreenCurvature(value: Float, persist: Boolean) {
+        val adjusted = value.coerceIn(SCREEN_CURVATURE_MIN, SCREEN_CURVATURE_MAX)
+        screenCurvature = adjusted
+        nativeSetScreenCurvature(adjusted)
+        if (persist) {
+            mediaStateStore.saveScreenCurvature(spec, adjusted)
+            Log.i("DreamPlayerScreen", "Screen curvature set to $adjusted")
+        }
+    }
+
+    private fun keyboardValue(): String = when (keyboardField) {
+        KeyboardField.HOST -> smbCredentials.host
+        KeyboardField.USERNAME -> smbCredentials.username
+        KeyboardField.PASSWORD -> smbCredentials.password
+        KeyboardField.DOMAIN -> smbCredentials.domain
+    }
+
+    private fun setKeyboardValue(value: String) {
+        smbCredentials = when (keyboardField) {
+            KeyboardField.HOST -> smbCredentials.copy(host = value)
+            KeyboardField.USERNAME -> smbCredentials.copy(username = value)
+            KeyboardField.PASSWORD -> smbCredentials.copy(password = value)
+            KeyboardField.DOMAIN -> smbCredentials.copy(domain = value)
+        }
+    }
+
+    private fun keyboardTitle(): String = when (keyboardField) {
+        KeyboardField.HOST -> "Server hostname or IP"
+        KeyboardField.USERNAME -> "Username"
+        KeyboardField.PASSWORD -> "Password"
+        KeyboardField.DOMAIN -> "Domain (usually blank)"
+    }
+
+    private fun renderSubtitle(lines: List<String>): Bitmap {
+        val bitmap = Bitmap.createBitmap(2048, 320, Bitmap.Config.ARGB_8888)
+        if (lines.isEmpty()) return bitmap
+        val canvas = Canvas(bitmap)
+        val text = lines.joinToString("\n")
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            textSize = 68f
+        }
+        val split = text.split('\n').take(3)
+        val firstY = 160f - (split.size - 1) * 44f
+        split.forEachIndexed { index, line ->
+            val y = firstY + index * 88f
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 10f
+            paint.color = Color.BLACK
+            canvas.drawText(line.take(90), 1024f, y, paint)
+            paint.style = Paint.Style.FILL
+            paint.color = Color.WHITE
+            canvas.drawText(line.take(90), 1024f, y, paint)
+        }
+        return bitmap
+    }
+
+    private fun applySubtitleCues(cues: List<Cue>) {
+        val bitmapCues = cues.filter { it.bitmap != null }
+        if (bitmapCues.isEmpty()) {
+            nativeSetSubtitle(
+                renderSubtitle(
+                    cues.mapNotNull { it.text?.toString() }.filter { it.isNotBlank() }
+                )
+            )
+            return
+        }
+
+        val layouts = bitmapCues.mapNotNull { cue ->
+            val source = cue.bitmap ?: return@mapNotNull null
+            val widthFraction = cue.size
+                .takeUnless { it == Cue.DIMEN_UNSET || !it.isFinite() || it <= 0f }
+                ?: (source.width.toFloat() / PGS_REFERENCE_WIDTH)
+            val heightFraction = cue.bitmapHeight
+                .takeUnless { it == Cue.DIMEN_UNSET || !it.isFinite() || it <= 0f }
+                ?: (
+                    widthFraction * source.height /
+                        source.width.coerceAtLeast(1).toFloat() *
+                        PGS_REFERENCE_WIDTH / PGS_REFERENCE_HEIGHT
+                )
+
+            val position = cue.position
+                .takeUnless { it == Cue.DIMEN_UNSET || !it.isFinite() }
+                ?: 0.5f
+            val line = cue.line
+                .takeUnless {
+                    it == Cue.DIMEN_UNSET || !it.isFinite() ||
+                        cue.lineType != Cue.LINE_TYPE_FRACTION
+                }
+                ?: 0.82f
+            val left = anchorStart(
+                position,
+                widthFraction,
+                cue.positionAnchor,
+            )
+            val top = anchorStart(
+                line,
+                heightFraction,
+                cue.lineAnchor,
+            )
+            BitmapCueLayout(
+                source,
+                RectF(left, top, left + widthFraction, top + heightFraction),
+            )
+        }
+
+        if (layouts.isEmpty()) {
+            nativeSetSubtitle(renderSubtitle(emptyList()))
+            return
+        }
+
+        // PGS usually contains one already-cropped bitmap. Upload it directly instead
+        // of expanding every cue into a 1920x1080 ARGB plane (about 8 MB per event).
+        // Native rendering applies these normalized bounds to the curved movie screen.
+        if (layouts.size == 1) {
+            val layout = layouts.first()
+            nativeSetBitmapSubtitle(
+                layout.bitmap,
+                layout.bounds.left,
+                layout.bounds.top,
+                layout.bounds.right,
+                layout.bounds.bottom,
+            )
+            return
+        }
+
+        // Preserve simultaneous PGS objects while allocating only their union.
+        val union = RectF(layouts.first().bounds)
+        layouts.drop(1).forEach { union.union(it.bounds) }
+        val outputWidth = (union.width() * PGS_REFERENCE_WIDTH).toInt().coerceAtLeast(1)
+        val outputHeight = (union.height() * PGS_REFERENCE_HEIGHT).toInt().coerceAtLeast(1)
+        val output = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        layouts.forEach { layout ->
+            val bounds = layout.bounds
+            canvas.drawBitmap(
+                layout.bitmap,
+                null,
+                RectF(
+                    (bounds.left - union.left) / union.width() * outputWidth,
+                    (bounds.top - union.top) / union.height() * outputHeight,
+                    (bounds.right - union.left) / union.width() * outputWidth,
+                    (bounds.bottom - union.top) / union.height() * outputHeight,
+                ),
+                paint,
+            )
+        }
+        nativeSetBitmapSubtitle(output, union.left, union.top, union.right, union.bottom)
+        output.recycle()
+    }
+
+    private data class BitmapCueLayout(val bitmap: Bitmap, val bounds: RectF)
+
+    private fun anchorStart(value: Float, extent: Float, anchor: Int): Float = when (anchor) {
+        Cue.ANCHOR_TYPE_MIDDLE -> value - extent / 2f
+        Cue.ANCHOR_TYPE_END -> value - extent
+        else -> value
+    }
+
+    private fun renderVrMenu() {
+        if (!uiVisible) return
+        val bitmap = menuBitmap ?: Bitmap.createBitmap(
+            UI_WIDTH.toInt(),
+            UI_HEIGHT.toInt(),
+            Bitmap.Config.ARGB_8888,
+        ).also { menuBitmap = it }
+        bitmap.eraseColor(Color.TRANSPARENT)
+        val canvas = Canvas(bitmap)
+        val buttons = mutableListOf<UiButton>()
+        val colorPanel = Color.argb(248, 3, 9, 18)
+        val colorSurface = Color.rgb(7, 18, 32)
+        val colorSurfaceRaised = Color.rgb(12, 29, 49)
+        val colorSelected = Color.rgb(10, 55, 84)
+        val colorHover = Color.rgb(13, 73, 108)
+        val colorOutline = Color.rgb(27, 49, 69)
+        val colorAccent = Color.rgb(42, 163, 215)
+        val colorAccentBright = Color.rgb(91, 190, 235)
+        val colorText = Color.rgb(232, 242, 249)
+        val colorTextMuted = Color.rgb(153, 176, 194)
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = colorText
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+        }
+        val panelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel }
+
+        fun text(
+            value: String,
+            x: Float,
+            y: Float,
+            size: Float,
+            align: Paint.Align = Paint.Align.CENTER,
+            color: Int = colorText,
+        ) {
+            textPaint.textSize = size
+            textPaint.textAlign = align
+            textPaint.color = color
+            canvas.drawText(value.take(80), x, y, textPaint)
+        }
+
+        fun button(id: String, label: String, bounds: RectF, selected: Boolean = false, fontSize: Float = 46f) {
+            val hovered = hoveredButton == id
+            val fill = when {
+                hovered -> colorHover
+                selected -> colorSelected
+                else -> colorSurface
+            }
+            canvas.drawRoundRect(bounds, 24f, 24f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill })
+            canvas.drawRoundRect(bounds, 24f, 24f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (hovered || selected) colorAccent else colorOutline
+                style = Paint.Style.STROKE
+                strokeWidth = if (hovered) 4f else 2f
+            })
+            text(label, bounds.centerX(), bounds.centerY() + fontSize * 0.39f, fontSize)
+            buttons += UiButton(id, label, bounds, selected)
+        }
+
+        fun sliderResetButton(id: String, label: String, centerX: Float, centerY: Float, radius: Float) {
+            val bounds = RectF(
+                centerX - radius,
+                centerY - radius,
+                centerX + radius,
+                centerY + radius,
+            )
+            val hovered = hoveredButton == id
+            canvas.drawCircle(
+                centerX,
+                centerY,
+                radius,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hovered) colorHover else colorSurface
+                },
+            )
+            canvas.drawCircle(
+                centerX,
+                centerY,
+                radius,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hovered) colorAccent else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = if (hovered) 3f else 2f
+                },
+            )
+            val iconRadius = radius * 0.52f
+            val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (hovered) colorAccentBright else colorTextMuted
+                style = Paint.Style.STROKE
+                strokeWidth = (radius * 0.14f).coerceAtLeast(2.5f)
+                strokeCap = Paint.Cap.ROUND
+            }
+            canvas.drawArc(
+                RectF(
+                    centerX - iconRadius,
+                    centerY - iconRadius,
+                    centerX + iconRadius,
+                    centerY + iconRadius,
+                ),
+                -55f,
+                -255f,
+                false,
+                iconPaint,
+            )
+            canvas.drawPath(
+                Path().apply {
+                    moveTo(centerX - iconRadius * 0.95f, centerY - iconRadius * 0.70f)
+                    lineTo(centerX - iconRadius * 1.30f, centerY - iconRadius * 0.12f)
+                    lineTo(centerX - iconRadius * 0.58f, centerY - iconRadius * 0.05f)
+                    close()
+                },
+                Paint(iconPaint).apply { style = Paint.Style.FILL },
+            )
+            buttons += UiButton(id, "Reset $label", bounds)
+        }
+
+        fun slider(
+            id: String,
+            label: String,
+            valueLabel: String,
+            value: Float,
+            minimum: Float,
+            maximum: Float,
+            y: Float,
+            logarithmic: Boolean = false,
+        ) {
+            val bounds = RectF(PICTURE_SLIDER_LEFT, y - 34f, PICTURE_SLIDER_RIGHT, y + 34f)
+            val fraction = if (logarithmic) {
+                (
+                    kotlin.math.ln(value / minimum) /
+                        kotlin.math.ln(maximum / minimum)
+                ).coerceIn(0f, 1f)
+            } else {
+                ((value - minimum) / (maximum - minimum)).coerceIn(0f, 1f)
+            }
+            text(label, 385f, y + 12f, 31f, Paint.Align.LEFT)
+            text(valueLabel, 1690f, y + 12f, 29f, Paint.Align.RIGHT, colorTextMuted)
+            val rail = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorOutline }
+            val active = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccent }
+            canvas.drawRoundRect(PICTURE_SLIDER_LEFT, y - 7f, PICTURE_SLIDER_RIGHT, y + 7f, 7f, 7f, rail)
+            val knobX = PICTURE_SLIDER_LEFT +
+                (PICTURE_SLIDER_RIGHT - PICTURE_SLIDER_LEFT) * fraction
+            canvas.drawRoundRect(PICTURE_SLIDER_LEFT, y - 7f, knobX, y + 7f, 7f, 7f, active)
+            val knobRadius = if (hoveredButton == id || activeSlider == id) 24f else 19f
+            canvas.drawCircle(
+                knobX,
+                y,
+                knobRadius,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText },
+            )
+            canvas.drawCircle(
+                knobX,
+                y,
+                knobRadius,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hoveredButton == id || activeSlider == id) colorAccentBright else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 4f
+                },
+            )
+            buttons += UiButton(id, label, bounds)
+            sliderResetButton(
+                "picture_reset_${id.substringAfter("slider_")}",
+                label,
+                1745f,
+                y,
+                27f,
+            )
+        }
+
+        fun compactSettingsSlider(
+            id: String,
+            label: String,
+            valueLabel: String,
+            value: Float,
+            minimum: Float,
+            maximum: Float,
+            y: Float,
+            logarithmic: Boolean = false,
+        ) {
+            val bounds = RectF(
+                SETTINGS_SLIDER_LEFT,
+                y - 19f,
+                SETTINGS_SLIDER_RIGHT,
+                y + 19f,
+            )
+            val fraction = if (logarithmic) {
+                (
+                    kotlin.math.ln(value / minimum) /
+                        kotlin.math.ln(maximum / minimum)
+                ).coerceIn(0f, 1f)
+            } else {
+                ((value - minimum) / (maximum - minimum)).coerceIn(0f, 1f)
+            }
+            text(label, 975f, y + 9f, 24f, Paint.Align.LEFT)
+            text(valueLabel, 1768f, y + 9f, 22f, Paint.Align.RIGHT, colorTextMuted)
+            canvas.drawRoundRect(
+                SETTINGS_SLIDER_LEFT, y - 5f, SETTINGS_SLIDER_RIGHT, y + 5f,
+                5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorOutline },
+            )
+            val knobX = SETTINGS_SLIDER_LEFT +
+                (SETTINGS_SLIDER_RIGHT - SETTINGS_SLIDER_LEFT) * fraction
+            canvas.drawRoundRect(
+                SETTINGS_SLIDER_LEFT, y - 5f, knobX, y + 5f,
+                5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccent },
+            )
+            val focused = hoveredButton == id || activeSlider == id
+            canvas.drawCircle(
+                knobX, y, if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText },
+            )
+            canvas.drawCircle(
+                knobX, y, if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (focused) colorAccentBright else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                },
+            )
+            buttons += UiButton(id, label, bounds)
+            sliderResetButton(
+                "picture_reset_${id.substringAfter("slider_")}",
+                label,
+                1832f,
+                y,
+                17f,
+            )
+        }
+
+        fun subtitleDepthSlider(y: Float) {
+            val id = "subtitle_depth_slider"
+            val bounds = RectF(
+                SUBTITLE_DEPTH_SLIDER_LEFT,
+                y - 22f,
+                SUBTITLE_DEPTH_SLIDER_RIGHT,
+                y + 22f,
+            )
+            val fraction = (
+                (subtitleDepthMeters - SUBTITLE_DEPTH_MIN_METERS) /
+                    (SUBTITLE_DEPTH_MAX_METERS - SUBTITLE_DEPTH_MIN_METERS)
+            ).coerceIn(0f, 1f)
+            text("Depth", 190f, y + 8f, 23f, Paint.Align.LEFT)
+            val depthLabel = if (subtitleDepthMeters < 0.005f) {
+                "On screen"
+            } else {
+                "%.0f cm closer".format(Locale.US, subtitleDepthMeters * 100f)
+            }
+            text(depthLabel, 820f, y + 8f, 21f, Paint.Align.RIGHT, colorTextMuted)
+            canvas.drawRoundRect(
+                SUBTITLE_DEPTH_SLIDER_LEFT, y - 5f,
+                SUBTITLE_DEPTH_SLIDER_RIGHT, y + 5f,
+                5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorOutline },
+            )
+            val knobX = SUBTITLE_DEPTH_SLIDER_LEFT +
+                (SUBTITLE_DEPTH_SLIDER_RIGHT - SUBTITLE_DEPTH_SLIDER_LEFT) * fraction
+            canvas.drawRoundRect(
+                SUBTITLE_DEPTH_SLIDER_LEFT, y - 5f, knobX, y + 5f,
+                5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccent },
+            )
+            val focused = hoveredButton == id || activeSlider == id
+            canvas.drawCircle(
+                knobX, y, if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText },
+            )
+            canvas.drawCircle(
+                knobX, y, if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (focused) colorAccentBright else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                },
+            )
+            buttons += UiButton(id, "Subtitle depth", bounds)
+        }
+
+        fun projectionCurvatureSlider(y: Float) {
+            val id = "screen_curvature_slider"
+            val bounds = RectF(
+                SCREEN_CURVATURE_SLIDER_LEFT,
+                y - 23f,
+                SCREEN_CURVATURE_SLIDER_RIGHT,
+                y + 23f,
+            )
+            val fraction = (
+                (screenCurvature - SCREEN_CURVATURE_MIN) /
+                    (SCREEN_CURVATURE_MAX - SCREEN_CURVATURE_MIN)
+            ).coerceIn(0f, 1f)
+            text("Screen curvature", 1218f, y + 8f, 23f, Paint.Align.LEFT)
+            text(
+                if (screenCurvature < 0.01f) {
+                    "Flat"
+                } else {
+                    "%.0f%%".format(Locale.US, screenCurvature * 100f)
+                },
+                1860f, y + 8f, 21f, Paint.Align.RIGHT, colorTextMuted,
+            )
+            canvas.drawRoundRect(
+                SCREEN_CURVATURE_SLIDER_LEFT, y - 5f,
+                SCREEN_CURVATURE_SLIDER_RIGHT, y + 5f,
+                5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorOutline },
+            )
+            val knobX = SCREEN_CURVATURE_SLIDER_LEFT +
+                (SCREEN_CURVATURE_SLIDER_RIGHT - SCREEN_CURVATURE_SLIDER_LEFT) * fraction
+            canvas.drawRoundRect(
+                SCREEN_CURVATURE_SLIDER_LEFT, y - 5f, knobX, y + 5f,
+                5f, 5f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccent },
+            )
+            val focused = hoveredButton == id || activeSlider == id
+            canvas.drawCircle(
+                knobX, y, if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText },
+            )
+            canvas.drawCircle(
+                knobX, y, if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (focused) colorAccentBright else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                },
+            )
+            buttons += UiButton(id, "Screen curvature", bounds)
+        }
+
+        fun iconButton(
+            id: String,
+            label: String,
+            bounds: RectF,
+            selected: Boolean = false,
+            prominent: Boolean = false,
+        ) {
+            val hovered = hoveredButton == id
+            val fill = when {
+                hovered -> colorHover
+                selected -> colorSelected
+                prominent -> colorAccent
+                else -> colorSurface
+            }
+            val cornerRadius = if (prominent) bounds.height() / 2f else 22f
+            canvas.drawRoundRect(bounds, cornerRadius, cornerRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill })
+            canvas.drawRoundRect(bounds, cornerRadius, cornerRadius, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = when {
+                    prominent && hovered -> colorAccentBright
+                    hovered || selected -> colorAccent
+                    prominent -> colorAccentBright
+                    else -> colorOutline
+                }
+                style = Paint.Style.STROKE
+                strokeWidth = if (hovered || prominent) 4f else 2f
+            })
+            val cx = bounds.centerX()
+            val cy = bounds.centerY()
+            val scale = minOf(bounds.width(), bounds.height()) * if (prominent) 0.25f else 0.27f
+            val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (prominent) colorSurface else colorText
+                style = Paint.Style.STROKE
+                strokeWidth = 7f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            val solid = Paint(stroke).apply { style = Paint.Style.FILL }
+            when (id) {
+                "back_library" -> {
+                    val folder = Path().apply {
+                        moveTo(cx - scale, cy - scale * 0.45f)
+                        lineTo(cx - scale * 0.35f, cy - scale * 0.45f)
+                        lineTo(cx - scale * 0.12f, cy - scale * 0.75f)
+                        lineTo(cx + scale, cy - scale * 0.75f)
+                        lineTo(cx + scale, cy + scale * 0.72f)
+                        lineTo(cx - scale, cy + scale * 0.72f)
+                        close()
+                    }
+                    canvas.drawPath(folder, stroke)
+                }
+                "seek_back", "seek_forward" -> {
+                    // The arc geometry's visual direction is opposite its mathematical sweep.
+                    val backwards = id == "seek_forward"
+                    val arc = RectF(cx - scale, cy - scale, cx + scale, cy + scale)
+                    canvas.drawArc(arc, if (backwards) -55f else 235f, if (backwards) -255f else 255f, false, stroke)
+                    val arrowX = if (backwards) cx - scale * 0.92f else cx + scale * 0.92f
+                    val arrow = Path().apply {
+                        moveTo(arrowX, cy - scale * 0.7f)
+                        lineTo(arrowX + (if (backwards) -1 else 1) * scale * 0.48f, cy - scale * 0.15f)
+                        lineTo(arrowX + (if (backwards) 1 else -1) * scale * 0.15f, cy - scale * 0.05f)
+                        close()
+                    }
+                    canvas.drawPath(arrow, solid)
+                    text("10", cx, cy + 12f, 28f)
+                }
+                "play_pause" -> {
+                    if (player.isPlaying) {
+                        canvas.drawRoundRect(
+                            cx - scale * 0.72f, cy - scale, cx - scale * 0.18f, cy + scale,
+                            4f, 4f, solid,
+                        )
+                        canvas.drawRoundRect(
+                            cx + scale * 0.18f, cy - scale, cx + scale * 0.72f, cy + scale,
+                            4f, 4f, solid,
+                        )
+                    } else {
+                        val play = Path().apply {
+                            moveTo(cx - scale * 0.62f, cy - scale)
+                            lineTo(cx + scale, cy)
+                            lineTo(cx - scale * 0.62f, cy + scale)
+                            close()
+                        }
+                        canvas.drawPath(play, solid)
+                    }
+                }
+                "projection" -> {
+                    canvas.drawRoundRect(
+                        cx - scale * 1.15f, cy - scale * 0.72f,
+                        cx + scale * 1.15f, cy + scale * 0.72f,
+                        8f, 8f, stroke,
+                    )
+                    when (currentStereoMode) {
+                        StereoMode.MONO -> {
+                            val mountain = Path().apply {
+                                moveTo(cx - scale * 0.72f, cy + scale * 0.36f)
+                                lineTo(cx - scale * 0.2f, cy - scale * 0.2f)
+                                lineTo(cx + scale * 0.12f, cy + scale * 0.1f)
+                                lineTo(cx + scale * 0.46f, cy - scale * 0.3f)
+                                lineTo(cx + scale * 0.82f, cy + scale * 0.36f)
+                            }
+                            canvas.drawPath(mountain, stroke)
+                        }
+                        StereoMode.SBS,
+                        StereoMode.HALF_SBS -> {
+                            canvas.drawLine(cx, cy - scale * 0.68f, cx, cy + scale * 0.68f, stroke)
+                        }
+                        StereoMode.OVER_UNDER,
+                        StereoMode.HALF_OVER_UNDER -> {
+                            canvas.drawLine(cx - scale * 1.1f, cy, cx + scale * 1.1f, cy, stroke)
+                        }
+                    }
+                }
+                "picture" -> {
+                    canvas.drawCircle(cx, cy, scale * 0.45f, stroke)
+                    repeat(8) { index ->
+                        val angle = Math.PI * index / 4.0
+                        val x1 = cx + Math.cos(angle).toFloat() * scale * 0.7f
+                        val y1 = cy + Math.sin(angle).toFloat() * scale * 0.7f
+                        val x2 = cx + Math.cos(angle).toFloat() * scale * 1.05f
+                        val y2 = cy + Math.sin(angle).toFloat() * scale * 1.05f
+                        canvas.drawLine(x1, y1, x2, y2, stroke)
+                    }
+                }
+                "decoder" -> {
+                    canvas.drawRoundRect(
+                        cx - scale * 0.95f, cy - scale * 0.72f,
+                        cx + scale * 0.95f, cy + scale * 0.72f,
+                        8f, 8f, stroke,
+                    )
+                    repeat(3) { index ->
+                        val offset = (index - 1) * scale * 0.55f
+                        canvas.drawLine(
+                            cx + offset, cy - scale * 0.72f,
+                            cx + offset, cy - scale * 1.02f, stroke,
+                        )
+                        canvas.drawLine(
+                            cx + offset, cy + scale * 0.72f,
+                            cx + offset, cy + scale * 1.02f, stroke,
+                        )
+                    }
+                    text(if (effectiveDecoderMode == DecoderMode.SOFTWARE) "SW" else "HW", cx, cy + 10f, 24f)
+                }
+                "audio_sync" -> {
+                    val speaker = Path().apply {
+                        moveTo(cx - scale * 1.08f, cy - scale * 0.32f)
+                        lineTo(cx - scale * 0.55f, cy - scale * 0.32f)
+                        lineTo(cx, cy - scale * 0.82f)
+                        lineTo(cx, cy + scale * 0.82f)
+                        lineTo(cx - scale * 0.55f, cy + scale * 0.32f)
+                        lineTo(cx - scale * 1.08f, cy + scale * 0.32f)
+                        close()
+                    }
+                    canvas.drawPath(speaker, stroke)
+                    val clockX = cx + scale * 0.72f
+                    val clockY = cy + scale * 0.22f
+                    canvas.drawCircle(clockX, clockY, scale * 0.55f, stroke)
+                    canvas.drawLine(clockX, clockY, clockX, clockY - scale * 0.32f, stroke)
+                    canvas.drawLine(clockX, clockY, clockX + scale * 0.24f, clockY + scale * 0.12f, stroke)
+                }
+                "audio_tracks", "audio" -> {
+                    val speaker = Path().apply {
+                        moveTo(cx - scale * 1.05f, cy - scale * 0.34f)
+                        lineTo(cx - scale * 0.52f, cy - scale * 0.34f)
+                        lineTo(cx, cy - scale * 0.86f)
+                        lineTo(cx, cy + scale * 0.86f)
+                        lineTo(cx - scale * 0.52f, cy + scale * 0.34f)
+                        lineTo(cx - scale * 1.05f, cy + scale * 0.34f)
+                        close()
+                    }
+                    canvas.drawPath(speaker, stroke)
+                    canvas.drawArc(
+                        RectF(cx - scale * 0.22f, cy - scale * 0.58f, cx + scale * 0.75f, cy + scale * 0.58f),
+                        -58f, 116f, false, stroke,
+                    )
+                    canvas.drawArc(
+                        RectF(cx - scale * 0.18f, cy - scale, cx + scale * 1.25f, cy + scale),
+                        -52f, 104f, false, stroke,
+                    )
+                }
+                "subtitles" -> {
+                    canvas.drawRoundRect(
+                        cx - scale * 1.2f, cy - scale * 0.82f,
+                        cx + scale * 1.2f, cy + scale * 0.82f,
+                        9f, 9f, stroke,
+                    )
+                    text("CC", cx, cy + 13f, 31f)
+                }
+                "settings" -> {
+                    canvas.drawCircle(cx, cy, scale * 0.43f, stroke)
+                    canvas.drawCircle(cx, cy, scale * 0.13f, solid)
+                    repeat(8) { index ->
+                        val angle = Math.PI * index / 4.0
+                        val innerX = cx + Math.cos(angle).toFloat() * scale * 0.68f
+                        val innerY = cy + Math.sin(angle).toFloat() * scale * 0.68f
+                        val outerX = cx + Math.cos(angle).toFloat() * scale * 1.03f
+                        val outerY = cy + Math.sin(angle).toFloat() * scale * 1.03f
+                        canvas.drawLine(innerX, innerY, outerX, outerY, stroke)
+                    }
+                }
+            }
+            buttons += UiButton(id, label, bounds, selected)
+        }
+
+        fun popoverPanel(bounds: RectF, title: String, anchorX: Float) {
+            canvas.drawRoundRect(
+                bounds,
+                30f,
+                30f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel },
+            )
+            canvas.drawRoundRect(
+                bounds,
+                30f,
+                30f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                },
+            )
+            val pointer = Path().apply {
+                moveTo(anchorX - 24f, bounds.bottom - 1f)
+                lineTo(anchorX + 24f, bounds.bottom - 1f)
+                lineTo(anchorX, bounds.bottom + 28f)
+                close()
+            }
+            canvas.drawPath(pointer, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel })
+            text(title, bounds.left + 44f, bounds.top + 62f, 39f, Paint.Align.LEFT)
+        }
+
+        fun projectionGridButton(
+            id: String,
+            label: String,
+            bounds: RectF,
+            mode: StereoMode? = null,
+            selected: Boolean = false,
+            swapControl: Boolean = false,
+        ) {
+            val hovered = hoveredButton == id
+            val fill = when {
+                hovered -> colorHover
+                selected -> colorSelected
+                else -> colorSurface
+            }
+            canvas.drawRoundRect(
+                bounds, 22f, 22f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill },
+            )
+            canvas.drawRoundRect(
+                bounds, 22f, 22f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hovered || selected) colorAccent else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = if (hovered || selected) 4f else 2f
+                },
+            )
+
+            val cx = bounds.centerX()
+            val iconY = bounds.top + 51f
+            val iconStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (selected) colorAccentBright else colorText
+                style = Paint.Style.STROKE
+                strokeWidth = 5f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            val iconFill = Paint(iconStroke).apply { style = Paint.Style.FILL }
+
+            if (swapControl) {
+                val leftEye = RectF(cx - 72f, iconY - 21f, cx - 8f, iconY + 21f)
+                val rightEye = RectF(cx + 8f, iconY - 21f, cx + 72f, iconY + 21f)
+                canvas.drawOval(leftEye, iconStroke)
+                canvas.drawOval(rightEye, iconStroke)
+                canvas.drawCircle(leftEye.centerX(), iconY, 7f, iconFill)
+                canvas.drawCircle(rightEye.centerX(), iconY, 7f, iconFill)
+                val arrowY = iconY + 34f
+                canvas.drawLine(cx - 48f, arrowY, cx + 48f, arrowY, iconStroke)
+                val direction = if (swapEyes) -1f else 1f
+                val arrowX = cx + direction * 48f
+                val arrow = Path().apply {
+                    moveTo(arrowX, arrowY)
+                    lineTo(arrowX - direction * 15f, arrowY - 10f)
+                    lineTo(arrowX - direction * 15f, arrowY + 10f)
+                    close()
+                }
+                canvas.drawPath(arrow, iconFill)
+            } else {
+                val frame = RectF(cx - 70f, iconY - 31f, cx + 70f, iconY + 31f)
+                canvas.drawRoundRect(frame, 8f, 8f, iconStroke)
+                when (mode) {
+                    StereoMode.MONO -> {
+                        val mountain = Path().apply {
+                            moveTo(cx - 52f, iconY + 17f)
+                            lineTo(cx - 22f, iconY - 11f)
+                            lineTo(cx + 1f, iconY + 7f)
+                            lineTo(cx + 26f, iconY - 17f)
+                            lineTo(cx + 53f, iconY + 17f)
+                        }
+                        canvas.drawPath(mountain, iconStroke)
+                    }
+                    StereoMode.SBS,
+                    StereoMode.HALF_SBS ->
+                        canvas.drawLine(cx, frame.top + 2f, cx, frame.bottom - 2f, iconStroke)
+                    StereoMode.OVER_UNDER,
+                    StereoMode.HALF_OVER_UNDER ->
+                        canvas.drawLine(frame.left + 2f, iconY, frame.right - 2f, iconY, iconStroke)
+                    null -> Unit
+                }
+                if (mode != StereoMode.MONO && mode != null) {
+                    val badgeText = when (mode) {
+                        StereoMode.SBS,
+                        StereoMode.OVER_UNDER -> "F"
+                        else -> "H"
+                    }
+                    canvas.drawCircle(
+                        frame.right - 2f,
+                        frame.top + 2f,
+                        16f,
+                        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = if (selected) colorAccent else colorSurfaceRaised
+                        },
+                    )
+                    text(badgeText, frame.right - 2f, frame.top + 10f, 20f)
+                }
+            }
+            text(label, cx, bounds.bottom - 14f, 22f)
+            buttons += UiButton(id, label, bounds, selected)
+        }
+
+        fun popoverTrackList(
+            itemCount: Int,
+            selectedIndex: Int,
+            itemLabel: (Int) -> String,
+            itemId: (Int) -> String,
+        ) {
+            val maximum =
+                (itemCount - TRACK_LIST_VISIBLE_ROWS).coerceAtLeast(0).toFloat()
+            setTrackListScrollOffset(trackListScrollOffset().coerceIn(0f, maximum))
+            val offset = trackListScrollOffset()
+            val anchorIndex = kotlin.math.floor(offset).toInt()
+            val firstIndex = (anchorIndex - TRACK_LIST_ROW_RENDER_BUFFER).coerceAtLeast(0)
+            val lastIndex = minOf(
+                itemCount - 1,
+                anchorIndex + TRACK_LIST_VISIBLE_ROWS + TRACK_LIST_ROW_RENDER_BUFFER,
+            )
+            val saveCount = canvas.save()
+            canvas.clipRect(TRACK_LIST_CLIP_BOUNDS)
+            if (itemCount > 0) {
+                for (index in firstIndex..lastIndex) {
+                    val top = TRACK_LIST_ROW_TOP + (index - offset) * TRACK_LIST_ROW_STRIDE
+                    val bounds = RectF(
+                        TRACK_LIST_ROW_LEFT,
+                        top,
+                        TRACK_LIST_ROW_RIGHT,
+                        top + TRACK_LIST_ROW_HEIGHT,
+                    )
+                    if (
+                        bounds.bottom >= TRACK_LIST_CLIP_BOUNDS.top &&
+                        bounds.top <= TRACK_LIST_CLIP_BOUNDS.bottom
+                    ) {
+                        button(
+                            itemId(index),
+                            itemLabel(index),
+                            bounds,
+                            selectedIndex == index,
+                            fontSize = 23f,
+                        )
+                        val drawnButton = buttons.removeAt(buttons.lastIndex)
+                        val hitBounds = RectF(drawnButton.bounds)
+                        if (hitBounds.intersect(TRACK_LIST_HIT_BOUNDS)) {
+                            buttons += drawnButton.copy(bounds = hitBounds)
+                        }
+                    }
+                }
+            }
+            canvas.restoreToCount(saveCount)
+
+            if (maximum > 0f) {
+                canvas.drawRoundRect(
+                    TRACK_LIST_SCROLLBAR_TRACK,
+                    6f,
+                    6f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorOutline },
+                )
+                val thumb = trackListScrollbarThumbBounds()
+                val thumbColor = if (
+                    hoveredButton == TRACK_LIST_SCROLLBAR_ID ||
+                    trackListScrollbarDragging
+                ) colorAccentBright else colorAccent
+                canvas.drawRoundRect(
+                    thumb,
+                    6f,
+                    6f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = thumbColor },
+                )
+                buttons += UiButton(
+                    TRACK_LIST_SCROLLBAR_ID,
+                    "Scroll tracks",
+                    RectF(
+                        thumb.left - TRACK_LIST_SCROLLBAR_HIT_PADDING,
+                        thumb.top - TRACK_LIST_SCROLLBAR_HIT_PADDING,
+                        thumb.right + TRACK_LIST_SCROLLBAR_HIT_PADDING,
+                        thumb.bottom + TRACK_LIST_SCROLLBAR_HIT_PADDING,
+                    ),
+                )
+            }
+        }
+
+        fun checkbox(id: String, label: String, bounds: RectF, checked: Boolean) {
+            val hovered = hoveredButton == id
+            if (hovered) {
+                canvas.drawRoundRect(bounds, 18f, 18f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = colorHover
+                })
+            }
+            val box = RectF(bounds.left + 18f, bounds.centerY() - 24f, bounds.left + 66f, bounds.centerY() + 24f)
+            canvas.drawRoundRect(box, 8f, 8f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (checked) colorAccent else colorSurfaceRaised
+                style = Paint.Style.FILL
+            })
+            canvas.drawRoundRect(box, 8f, 8f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (hovered || checked) colorAccentBright else colorOutline
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            })
+            if (checked) text("✓", box.centerX(), box.centerY() + 15f, 38f)
+            text(label, bounds.left + 90f, bounds.centerY() + 14f, 35f, Paint.Align.LEFT)
+            buttons += UiButton(id, label, bounds, checked)
+        }
+
+        fun browserEntryButton(id: String, name: String, detail: String, bounds: RectF, folder: Boolean) {
+            val hovered = hoveredButton == id
+            val fill = if (hovered) colorHover else colorSurfaceRaised
+            canvas.drawRoundRect(bounds, 20f, 20f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill })
+            canvas.drawRoundRect(bounds, 20f, 20f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (hovered) colorAccent else colorOutline
+                style = Paint.Style.STROKE
+                strokeWidth = if (hovered) 4f else 2f
+            })
+            if (hovered) {
+                canvas.drawRoundRect(
+                    bounds.left, bounds.top + 13f, bounds.left + 7f, bounds.bottom - 13f,
+                    4f, 4f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccentBright },
+                )
+            }
+            val iconX = bounds.left + 38f
+            val iconY = bounds.centerY()
+            if (folder) {
+                val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(207, 165, 73) }
+                canvas.drawRoundRect(iconX, iconY - 18f, iconX + 58f, iconY + 24f, 7f, 7f, iconPaint)
+                canvas.drawRoundRect(iconX + 5f, iconY - 29f, iconX + 33f, iconY - 9f, 6f, 6f, iconPaint)
+            } else {
+                val play = Path().apply {
+                    moveTo(iconX + 8f, iconY - 27f)
+                    lineTo(iconX + 60f, iconY)
+                    lineTo(iconX + 8f, iconY + 27f)
+                    close()
+                }
+                canvas.drawPath(play, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccentBright })
+            }
+            text(name.take(52), iconX + 88f, iconY + 13f, 36f, Paint.Align.LEFT)
+            if (detail.isNotBlank()) {
+                text(detail, bounds.right - 28f, iconY + 12f, 29f, Paint.Align.RIGHT, colorTextMuted)
+            }
+            val hitBounds = RectF(bounds)
+            if (hitBounds.intersect(BROWSER_LIST_HIT_BOUNDS)) {
+                buttons += UiButton(id, name, hitBounds)
+            }
+        }
+
+        fun recentEntryButton(
+            id: String,
+            item: MediaStateStore.RecentMedia,
+            bounds: RectF,
+        ) {
+            val hovered = hoveredButton == id
+            canvas.drawRoundRect(
+                bounds,
+                20f,
+                20f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hovered) colorHover else colorSurfaceRaised
+                },
+            )
+            canvas.drawRoundRect(
+                bounds,
+                20f,
+                20f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hovered) colorAccent else colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = if (hovered) 4f else 2f
+                },
+            )
+            if (hovered) {
+                canvas.drawRoundRect(
+                    bounds.left,
+                    bounds.top + 12f,
+                    bounds.left + 7f,
+                    bounds.bottom - 12f,
+                    4f,
+                    4f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccentBright },
+                )
+            }
+
+            val iconX = bounds.left + 42f
+            val iconY = bounds.centerY()
+            canvas.drawCircle(
+                iconX,
+                iconY,
+                27f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccent },
+            )
+            canvas.drawPath(
+                Path().apply {
+                    moveTo(iconX - 7f, iconY - 14f)
+                    lineTo(iconX + 16f, iconY)
+                    lineTo(iconX - 7f, iconY + 14f)
+                    close()
+                },
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText },
+            )
+
+            val parsed = Uri.parse(item.uri)
+            val source = if (parsed.scheme.equals("smb", ignoreCase = true)) {
+                "SMB  •  ${parsed.host.orEmpty()}/${item.smbShare.orEmpty()}"
+            } else {
+                "Local"
+            }
+            val resume = item.positionMs
+                ?.takeIf { it >= MINIMUM_RESUME_POSITION_MS }
+                ?.let { position ->
+                    val duration = item.durationMs
+                    if (duration != null && duration > 0L) {
+                        "Resume ${formatTime(position)} / ${formatTime(duration)}"
+                    } else {
+                        "Resume ${formatTime(position)}"
+                    }
+                }
+            text(
+                item.title.take(42),
+                bounds.left + 88f,
+                bounds.top + 39f,
+                31f,
+                Paint.Align.LEFT,
+            )
+            text(
+                listOfNotNull(resume, source).joinToString("  •  ").take(58),
+                bounds.left + 88f,
+                bounds.bottom - 17f,
+                23f,
+                Paint.Align.LEFT,
+                colorTextMuted,
+            )
+            buttons += UiButton(id, item.title, bounds)
+        }
+
+        fun scrollableList(
+            itemCount: Int,
+            rowStride: Float,
+            rowHeight: Float,
+            drawRow: (index: Int, bounds: RectF) -> Unit,
+        ) {
+            val maximum = (itemCount - BROWSER_VISIBLE_ROWS).coerceAtLeast(0).toFloat()
+            browserScrollOffset = browserScrollOffset.coerceIn(0f, maximum)
+            val anchorIndex = kotlin.math.floor(browserScrollOffset).toInt()
+            // Keep rows on both sides of the viewport alive while they cross its edge.
+            // Canvas clipping, rather than index culling, then reveals/hides them progressively.
+            val firstIndex = (anchorIndex - BROWSER_ROW_RENDER_BUFFER).coerceAtLeast(0)
+            val lastIndex = minOf(
+                itemCount - 1,
+                anchorIndex + BROWSER_VISIBLE_ROWS + BROWSER_ROW_RENDER_BUFFER,
+            )
+            val saveCount = canvas.save()
+            canvas.clipRect(BROWSER_LIST_CLIP_BOUNDS)
+            if (itemCount > 0) {
+                for (index in firstIndex..lastIndex) {
+                    val top = BROWSER_LIST_TOP + (index - browserScrollOffset) * rowStride
+                    val bounds = RectF(BROWSER_LIST_LEFT, top, BROWSER_LIST_RIGHT, top + rowHeight)
+                    if (bounds.bottom >= BROWSER_LIST_TOP && bounds.top <= BROWSER_LIST_BOTTOM) {
+                        drawRow(index, bounds)
+                    }
+                }
+            }
+            canvas.restoreToCount(saveCount)
+
+            if (maximum > 0f) {
+                val track = BROWSER_SCROLLBAR_TRACK
+                canvas.drawRoundRect(track, 8f, 8f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = colorOutline
+                })
+                val thumb = browserScrollbarThumbBounds()
+                val thumbColor = if (
+                    hoveredButton == BROWSER_SCROLLBAR_ID || browserScrollbarDragging
+                ) colorAccentBright else colorAccent
+                canvas.drawRoundRect(
+                    thumb, 8f, 8f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = thumbColor },
+                )
+                buttons += UiButton(
+                    BROWSER_SCROLLBAR_ID,
+                    "Scroll",
+                    RectF(
+                        thumb.left - BROWSER_SCROLLBAR_HIT_PADDING,
+                        thumb.top - BROWSER_SCROLLBAR_HIT_PADDING,
+                        thumb.right + BROWSER_SCROLLBAR_HIT_PADDING,
+                        thumb.bottom + BROWSER_SCROLLBAR_HIT_PADDING,
+                    ),
+                )
+            }
+        }
+
+        when (uiScreen) {
+            UiScreen.LIBRARY -> {
+                canvas.drawRoundRect(90f, 60f, 845f, 955f, 42f, 42f, panelPaint)
+                canvas.drawRoundRect(885f, 60f, 1958f, 955f, 42f, 42f, panelPaint)
+                text("Dream Player", 468f, 190f, 76f)
+                text("Choose a source", 468f, 252f, 36f, color = colorTextMuted)
+                button("open_local", "Local video library", RectF(155f, 330f, 780f, 465f), fontSize = 42f)
+                button("open_smb", "Network shares (SMB)", RectF(155f, 505f, 780f, 640f), fontSize = 42f)
+                text(
+                    "Browse without leaving VR.",
+                    468f,
+                    715f,
+                    29f,
+                    color = colorTextMuted,
+                )
+                button("exit", "Exit", RectF(265f, 795f, 670f, 895f), fontSize = 38f)
+
+                text("Recently played", 1422f, 145f, 50f)
+                if (recentMedia.isEmpty()) {
+                    text(
+                        "Videos you play will appear here.",
+                        1422f,
+                        470f,
+                        34f,
+                        color = colorTextMuted,
+                    )
+                } else {
+                    recentMedia.take(RECENT_MEDIA_LIMIT).forEachIndexed { index, item ->
+                        val top = 185f + index * 118f
+                        recentEntryButton(
+                            "recent_$index",
+                            item,
+                            RectF(940f, top, 1903f, top + 96f),
+                        )
+                    }
+                }
+            }
+            UiScreen.LOCAL_FOLDERS -> {
+                canvas.drawRoundRect(170f, 55f, 1878f, 975f, 42f, 42f, panelPaint)
+                text("Local videos", 1024f, 135f, 66f)
+                val folders = localVideos.map { it.folder }.distinct().sortedWith(String.CASE_INSENSITIVE_ORDER)
+                scrollableList(folders.size, 98f, 80f) { index, bounds ->
+                    val folder = folders[index]
+                    val count = localVideos.count { it.folder == folder }
+                    browserEntryButton(
+                        "folder_$index", folder, "$count videos",
+                        RectF(290f, bounds.top, 1758f, bounds.bottom), true,
+                    )
+                }
+                if (folders.isEmpty()) text("No local videos were found.", 1024f, 450f, 46f)
+                button("local_back", "Back", RectF(250f, 885f, 570f, 950f))
+                text("${folders.size} folders  •  Joystick ↑/↓ to scroll", 1740f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
+            }
+            UiScreen.LOCAL_FILES -> {
+                canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
+                text(localFolder ?: "Local videos", 1024f, 135f, 58f)
+                val indexed = localVideos.withIndex().filter { it.value.folder == localFolder }
+                scrollableList(indexed.size, 98f, 80f) { index, bounds ->
+                    val indexedVideo = indexed[index]
+                    val video = indexedVideo.value
+                    val details = "${formatTime(video.durationMs)}  •  ${formatBytes(video.size)}"
+                    browserEntryButton("video_${indexedVideo.index}", video.name, details,
+                        RectF(230f, bounds.top, 1818f, bounds.bottom), false)
+                }
+                button("local_back", "Folders", RectF(250f, 885f, 570f, 950f))
+                text("${indexed.size} videos  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
+            }
+            UiScreen.SMB_SERVERS -> {
+                canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
+                text("SMB servers", 1024f, 135f, 64f)
+                scrollableList(smbServers.size, 90f, 72f) { index, bounds ->
+                    val server = smbServers[index]
+                    browserEntryButton(
+                        "smb_server_$index",
+                        server.displayName,
+                        if (server.displayName.equals(server.host, ignoreCase = true)) "" else server.host,
+                        RectF(300f, bounds.top, 1748f, bounds.bottom), true,
+                    )
+                }
+                button("smb_servers_back", "Back", RectF(180f, 885f, 460f, 955f), fontSize = 36f)
+                button("smb_add_server", "Add server", RectF(505f, 885f, 835f, 955f), fontSize = 36f)
+                button("smb_discover_again", "Scan again", RectF(880f, 885f, 1210f, 955f), fontSize = 36f)
+                text("Joystick ↑/↓ to scroll", 1800f, 930f, 28f, Paint.Align.RIGHT, colorTextMuted)
+            }
+            UiScreen.SMB_LOGIN -> {
+                canvas.drawRoundRect(210f, 55f, 1838f, 975f, 42f, 42f, panelPaint)
+                text("Connect to SMB", 1024f, 145f, 66f)
+                fun field(id: String, label: String, value: String, top: Float, secret: Boolean = false) {
+                    text(label, 360f, top + 63f, 34f, Paint.Align.LEFT)
+                    val shown = if (secret && value.isNotEmpty()) "•".repeat(value.length.coerceAtMost(24)) else value.ifBlank { "Select to enter" }
+                    button("smb_field_$id", shown.take(38), RectF(700f, top, 1660f, top + 88f), fontSize = 38f)
+                }
+                field("host", "Server", smbCredentials.host, 205f)
+                field("user", "Username", smbCredentials.username, 325f)
+                field("password", "Password", smbCredentials.password, 445f, true)
+                field("domain", "Domain", smbCredentials.domain, 565f)
+                checkbox("smb_remember", "Remember credentials securely", RectF(570f, 680f, 1478f, 750f), rememberSmbCredentials)
+                button("smb_login_back", "Back", RectF(430f, 790f, 850f, 905f))
+                button("smb_connect", "Connect", RectF(910f, 790f, 1618f, 905f))
+            }
+            UiScreen.SMB_SHARES -> {
+                canvas.drawRoundRect(150f, 55f, 1898f, 975f, 42f, 42f, panelPaint)
+                text(smbDisplayHost.ifBlank { smbCredentials.host }, 1024f, 135f, 58f)
+                scrollableList(smbShares.size, 92f, 75f) { index, bounds ->
+                    browserEntryButton(
+                        "smb_share_$index", smbShares[index], "",
+                        RectF(270f, bounds.top, 1778f, bounds.bottom), true,
+                    )
+                }
+                button("smb_shares_back", "Servers", RectF(250f, 885f, 570f, 950f), fontSize = 36f)
+                text("${smbShares.size} shares  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
+            }
+            UiScreen.SMB_FILES -> {
+                canvas.drawRoundRect(120f, 55f, 1928f, 975f, 42f, 42f, panelPaint)
+                val location = if (smbPath.isBlank()) smbCredentials.share else "${smbCredentials.share} / ${smbPath.replace('\\', '/')}"
+                text(location.takeLast(56), 1024f, 135f, 48f)
+                scrollableList(smbEntries.size, 92f, 75f) { index, bounds ->
+                    val entry = smbEntries[index]
+                    browserEntryButton(
+                        "smb_entry_$index", entry.name,
+                        if (entry.isDirectory) "" else formatBytes(entry.size),
+                        RectF(210f, bounds.top, 1838f, bounds.bottom), entry.isDirectory,
+                    )
+                }
+                if (smbEntries.isEmpty()) text("No video files or folders found.", 1024f, 450f, 42f)
+                button("smb_files_back", "Up", RectF(250f, 885f, 570f, 950f), fontSize = 36f)
+                text("${smbEntries.size} items  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
+            }
+            UiScreen.SMB_KEYBOARD -> {
+                canvas.drawRoundRect(95f, 35f, 1953f, 995f, 42f, 42f, panelPaint)
+                text(keyboardTitle(), 1024f, 105f, 50f)
+                val raw = keyboardValue()
+                val shown = if (keyboardField == KeyboardField.PASSWORD) "•".repeat(raw.length) else raw
+                canvas.drawRoundRect(
+                    230f, 135f, 1818f, 225f, 20f, 20f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorSurfaceRaised },
+                )
+                text(shown.takeLast(52).ifBlank { " " }, 1024f, 195f, 42f)
+                val letterRows = listOf("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm.-_@")
+                val rows = if (keyboardSymbols) listOf(
+                    "1234567890", "!@#$%&*+?", "()[]{}<>\\", "-_=/:;.,",
+                ) else if (keyboardUppercase) letterRows.map { it.uppercase() } else letterRows
+                rows.forEachIndexed { row, characters ->
+                    val width = 1540f / characters.length
+                    val left = 254f
+                    characters.forEachIndexed { column, character ->
+                        val x = left + column * width
+                        button(
+                            "key_char_${character.code}", character.toString(),
+                            RectF(x, 275f + row * 112f, x + width - 10f, 365f + row * 112f),
+                            fontSize = 42f,
+                        )
+                    }
+                }
+                button("key_case", if (keyboardUppercase) "lower" else "UPPER", RectF(120f, 755f, 390f, 850f), fontSize = 32f)
+                button("key_symbols", if (keyboardSymbols) "ABC" else "Symbols", RectF(410f, 755f, 690f, 850f), fontSize = 32f)
+                button("key_space", "Space", RectF(710f, 755f, 1040f, 850f), fontSize = 34f)
+                button("key_backspace", "Backspace", RectF(1060f, 755f, 1410f, 850f), fontSize = 31f)
+                button("key_clear", "Clear", RectF(1430f, 755f, 1710f, 850f), fontSize = 34f)
+                button("key_cancel", "Cancel", RectF(480f, 885f, 900f, 960f), fontSize = 36f)
+                button("key_done", "Done", RectF(1148f, 885f, 1568f, 960f), fontSize = 36f)
+            }
+            UiScreen.PLAYBACK -> {
+                canvas.drawRoundRect(PLAYBACK_TOOLBAR_BOUNDS, 34f, 34f, panelPaint)
+                val duration = player.duration.takeIf { it > 0 } ?: 0L
+                val fraction = if (duration > 0) player.currentPosition.toFloat() / duration else 0f
+                val seekLeft = PLAYBACK_SEEK_LEFT
+                val seekRight = PLAYBACK_SEEK_RIGHT
+                val seekWidth = seekRight - seekLeft
+                val seekBounds = RectF(seekLeft, 720f, seekRight, 790f)
+                canvas.drawRoundRect(seekLeft, 749f, seekRight, 763f, 7f, 7f,
+                    Paint().apply { color = colorOutline })
+                canvas.drawRoundRect(seekLeft, 749f, seekLeft + seekWidth * fraction.coerceIn(0f, 1f), 763f, 7f, 7f,
+                    Paint().apply { color = colorAccent })
+                canvas.drawCircle(seekLeft + seekWidth * fraction.coerceIn(0f, 1f), 756f, 18f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText })
+                buttons += UiButton("seek_bar", "Seek", seekBounds)
+                text(formatTime(player.currentPosition), 320f, 765f, 26f, Paint.Align.RIGHT, colorTextMuted)
+                text(formatTime(duration), 1728f, 765f, 26f, Paint.Align.LEFT, colorTextMuted)
+                val iconTop = 820f
+                val iconBottom = 936f
+                val standardButtonSize = iconBottom - iconTop
+                fun standardBounds(left: Float) =
+                    RectF(left, iconTop, left + standardButtonSize, iconBottom)
+
+                // Left: navigation and language controls.
+                iconButton("back_library", "Library", standardBounds(176f))
+                iconButton(
+                    "subtitles", "Subtitles", standardBounds(316f),
+                    playbackPopover == PlaybackPopover.SUBTITLES ||
+                        subtitleChoiceIndex > 1 ||
+                        subtitleSyncMs != 0,
+                )
+                iconButton(
+                    "audio", "Audio", standardBounds(456f),
+                    playbackPopover == PlaybackPopover.AUDIO ||
+                        audioChoiceIndex > 0 ||
+                        audioSyncMs != 0,
+                )
+
+                // Center: the primary playback controls remain centered independently
+                // of the number or width of controls in the side groups.
+                iconButton("seek_back", "Back 10 seconds", RectF(816f, iconTop, 928f, iconBottom))
+                iconButton(
+                    "play_pause",
+                    if (player.isPlaying) "Pause" else "Play",
+                    RectF(952f, 806f, 1096f, 950f),
+                    prominent = true,
+                )
+                iconButton("seek_forward", "Forward 10 seconds", RectF(1120f, iconTop, 1232f, iconBottom))
+
+                // Right: presentation and player configuration.
+                iconButton(
+                    "projection", stereoLabel(), standardBounds(1616f),
+                    playbackPopover == PlaybackPopover.PROJECTION ||
+                        currentStereoMode != StereoMode.MONO ||
+                        swapEyes ||
+                        screenCurvature != DEFAULT_SCREEN_CURVATURE,
+                )
+                iconButton(
+                    "settings", "Settings", standardBounds(1756f),
+                    playbackPopover == PlaybackPopover.SETTINGS ||
+                        playbackPopover == PlaybackPopover.CINEMA ||
+                        pictureMode != PictureMode.AUTO ||
+                        pictureBrightness != DEFAULT_PICTURE_BRIGHTNESS ||
+                        pictureExposure != defaultExposureForCurrentColorMode() ||
+                        pictureContrast != DEFAULT_PICTURE_CONTRAST ||
+                        pictureSaturation != DEFAULT_PICTURE_SATURATION ||
+                        pictureVibrance != DEFAULT_PICTURE_VIBRANCE ||
+                        decoderMode != DecoderMode.AUTO,
+                )
+
+                val groupDividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = colorOutline
+                    strokeWidth = 2f
+                }
+                canvas.drawLine(622f, 838f, 622f, 918f, groupDividerPaint)
+                canvas.drawLine(1426f, 838f, 1426f, 918f, groupDividerPaint)
+                buttons.lastOrNull { it.id == hoveredButton }?.takeIf {
+                    it.id != "seek_bar" &&
+                        playbackPopover == PlaybackPopover.NONE &&
+                        activeSlider == null
+                }?.let { focused ->
+                    val tooltipWidth = (focused.label.length * 17f + 52f).coerceIn(180f, 430f)
+                    val tooltipCenter = focused.bounds.centerX().coerceIn(
+                        PLAYBACK_TOOLBAR_BOUNDS.left + tooltipWidth / 2f + 20f,
+                        PLAYBACK_TOOLBAR_BOUNDS.right - tooltipWidth / 2f - 20f,
+                    )
+                    val tooltip = RectF(
+                        tooltipCenter - tooltipWidth / 2f, 778f,
+                        tooltipCenter + tooltipWidth / 2f, 812f,
+                    )
+                    canvas.drawRoundRect(tooltip, 13f, 13f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = colorSurfaceRaised
+                    })
+                    text(focused.label, tooltipCenter, 804f, 23f, color = colorTextMuted)
+                }
+
+                when (playbackPopover) {
+                    PlaybackPopover.SUBTITLES -> {
+                        val bounds = PLAYBACK_LEFT_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Subtitles", 374f)
+                        popoverTrackList(
+                            subtitleChoices.size,
+                            subtitleChoiceIndex,
+                            { subtitleChoices[it].label },
+                            { "subtitle_$it" },
+                        )
+                        subtitleDepthSlider(525f)
+                        text(
+                            when {
+                                subtitleSyncMs < 0 -> "Timing  ${subtitleSyncMs} ms  •  earlier"
+                                subtitleSyncMs > 0 -> "Timing  +${subtitleSyncMs} ms  •  later"
+                                else -> "Timing  0 ms"
+                            },
+                            505f, 565f, 24f, color = colorTextMuted,
+                        )
+                        button(
+                            "subtitle_sync_earlier_500", "−500",
+                            RectF(190f, 585f, 300f, 640f), fontSize = 21f,
+                        )
+                        button(
+                            "subtitle_sync_earlier_100", "−100",
+                            RectF(310f, 585f, 420f, 640f), fontSize = 21f,
+                        )
+                        button(
+                            "subtitle_sync_reset", "Reset",
+                            RectF(430f, 585f, 580f, 640f),
+                            subtitleSyncMs == 0, fontSize = 21f,
+                        )
+                        button(
+                            "subtitle_sync_later_100", "+100",
+                            RectF(590f, 585f, 700f, 640f), fontSize = 21f,
+                        )
+                        button(
+                            "subtitle_sync_later_500", "+500",
+                            RectF(710f, 585f, 820f, 640f), fontSize = 21f,
+                        )
+                    }
+                    PlaybackPopover.AUDIO -> {
+                        val bounds = PLAYBACK_LEFT_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Audio", 514f)
+                        popoverTrackList(
+                            audioChoices.size,
+                            audioChoiceIndex,
+                            { audioChoices[it].label },
+                            { "audio_track_$it" },
+                        )
+                        text(
+                            when {
+                                audioSyncMs < 0 -> "Timing  ${audioSyncMs} ms  •  earlier"
+                                audioSyncMs > 0 -> "Timing  +${audioSyncMs} ms  •  later"
+                                else -> "Timing  0 ms"
+                            },
+                            505f, 565f, 24f, color = colorTextMuted,
+                        )
+                        button(
+                            "sync_earlier_100", "−100",
+                            RectF(190f, 585f, 310f, 640f), fontSize = 21f,
+                        )
+                        button(
+                            "sync_earlier_25", "−25",
+                            RectF(320f, 585f, 440f, 640f), fontSize = 21f,
+                        )
+                        button(
+                            "sync_reset", "Reset",
+                            RectF(450f, 585f, 560f, 640f),
+                            audioSyncMs == 0, fontSize = 21f,
+                        )
+                        button(
+                            "sync_later_25", "+25",
+                            RectF(570f, 585f, 690f, 640f), fontSize = 21f,
+                        )
+                        button(
+                            "sync_later_100", "+100",
+                            RectF(700f, 585f, 820f, 640f), fontSize = 21f,
+                        )
+                    }
+                    PlaybackPopover.PROJECTION -> {
+                        val bounds = PLAYBACK_PROJECTION_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Projection", 1674f)
+                        projectionGridButton(
+                            "mode_2d", "2D",
+                            RectF(1218f, 290f, 1420f, 425f),
+                            StereoMode.MONO,
+                            currentStereoMode == StereoMode.MONO,
+                        )
+                        projectionGridButton(
+                            "mode_full_sbs", "Full SBS",
+                            RectF(1438f, 290f, 1640f, 425f),
+                            StereoMode.SBS,
+                            currentStereoMode == StereoMode.SBS,
+                        )
+                        projectionGridButton(
+                            "mode_half_sbs", "Half SBS",
+                            RectF(1658f, 290f, 1860f, 425f),
+                            StereoMode.HALF_SBS,
+                            currentStereoMode == StereoMode.HALF_SBS,
+                        )
+                        projectionGridButton(
+                            "mode_full_ou", "Full OU",
+                            RectF(1218f, 443f, 1420f, 578f),
+                            StereoMode.OVER_UNDER,
+                            currentStereoMode == StereoMode.OVER_UNDER,
+                        )
+                        projectionGridButton(
+                            "mode_half_ou", "Half OU",
+                            RectF(1438f, 443f, 1640f, 578f),
+                            StereoMode.HALF_OVER_UNDER,
+                            currentStereoMode == StereoMode.HALF_OVER_UNDER,
+                        )
+                        projectionGridButton(
+                            "swap_eyes",
+                            if (swapEyes) "Eyes swapped" else "Swap eyes",
+                            RectF(1658f, 443f, 1860f, 578f),
+                            selected = swapEyes,
+                            swapControl = true,
+                        )
+                        projectionCurvatureSlider(625f)
+                    }
+                    PlaybackPopover.SETTINGS -> {
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Settings", 1814f)
+                        val detectedStatus = detectedVideoTransfer.label +
+                            if (detectedVideoPrimaries == VideoPrimaries.BT2020) {
+                                " • BT.2020"
+                            } else {
+                                " • BT.709"
+                            }
+                        text(
+                            "Detected: $detectedStatus",
+                            1860f, 109f, 21f, Paint.Align.RIGHT, colorTextMuted,
+                        )
+                        text("Decoder", 975f, 174f, 24f, Paint.Align.LEFT)
+                        button(
+                            "decoder_auto", "Auto",
+                            RectF(1200f, 140f, 1410f, 192f),
+                            decoderMode == DecoderMode.AUTO, fontSize = 22f,
+                        )
+                        button(
+                            "decoder_hardware", "Hardware",
+                            RectF(1420f, 140f, 1630f, 192f),
+                            decoderMode == DecoderMode.HARDWARE, fontSize = 22f,
+                        )
+                        button(
+                            "decoder_software", "Software",
+                            RectF(1640f, 140f, 1860f, 192f),
+                            decoderMode == DecoderMode.SOFTWARE, fontSize = 22f,
+                        )
+                        text("Color mode", 975f, 239f, 24f, Paint.Align.LEFT)
+                        val compactModes = listOf(
+                            Triple("picture_mode_auto", "Auto", PictureMode.AUTO),
+                            Triple("picture_mode_sdr", "SDR", PictureMode.FORCE_SDR),
+                            Triple("picture_mode_pq", "HDR10", PictureMode.FORCE_PQ),
+                            Triple("picture_mode_hlg", "HLG", PictureMode.FORCE_HLG),
+                            Triple("picture_mode_original", "Original", PictureMode.ORIGINAL),
+                        )
+                        val compactModeBounds = listOf(
+                            RectF(1120f, 205f, 1258f, 257f),
+                            RectF(1266f, 205f, 1404f, 257f),
+                            RectF(1412f, 205f, 1550f, 257f),
+                            RectF(1558f, 205f, 1696f, 257f),
+                            RectF(1704f, 205f, 1860f, 257f),
+                        )
+                        compactModes.forEachIndexed { index, (id, label, mode) ->
+                            button(
+                                id, label, compactModeBounds[index],
+                                pictureMode == mode, fontSize = 20f,
+                            )
+                        }
+                        compactSettingsSlider(
+                            "settings_slider_brightness", "Brightness",
+                            "%+.1f%%".format(Locale.US, pictureBrightness * 100f),
+                            pictureBrightness,
+                            PICTURE_BRIGHTNESS_MIN,
+                            PICTURE_BRIGHTNESS_MAX,
+                            286f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_exposure", "Exposure",
+                            "%+.2f EV".format(Locale.US, pictureExposure),
+                            pictureExposure,
+                            PICTURE_EXPOSURE_MIN,
+                            PICTURE_EXPOSURE_MAX,
+                            326f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_contrast", "Contrast",
+                            "%.2f".format(Locale.US, pictureContrast),
+                            pictureContrast,
+                            PICTURE_CONTRAST_MIN,
+                            PICTURE_CONTRAST_MAX,
+                            366f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_vibrance", "Vibrance",
+                            "%+.0f".format(Locale.US, pictureVibrance * 100f),
+                            pictureVibrance,
+                            PICTURE_VIBRANCE_MIN,
+                            PICTURE_VIBRANCE_MAX,
+                            406f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_saturation", "Saturation",
+                            "%.2f".format(Locale.US, pictureSaturation),
+                            pictureSaturation,
+                            PICTURE_SATURATION_MIN,
+                            PICTURE_SATURATION_MAX,
+                            446f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_tone_peak", "HDR target",
+                            "%.0f nits".format(Locale.US, toneMapPeakNits),
+                            toneMapPeakNits,
+                            TONE_MAP_PEAK_NITS_MIN,
+                            TONE_MAP_PEAK_NITS_MAX,
+                            506f,
+                            logarithmic = true,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_scene", "Scene brightness",
+                            "%.0f%%".format(Locale.US, sceneBrightness * 100f),
+                            sceneBrightness,
+                            SCENE_BRIGHTNESS_MIN,
+                            SCENE_BRIGHTNESS_MAX,
+                            566f,
+                        )
+                        text(
+                            "Cinema \u2022 ${activeCinemaTransfer().label}",
+                            975f, 637f, 21f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "cinema_tune", "Tune",
+                            RectF(1210f, 605f, 1535f, 660f),
+                            fontSize = 20f,
+                        )
+                        button(
+                            "picture_reset", "Reset sliders",
+                            RectF(1543f, 605f, 1860f, 660f),
+                            fontSize = 21f,
+                        )
+                    }
+                    PlaybackPopover.CINEMA -> {
+                        val cinemaTuning = activeCinemaTuning()
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Cinema tuning", 1814f)
+                        text(
+                            "Global ${activeCinemaTransfer().label} profile • black and white endpoints remain fixed",
+                            975f, 122f, 21f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_tone_depth", "Tone depth",
+                            "%.0f".format(
+                                Locale.US,
+                                cinemaTuning.toneDepth * CINEMA_TONE_DEPTH_DISPLAY_SCALE,
+                            ),
+                            cinemaTuning.toneDepth,
+                            CINEMA_TONE_DEPTH_MIN,
+                            CINEMA_TONE_DEPTH_MAX,
+                            225f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_midtones", "Midtone brightness",
+                            "%+.2f EV".format(Locale.US, cinemaTuning.midtoneEv),
+                            cinemaTuning.midtoneEv,
+                            CINEMA_MIDTONE_EV_MIN,
+                            CINEMA_MIDTONE_EV_MAX,
+                            325f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_color_intensity", "Color intensity",
+                            "%+.0f%%".format(
+                                Locale.US,
+                                (cinemaTuning.colorIntensity - 1f) * 100f,
+                            ),
+                            cinemaTuning.colorIntensity,
+                            CINEMA_COLOR_INTENSITY_MIN,
+                            CINEMA_COLOR_INTENSITY_MAX,
+                            425f,
+                        )
+                        text(
+                            "Tone depth adds separation • Midtones changes ordinary scene brightness",
+                            975f, 525f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            "Color intensity adjusts perceptual chroma after SDR/HDR conversion",
+                            975f, 555f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "cinema_reset", "Reset Cinema",
+                            RectF(1198f, 595f, 1518f, 655f),
+                            fontSize = 22f,
+                        )
+                        button(
+                            "cinema_back", "Back",
+                            RectF(1530f, 595f, 1860f, 655f),
+                            fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.NONE -> Unit
+                }
+            }
+            UiScreen.PROJECTION -> {
+                canvas.drawRoundRect(250f, 55f, 1798f, 995f, 42f, 42f, panelPaint)
+                text("Projection", 1024f, 155f, 68f)
+                button("mode_2d", "2D", RectF(390f, 205f, 840f, 330f), currentStereoMode == StereoMode.MONO)
+                button("mode_full_sbs", "Full SBS", RectF(880f, 205f, 1658f, 330f), currentStereoMode == StereoMode.SBS)
+                button("mode_half_sbs", "Half SBS", RectF(390f, 365f, 840f, 490f), currentStereoMode == StereoMode.HALF_SBS)
+                button("mode_full_ou", "Full OU / TB", RectF(880f, 365f, 1658f, 490f), currentStereoMode == StereoMode.OVER_UNDER)
+                button("mode_half_ou", "Half OU / TB", RectF(390f, 525f, 840f, 650f), currentStereoMode == StereoMode.HALF_OVER_UNDER)
+                button("swap_eyes", if (swapEyes) "Eye order: swapped" else "Eye order: normal", RectF(880f, 525f, 1658f, 650f), swapEyes)
+                button("modal_back", "Back", RectF(800f, 790f, 1248f, 880f))
+            }
+            UiScreen.PICTURE -> {
+                canvas.drawRoundRect(250f, 35f, 1798f, 990f, 42f, 42f, panelPaint)
+                text("Picture", 1024f, 120f, 62f)
+                val detectedStatus = detectedVideoTransfer.label +
+                    if (detectedVideoPrimaries == VideoPrimaries.BT2020) " • BT.2020" else " • BT.709"
+                val colorStatus = when (pictureMode) {
+                    PictureMode.ORIGINAL -> "Original decoder output • adjustments still apply"
+                    PictureMode.AUTO -> "Auto detected: $detectedStatus"
+                    PictureMode.FORCE_SDR -> "Manual override: SDR • BT.709"
+                    PictureMode.FORCE_PQ -> "Manual override: HDR10 / PQ • BT.2020"
+                    PictureMode.FORCE_HLG -> "Manual override: HDR / HLG • BT.2020"
+                }
+                text(colorStatus, 1024f, 177f, 30f, color = colorTextMuted)
+                val modeLabels = listOf(
+                    Triple("picture_mode_auto", "Auto", PictureMode.AUTO),
+                    Triple("picture_mode_sdr", "SDR", PictureMode.FORCE_SDR),
+                    Triple("picture_mode_pq", "HDR10", PictureMode.FORCE_PQ),
+                    Triple("picture_mode_hlg", "HLG", PictureMode.FORCE_HLG),
+                    Triple("picture_mode_original", "Original", PictureMode.ORIGINAL),
+                )
+                modeLabels.forEachIndexed { index, (id, label, mode) ->
+                    val left = 325f + index * 282f
+                    button(
+                        id, label, RectF(left, 205f, left + 252f, 282f),
+                        pictureMode == mode, fontSize = 27f,
+                    )
+                }
+                slider(
+                    "picture_slider_brightness", "Brightness",
+                    "%+.1f%%".format(Locale.US, pictureBrightness * 100f),
+                    pictureBrightness, PICTURE_BRIGHTNESS_MIN, PICTURE_BRIGHTNESS_MAX, 310f,
+                )
+                slider(
+                    "picture_slider_exposure", "Exposure",
+                    "%+.2f EV".format(Locale.US, pictureExposure),
+                    pictureExposure, PICTURE_EXPOSURE_MIN, PICTURE_EXPOSURE_MAX, 380f,
+                )
+                slider(
+                    "picture_slider_contrast", "Contrast",
+                    "%.2f".format(Locale.US, pictureContrast),
+                    pictureContrast, PICTURE_CONTRAST_MIN, PICTURE_CONTRAST_MAX, 450f,
+                )
+                slider(
+                    "picture_slider_vibrance", "Vibrance",
+                    "%+.0f".format(Locale.US, pictureVibrance * 100f),
+                    pictureVibrance, PICTURE_VIBRANCE_MIN, PICTURE_VIBRANCE_MAX, 520f,
+                )
+                slider(
+                    "picture_slider_saturation", "Saturation",
+                    "%.2f".format(Locale.US, pictureSaturation),
+                    pictureSaturation, PICTURE_SATURATION_MIN, PICTURE_SATURATION_MAX, 590f,
+                )
+                slider(
+                    "picture_slider_tone_peak", "HDR display target",
+                    "%.0f nits".format(Locale.US, toneMapPeakNits),
+                    toneMapPeakNits,
+                    TONE_MAP_PEAK_NITS_MIN,
+                    TONE_MAP_PEAK_NITS_MAX,
+                    660f,
+                    logarithmic = true,
+                )
+                slider(
+                    "picture_slider_scene", "Scene brightness",
+                    "%.0f%%".format(Locale.US, sceneBrightness * 100f),
+                    sceneBrightness, SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, 730f,
+                )
+                text(
+                    "Auto tone-maps HDR10 and HLG; decoder range expansion is intentionally avoided.",
+                    1024f, 855f, 22f, color = colorTextMuted,
+                )
+                button("picture_reset", "Reset sliders", RectF(365f, 885f, 720f, 965f), fontSize = 32f)
+                button("decoder", "Decoder", RectF(847f, 885f, 1202f, 965f), fontSize = 32f)
+                button("modal_back", "Back", RectF(1329f, 885f, 1684f, 965f), fontSize = 32f)
+            }
+            UiScreen.DECODER -> {
+                canvas.drawRoundRect(250f, 55f, 1798f, 995f, 42f, 42f, panelPaint)
+                text("Video decoder", 1024f, 145f, 62f)
+                text(
+                    "Auto uses hardware for efficiency and switches to software if timing is abnormal.",
+                    1024f, 205f, 30f, color = colorTextMuted,
+                )
+                button(
+                    "decoder_auto", "Auto",
+                    RectF(350f, 330f, 860f, 475f),
+                    decoderMode == DecoderMode.AUTO,
+                )
+                button(
+                    "decoder_hardware", "Hardware",
+                    RectF(910f, 330f, 1698f, 475f),
+                    decoderMode == DecoderMode.HARDWARE,
+                )
+                button(
+                    "decoder_software", "Software",
+                    RectF(350f, 535f, 1698f, 680f),
+                    decoderMode == DecoderMode.SOFTWARE,
+                )
+                text(
+                    "Active now: ${effectiveDecoderMode.label}",
+                    1024f, 755f, 31f, color = colorTextMuted,
+                )
+                button("modal_back", "Back", RectF(800f, 835f, 1248f, 920f), fontSize = 34f)
+            }
+            UiScreen.AUDIO_SYNC -> {
+                canvas.drawRoundRect(330f, 120f, 1718f, 920f, 42f, 42f, panelPaint)
+                text("Audio sync", 1024f, 220f, 68f)
+                val syncLabel = when {
+                    audioSyncMs < 0 -> "${audioSyncMs} ms  •  audio earlier"
+                    audioSyncMs > 0 -> "+${audioSyncMs} ms  •  audio later"
+                    else -> "0 ms  •  original timing"
+                }
+                text(syncLabel, 1024f, 325f, 42f)
+                text(
+                    "Use negative values when sound is heard after the picture.",
+                    1024f, 385f, 29f, color = colorTextMuted,
+                )
+                button("sync_earlier_100", "−100 ms", RectF(380f, 445f, 620f, 565f), fontSize = 34f)
+                button("sync_earlier_25", "−25 ms", RectF(650f, 445f, 890f, 565f), fontSize = 34f)
+                button("sync_reset", "Reset", RectF(920f, 445f, 1128f, 565f), audioSyncMs == 0, fontSize = 34f)
+                button("sync_later_25", "+25 ms", RectF(1158f, 445f, 1398f, 565f), fontSize = 34f)
+                button("sync_later_100", "+100 ms", RectF(1428f, 445f, 1668f, 565f), fontSize = 34f)
+                button("modal_back", "Back", RectF(800f, 650f, 1248f, 755f), fontSize = 37f)
+            }
+            UiScreen.AUDIO_TRACKS -> {
+                canvas.drawRoundRect(280f, 70f, 1768f, 960f, 42f, 42f, panelPaint)
+                text("Audio track", 1024f, 175f, 72f)
+                audioChoices.take(7).forEachIndexed { index, choice ->
+                    val top = 220f + index * 92f
+                    button(
+                        "audio_track_$index",
+                        choice.label,
+                        RectF(420f, top, 1628f, top + 74f),
+                        audioChoiceIndex == index,
+                        fontSize = 34f,
+                    )
+                }
+                button("audio_sync", "Audio timing", RectF(540f, 875f, 990f, 940f), fontSize = 29f)
+                button("modal_back", "Back", RectF(1058f, 875f, 1508f, 940f), fontSize = 29f)
+            }
+            UiScreen.SUBTITLES -> {
+                canvas.drawRoundRect(280f, 70f, 1768f, 960f, 42f, 42f, panelPaint)
+                text("Subtitle track", 1024f, 175f, 72f)
+                subtitleChoices.take(7).forEachIndexed { index, choice ->
+                    val top = 220f + index * 92f
+                    button(
+                        "subtitle_$index",
+                        choice.label,
+                        RectF(420f, top, 1628f, top + 74f),
+                        subtitleChoiceIndex == index,
+                    )
+                }
+                button("modal_back", "Back", RectF(800f, 875f, 1248f, 940f))
+            }
+        }
+
+        transientMessage?.let {
+            canvas.drawRoundRect(280f, 35f, 1768f, 115f, 24f, 24f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(245, 91, 31, 39) })
+            canvas.drawRoundRect(280f, 35f, 1768f, 115f, 24f, 24f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.rgb(214, 86, 91)
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                })
+            text(it, 1024f, 91f, 36f)
+        }
+        uiButtons = buttons
+        nativeSetMenuInteractive(true)
+        nativeSetSubtitle(bitmap)
+    }
+
+    private fun formatTime(milliseconds: Long): String {
+        val totalSeconds = (milliseconds.coerceAtLeast(0L) / 1000L)
+        val hours = totalSeconds / 3600L
+        val minutes = (totalSeconds % 3600L) / 60L
+        val seconds = totalSeconds % 60L
+        return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, seconds)
+        else "%02d:%02d".format(minutes, seconds)
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1_073_741_824L -> "%.1f GB".format(bytes / 1_073_741_824.0)
+        bytes >= 1_048_576L -> "%.0f MB".format(bytes / 1_048_576.0)
+        else -> "$bytes B"
+    }
+
+    private fun resumePosition(state: MediaStateStore.PlaybackState?): Long? {
+        val position = state?.positionMs ?: return null
+        val duration = state.durationMs
+        if (position < MINIMUM_RESUME_POSITION_MS) return null
+        if (duration != null && duration > 0L) {
+            val nearEndWindow = maxOf(MINIMUM_REMAINING_MS, (duration * END_FRACTION).toLong())
+            if (duration - position <= nearEndWindow) return null
+        }
+        return position
+    }
+
+    private fun resetPlaybackHealthMonitor() {
+        healthLastElapsedMs = 0L
+        healthLastPositionMs = 0L
+        healthAnchorElapsedMs = 0L
+        healthAnchorPositionMs = 0L
+        abnormalClockSamples = 0
+    }
+
+    private fun saveCurrentMediaState(positionOverrideMs: Long? = null) {
+        if (!mediaLoaded || !::player.isInitialized || spec.uri.isBlank()) return
+        val nativeTransform = nativeGetScreenTransform()
+        if (nativeTransform.size != 4) return
+        val duration = player.duration.takeIf { it != C.TIME_UNSET && it > 0L }
+        val position = positionOverrideMs
+            ?: if (playbackCompleted) 0L else player.currentPosition.coerceAtLeast(0L)
+        mediaStateStore.savePlaybackState(
+            spec = spec,
+            positionMs = position,
+            durationMs = duration,
+            transform = MediaStateStore.ScreenTransform(
+                x = nativeTransform[0],
+                y = nativeTransform[1],
+                z = nativeTransform[2],
+                halfHeight = nativeTransform[3],
+            ),
+        )
+    }
+
+    private fun applyVideoColorInfo(format: Format) {
+        val color = format.colorInfo
+        detectedVideoTransfer = when (color?.colorTransfer) {
+            C.COLOR_TRANSFER_ST2084 -> VideoTransfer.PQ
+            C.COLOR_TRANSFER_HLG -> VideoTransfer.HLG
+            else -> VideoTransfer.SDR
+        }
+        detectedVideoPrimaries =
+            if (color?.colorSpace == C.COLOR_SPACE_BT2020) VideoPrimaries.BT2020
+            else VideoPrimaries.BT709
+        nativeSetVideoColorInfo(detectedVideoTransfer.wireValue, detectedVideoPrimaries.wireValue)
+        applyCinemaSettings(persist = false)
+        if (
+            (detectedVideoTransfer == VideoTransfer.PQ ||
+                detectedVideoTransfer == VideoTransfer.HLG) &&
+            pictureMode == PictureMode.AUTO &&
+            !currentMediaHasSavedPictureSettings &&
+            !hdrDefaultExposureApplied
+        ) {
+            pictureExposure = DEFAULT_HDR_EXPOSURE
+            hdrDefaultExposureApplied = true
+            applyPictureSettings(persist = false)
+        }
+        Log.i(
+            "DreamPlayerColor",
+            "Managed color input: ${detectedVideoTransfer.label}, $detectedVideoPrimaries, " +
+                "range=${color?.colorRange}, lumaBits=${color?.lumaBitdepth}, chromaBits=${color?.chromaBitdepth}",
+        )
+        if (uiVisible && uiScreen == UiScreen.PICTURE) renderVrMenu()
+    }
+
+    private fun applyPictureSettings(persist: Boolean = true) {
+        nativeSetPictureSettings(
+            pictureMode.wireValue,
+            pictureBrightness,
+            pictureExposure,
+            pictureContrast,
+            pictureSaturation,
+            pictureVibrance,
+            toneMapPeakNits,
+            sceneBrightness,
+        )
+        if (persist && mediaLoaded && spec.uri.isNotBlank()) {
+            mediaStateStore.savePictureSettings(
+                spec,
+                MediaStateStore.PictureSettings(
+                    pictureMode.wireValue,
+                    pictureBrightness,
+                    pictureExposure,
+                    pictureContrast,
+                    pictureSaturation,
+                    pictureVibrance,
+                ),
+            )
+            currentMediaHasSavedPictureSettings = true
+        }
+    }
+
+    private fun activeCinemaTransfer(): VideoTransfer = when (pictureMode) {
+        PictureMode.FORCE_SDR -> VideoTransfer.SDR
+        PictureMode.FORCE_PQ -> VideoTransfer.PQ
+        PictureMode.FORCE_HLG -> VideoTransfer.HLG
+        PictureMode.AUTO,
+        PictureMode.ORIGINAL -> detectedVideoTransfer
+    }
+
+    private fun activeCinemaTuning(): CinemaTuning =
+        cinemaTunings.getValue(activeCinemaTransfer())
+
+    private fun loadCinemaTunings(preferences: android.content.SharedPreferences) {
+        val legacyToneDepth =
+            preferences.getFloat(PREF_CINEMA_TONE_DEPTH, DEFAULT_CINEMA_TONE_DEPTH)
+        val legacyMidtoneEv =
+            preferences.getFloat(PREF_CINEMA_MIDTONE_EV, DEFAULT_CINEMA_MIDTONE_EV)
+        val legacyColorIntensity =
+            preferences.getFloat(
+                PREF_CINEMA_COLOR_INTENSITY,
+                DEFAULT_CINEMA_COLOR_INTENSITY,
+            )
+        VideoTransfer.entries.forEach { transfer ->
+            val prefix = cinemaPreferencePrefix(transfer)
+            val defaults = defaultCinemaTuning(transfer)
+            val migratedToneDepth =
+                if (transfer == VideoTransfer.PQ) defaults.toneDepth else legacyToneDepth
+            cinemaTunings[transfer] = CinemaTuning(
+                preferences.getFloat("$prefix-tone-depth", migratedToneDepth)
+                    .coerceIn(CINEMA_TONE_DEPTH_MIN, CINEMA_TONE_DEPTH_MAX),
+                preferences.getFloat("$prefix-midtone-ev", legacyMidtoneEv)
+                    .coerceIn(CINEMA_MIDTONE_EV_MIN, CINEMA_MIDTONE_EV_MAX),
+                preferences.getFloat("$prefix-color-intensity", legacyColorIntensity)
+                    .coerceIn(CINEMA_COLOR_INTENSITY_MIN, CINEMA_COLOR_INTENSITY_MAX),
+            )
+        }
+    }
+
+    private fun cinemaPreferencePrefix(transfer: VideoTransfer): String = when (transfer) {
+        VideoTransfer.SDR -> "cinema-sdr"
+        VideoTransfer.PQ -> "cinema-pq"
+        VideoTransfer.HLG -> "cinema-hlg"
+    }
+
+    private fun applyCinemaSettings(persist: Boolean = true) {
+        val transfer = activeCinemaTransfer()
+        val tuning = cinemaTunings.getValue(transfer)
+        nativeSetCinemaSettings(
+            tuning.toneDepth,
+            tuning.midtoneEv,
+            tuning.colorIntensity,
+        )
+        if (persist) {
+            val prefix = cinemaPreferencePrefix(transfer)
+            getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                .putFloat("$prefix-tone-depth", tuning.toneDepth)
+                .putFloat("$prefix-midtone-ev", tuning.midtoneEv)
+                .putFloat("$prefix-color-intensity", tuning.colorIntensity)
+                .apply()
+        }
+    }
+
+    private fun currentColorModeIsHdr(): Boolean =
+        pictureMode == PictureMode.FORCE_PQ ||
+            pictureMode == PictureMode.FORCE_HLG ||
+            (
+                pictureMode == PictureMode.AUTO &&
+                    (detectedVideoTransfer == VideoTransfer.PQ ||
+                        detectedVideoTransfer == VideoTransfer.HLG)
+            )
+
+    private fun defaultExposureForCurrentColorMode(): Float =
+        if (currentColorModeIsHdr()) DEFAULT_HDR_EXPOSURE
+        else DEFAULT_PICTURE_EXPOSURE
+
+    private fun lerp(minimum: Float, maximum: Float, fraction: Float): Float =
+        minimum + (maximum - minimum) * fraction
+
+    private fun logarithmicLerp(minimum: Float, maximum: Float, fraction: Float): Float {
+        val logMinimum = kotlin.math.ln(minimum)
+        val logMaximum = kotlin.math.ln(maximum)
+        return kotlin.math.exp(logMinimum + (logMaximum - logMinimum) * fraction)
+    }
+
+    private fun isSlider(id: String): Boolean =
+        id == "seek_bar" ||
+            id == "subtitle_depth_slider" ||
+            id == "screen_curvature_slider" ||
+            id.startsWith("picture_slider_") ||
+            id.startsWith("settings_slider_")
+
+    private fun subtitleMime(value: String): String = when (value.substringAfterLast('.', "").lowercase()) {
+        "srt" -> MimeTypes.APPLICATION_SUBRIP
+        "vtt" -> MimeTypes.TEXT_VTT
+        "ssa", "ass" -> MimeTypes.TEXT_SSA
+        "ttml", "xml" -> MimeTypes.APPLICATION_TTML
+        else -> MimeTypes.APPLICATION_SUBRIP
+    }
+
+    override fun onResume() {
+        super.onResume()
+        hideSystemUi()
+        nativeSetResumed(true)
+    }
+
+    override fun onPause() {
+        saveCurrentMediaState()
+        nativeSetResumed(false)
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        stopBrowserScroll()
+        mainHandler.removeCallbacksAndMessages(null)
+        io.shutdownNow()
+        if (mediaLoaded) {
+            releaseCurrentPlayer(saveState = true)
+        }
+        mediaStateStore.close()
+        menuBitmap?.recycle()
+        menuBitmap = null
+        if (nativeStarted) nativeRequestStop()
+        nativeThread?.join(2_000L)
+        super.onDestroy()
+    }
+
+    private fun hideSystemUi() {
+        window.decorView.systemUiVisibility =
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+            View.SYSTEM_UI_FLAG_FULLSCREEN or
+            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+    }
+
+    companion object {
+        private const val REQUEST_VIDEO = 4001
+        private const val REQUEST_MEDIA_PERMISSION = 4002
+        private const val RECENT_MEDIA_LIMIT = 6
+        private const val BROWSER_VISIBLE_ROWS = 7
+        private const val BROWSER_ROW_RENDER_BUFFER = 2
+        private const val BROWSER_JOYSTICK_DEAD_ZONE = 0.16f
+        private const val BROWSER_MAX_SCROLL_ROWS_PER_SECOND = 7.5f
+        private const val BROWSER_SCROLL_ACCELERATION = 11f
+        private const val BROWSER_SCROLL_FRICTION = 7.5f
+        private const val BROWSER_SCROLL_STOP_VELOCITY = 0.025f
+        private const val BROWSER_LIST_TOP = 165f
+        private const val BROWSER_LIST_BOTTOM = 855f
+        private const val BROWSER_LIST_LEFT = 170f
+        private const val BROWSER_LIST_RIGHT = 1850f
+        private const val BROWSER_SCROLLBAR_ID = "browser_scrollbar"
+        private const val BROWSER_SCROLLBAR_MIN_THUMB_HEIGHT = 65f
+        private const val BROWSER_SCROLLBAR_HIT_PADDING = 26f
+        private val BROWSER_SCROLLBAR_TRACK =
+            RectF(1858f, BROWSER_LIST_TOP, 1876f, BROWSER_LIST_BOTTOM)
+        private const val TRACK_LIST_VISIBLE_ROWS = 6
+        private const val TRACK_LIST_ROW_RENDER_BUFFER = 1
+        private const val TRACK_LIST_MAX_SCROLL_ROWS_PER_SECOND = 6f
+        private const val TRACK_LIST_ROW_TOP = 185f
+        private const val TRACK_LIST_ROW_STRIDE = 50f
+        private const val TRACK_LIST_ROW_HEIGHT = 40f
+        private const val TRACK_LIST_ROW_LEFT = 190f
+        private const val TRACK_LIST_ROW_RIGHT = 805f
+        private const val TRACK_LIST_SCROLLBAR_ID = "track_list_scrollbar"
+        private const val TRACK_LIST_SCROLLBAR_MIN_THUMB_HEIGHT = 45f
+        private const val TRACK_LIST_SCROLLBAR_HIT_PADDING = 18f
+        private val TRACK_LIST_CLIP_BOUNDS =
+            RectF(TRACK_LIST_ROW_LEFT, 180f, 838f, 485f)
+        private val TRACK_LIST_HIT_BOUNDS =
+            RectF(TRACK_LIST_ROW_LEFT, 180f, TRACK_LIST_ROW_RIGHT, 485f)
+        private val TRACK_LIST_POINTER_BOUNDS =
+            RectF(TRACK_LIST_ROW_LEFT, 175f, 842f, 490f)
+        private val TRACK_LIST_SCROLLBAR_TRACK = RectF(820f, 185f, 832f, 475f)
+        private const val UI_WIDTH = 2048f
+        private const val UI_HEIGHT = 1024f
+        private const val PGS_REFERENCE_WIDTH = 1920f
+        private const val PGS_REFERENCE_HEIGHT = 1080f
+        private const val PLAYBACK_SEEK_LEFT = 350f
+        private const val PLAYBACK_SEEK_RIGHT = 1698f
+        private const val PLAYBACK_AUTO_HIDE_MS = 8_000L
+        private const val STATE_SAVE_INTERVAL_MS = 5_000L
+        private const val AUTO_FALLBACK_RATIO_MIN = 1.55
+        private const val AUTO_FALLBACK_RATIO_MAX = 2.45
+        private const val AUTO_FALLBACK_SAMPLE_COUNT = 3
+        private const val MINIMUM_RESUME_POSITION_MS = 10_000L
+        private const val MINIMUM_REMAINING_MS = 120_000L
+        private const val END_FRACTION = 0.03
+        private const val SUBTITLE_AUTO = "subtitle:auto"
+        private const val SUBTITLE_OFF = "subtitle:off"
+        private const val MAX_SUBTITLE_SYNC_MS = 10_000
+        private const val SUBTITLE_DEPTH_MIN_METERS = 0f
+        private const val SUBTITLE_DEPTH_MAX_METERS = 0.50f
+        private const val DEFAULT_2D_SUBTITLE_DEPTH_METERS = 0f
+        private const val DEFAULT_3D_SUBTITLE_DEPTH_METERS = 0.12f
+        private const val AUDIO_AUTO = "audio:auto"
+        private const val PICTURE_PREFS = "picture-preferences"
+        private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
+        private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
+        // Legacy single-profile keys are retained only to migrate existing tuning.
+        private const val PREF_CINEMA_TONE_DEPTH = "cinema-tone-depth"
+        private const val PREF_CINEMA_MIDTONE_EV = "cinema-midtone-ev"
+        private const val PREF_CINEMA_COLOR_INTENSITY = "cinema-color-intensity"
+        private const val DEFAULT_PICTURE_BRIGHTNESS = 0f
+        private const val DEFAULT_PICTURE_EXPOSURE = -0.50f
+        private const val DEFAULT_HDR_EXPOSURE = 0f
+        private const val DEFAULT_PICTURE_CONTRAST = 1f
+        private const val DEFAULT_PICTURE_SATURATION = 1f
+        private const val DEFAULT_PICTURE_VIBRANCE = 0f
+        private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
+        private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
+        private const val DEFAULT_CINEMA_TONE_DEPTH = 0.22f
+        private const val DEFAULT_PQ_CINEMA_TONE_DEPTH = 0f
+        private const val DEFAULT_CINEMA_MIDTONE_EV = 0.15f
+        private const val DEFAULT_CINEMA_COLOR_INTENSITY = 1.10f
+        private const val DEFAULT_SCREEN_CURVATURE = 0f
+        private const val SCREEN_CURVATURE_MIN = 0f
+        private const val SCREEN_CURVATURE_MAX = 1f
+        private const val PICTURE_BRIGHTNESS_MIN = -0.016f
+        private const val PICTURE_BRIGHTNESS_MAX = 0.016f
+        private const val PICTURE_EXPOSURE_MIN = -3f
+        private const val PICTURE_EXPOSURE_MAX = 3f
+        private const val PICTURE_CONTRAST_MIN = 0.6f
+        private const val PICTURE_CONTRAST_MAX = 1.4f
+        private const val PICTURE_SATURATION_MIN = 0.7f
+        private const val PICTURE_SATURATION_MAX = 1.3f
+        private const val PICTURE_VIBRANCE_MIN = -1f
+        private const val PICTURE_VIBRANCE_MAX = 1f
+        private const val SCENE_BRIGHTNESS_MIN = 0f
+        private const val SCENE_BRIGHTNESS_MAX = 1f
+        private const val TONE_MAP_PEAK_NITS_MIN = 50f
+        private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
+        private const val CINEMA_TONE_DEPTH_MIN = 0f
+        private const val CINEMA_TONE_DEPTH_MAX = 1f
+        private const val CINEMA_TONE_DEPTH_DISPLAY_SCALE = 200f
+        private const val CINEMA_MIDTONE_EV_MIN = -1f
+        private const val CINEMA_MIDTONE_EV_MAX = 1f
+        private const val CINEMA_COLOR_INTENSITY_MIN = 0.4f
+        private const val CINEMA_COLOR_INTENSITY_MAX = 1.6f
+        private fun defaultCinemaTuning(transfer: VideoTransfer) = CinemaTuning(
+            if (transfer == VideoTransfer.PQ) {
+                DEFAULT_PQ_CINEMA_TONE_DEPTH
+            } else {
+                DEFAULT_CINEMA_TONE_DEPTH
+            },
+            DEFAULT_CINEMA_MIDTONE_EV,
+            DEFAULT_CINEMA_COLOR_INTENSITY,
+        )
+        private const val PICTURE_SLIDER_LEFT = 665f
+        private const val PICTURE_SLIDER_RIGHT = 1510f
+        private const val SETTINGS_SLIDER_LEFT = 1200f
+        private const val SETTINGS_SLIDER_RIGHT = 1685f
+        private const val SUBTITLE_DEPTH_SLIDER_LEFT = 340f
+        private const val SUBTITLE_DEPTH_SLIDER_RIGHT = 690f
+        private const val SCREEN_CURVATURE_SLIDER_LEFT = 1470f
+        private const val SCREEN_CURVATURE_SLIDER_RIGHT = 1775f
+        private const val POINTER_PRESSED = 1
+        private const val POINTER_HELD = 2
+        private const val POINTER_RELEASED = 3
+        private val DEFAULT_SCREEN_TRANSFORM =
+            MediaStateStore.ScreenTransform(0f, 0f, -2.4f, 1f)
+        private val BROWSER_LIST_CLIP_BOUNDS =
+            RectF(BROWSER_LIST_LEFT, BROWSER_LIST_TOP, 1880f, BROWSER_LIST_BOTTOM)
+        private val BROWSER_LIST_HIT_BOUNDS =
+            RectF(BROWSER_LIST_LEFT, BROWSER_LIST_TOP, BROWSER_LIST_RIGHT, BROWSER_LIST_BOTTOM)
+        private val PLAYBACK_TOOLBAR_BOUNDS = RectF(120f, 700f, 1928f, 970f)
+        private val PLAYBACK_LEFT_POPOVER_BOUNDS = RectF(150f, 105f, 860f, 675f)
+        private val PLAYBACK_PROJECTION_POPOVER_BOUNDS = RectF(1185f, 205f, 1898f, 675f)
+        private val PLAYBACK_SETTINGS_POPOVER_BOUNDS = RectF(930f, 45f, 1898f, 675f)
+        init { System.loadLibrary("dreamplayer") }
+
+        @JvmStatic private external fun nativeRun(activity: PlayerActivity, stereoMode: Int)
+        @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
+        @JvmStatic private external fun nativeRequestStop()
+        @JvmStatic private external fun nativeSetVideoAspect(aspect: Float)
+        @JvmStatic private external fun nativeSetScreenTransform(x: Float, y: Float, z: Float, halfHeight: Float)
+        @JvmStatic private external fun nativeGetScreenTransform(): FloatArray
+        @JvmStatic private external fun nativeSetStereoMode(stereoMode: Int)
+        @JvmStatic private external fun nativeSetPictureSettings(
+            pictureMode: Int,
+            brightness: Float,
+            exposure: Float,
+            contrast: Float,
+            saturation: Float,
+            vibrance: Float,
+            toneMapPeakNits: Float,
+            sceneBrightness: Float,
+        )
+        @JvmStatic private external fun nativeSetVideoColorInfo(transfer: Int, primaries: Int)
+        @JvmStatic private external fun nativeSetCinemaSettings(
+            toneDepth: Float,
+            midtoneEv: Float,
+            colorIntensity: Float,
+        )
+        @JvmStatic private external fun nativeSetSwapEyes(swapped: Boolean)
+        @JvmStatic private external fun nativeSetVideoAvailable(available: Boolean)
+        @JvmStatic private external fun nativeSetMenuInteractive(interactive: Boolean)
+        @JvmStatic private external fun nativeSetSubtitle(bitmap: Bitmap)
+        @JvmStatic private external fun nativeSetBitmapSubtitle(
+            bitmap: Bitmap,
+            left: Float,
+            top: Float,
+            right: Float,
+            bottom: Float,
+        )
+        @JvmStatic private external fun nativeSetSubtitleDepth(depthMeters: Float)
+        @JvmStatic private external fun nativeSetScreenCurvature(curvature: Float)
+    }
+}
