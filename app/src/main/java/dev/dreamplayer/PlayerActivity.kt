@@ -96,6 +96,8 @@ class PlayerActivity : Activity(), Player.Listener {
     )
     private var subtitleChoiceIndex = 0
     private var pendingSubtitleFingerprint: String? = null
+    private var externalSubtitles: List<ExternalSubtitle> = emptyList()
+    private var subtitleDiscoveryGeneration = 0
     private var subtitleSyncMs = 0
     private var subtitleDepthMeters = DEFAULT_2D_SUBTITLE_DEPTH_METERS
     private var subtitleDepthIsCustom = false
@@ -889,10 +891,58 @@ class PlayerActivity : Activity(), Player.Listener {
         resumeOverrideMs: Long? = null,
         autoSoftwareFallback: Boolean = false,
     ) {
+        if (mediaLoaded && spec.uri == newSpec.uri) {
+            loadMediaResolved(
+                newSpec,
+                browserReturn,
+                resumeOverrideMs,
+                autoSoftwareFallback,
+                externalSubtitles,
+            )
+            return
+        }
+
+        val discoveryGeneration = ++subtitleDiscoveryGeneration
+        if (mediaLoaded && ::player.isInitialized) player.pause()
+        io.execute {
+            val discovered = ExternalSubtitleRepository(this).discover(newSpec)
+            runOnUiThread {
+                if (
+                    discoveryGeneration != subtitleDiscoveryGeneration ||
+                    isFinishing ||
+                    isDestroyed
+                ) {
+                    return@runOnUiThread
+                }
+                loadMediaResolved(
+                    newSpec,
+                    browserReturn,
+                    resumeOverrideMs,
+                    autoSoftwareFallback,
+                    discovered,
+                )
+            }
+        }
+    }
+
+    private fun loadMediaResolved(
+        newSpec: PlaybackSpec,
+        browserReturn: BrowserReturnState?,
+        resumeOverrideMs: Long?,
+        autoSoftwareFallback: Boolean,
+        discoveredExternalSubtitles: List<ExternalSubtitle>,
+    ) {
         mediaLoadGeneration++
         decoderFallbackPending = false
         if (mediaLoaded) {
             releaseCurrentPlayer(saveState = true)
+        }
+        externalSubtitles = discoveredExternalSubtitles
+        if (externalSubtitles.isNotEmpty()) {
+            Log.i(
+                "DreamPlayerSubtitle",
+                "Discovered external subtitles: ${externalSubtitles.joinToString { it.fileName }}",
+            )
         }
         latestCues = emptyList()
         playbackBrowserReturn = browserReturn
@@ -1022,18 +1072,35 @@ class PlayerActivity : Activity(), Player.Listener {
             .also { it.addListener(this) }
         player.subtitleDelayMilliseconds = subtitleSyncMs.toLong()
         videoSurface?.let(player::setVideoSurface)
-        val item = MediaItem.Builder().setUri(Uri.parse(newSpec.uri)).apply {
+        val subtitleConfigurations = buildList {
             newSpec.subtitleUri?.let { subtitleUri ->
-                setSubtitleConfigurations(
-                    listOf(
-                        MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitleUri))
-                            .setMimeType(subtitleMime(subtitleUri))
-                            .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                            .build()
-                    )
+                add(
+                    MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitleUri))
+                        .setMimeType(subtitleMime(subtitleUri))
+                        .setLabel(Uri.parse(subtitleUri).lastPathSegment ?: "External subtitle")
+                        .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                        .build()
                 )
             }
-        }.build()
+            externalSubtitles.forEach { subtitle ->
+                if (subtitle.uri != newSpec.subtitleUri) {
+                    add(
+                        MediaItem.SubtitleConfiguration.Builder(Uri.parse(subtitle.uri))
+                            .setMimeType(MimeTypes.APPLICATION_SUBRIP)
+                            .setLabel(subtitle.fileName)
+                            .build()
+                    )
+                }
+            }
+        }
+        val item = MediaItem.Builder()
+            .setUri(Uri.parse(newSpec.uri))
+            .apply {
+                if (subtitleConfigurations.isNotEmpty()) {
+                    setSubtitleConfigurations(subtitleConfigurations)
+                }
+            }
+            .build()
         player.setMediaItem(item)
         (resumeOverrideMs ?: resumePosition(savedPlaybackState))?.let { position ->
             player.seekTo(position)
