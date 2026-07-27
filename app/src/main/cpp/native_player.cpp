@@ -45,6 +45,10 @@ std::atomic<float> gCinemaMidtoneEv{0.15f};
 std::atomic<float> gCinemaColorIntensity{1.10f};
 std::atomic<float> gToneMapPeakNits{100.0f};
 std::atomic<float> gHlgSystemGamma{0.8459066f};
+std::atomic<float> gHdrSourcePeakNits{1000.0f};
+std::atomic<float> gHdrMaxFallNits{0.0f};
+// 0 = legacy hard clip, 1 = luminance/hue-direction preserving compression.
+std::atomic<int> gGamutMappingMode{1};
 std::atomic<float> gSceneBrightness{0.5f};
 std::atomic<bool> gSwapEyes{false};
 std::atomic<float> gScreenX{0.0f};
@@ -810,6 +814,9 @@ private:
             uniform float uVibrance;
             uniform float uToneMapPeakNits;
             uniform float uHlgSystemGamma;
+            uniform float uHdrSourcePeakNits;
+            uniform float uHdrMaxFallNits;
+            uniform int uGamutMappingMode;
             uniform float uCinemaToneDepth;
             uniform float uCinemaMidtoneEv;
             uniform float uCinemaColorIntensity;
@@ -848,7 +855,7 @@ private:
                     vec3(adjustedLuma),
                     perceptual,
                     uCinemaColorIntensity);
-                return clamp(perceptual * perceptual, 0.0, 1.0);
+                return perceptual * perceptual;
             }
             vec3 bt709ToLinear(vec3 value) {
                 bvec3 low = lessThan(value, vec3(0.081));
@@ -885,6 +892,36 @@ private:
             }
             const vec3 bt709Luma = vec3(0.2126, 0.7152, 0.0722);
             const vec3 bt2020Luma = vec3(0.2627, 0.6780, 0.0593);
+            float channelGamutLimit(float luma, float chroma) {
+                if (chroma > 0.000001) return (1.0 - luma) / chroma;
+                if (chroma < -0.000001) return luma / -chroma;
+                return 10000.0;
+            }
+            vec3 perceptualGamutMap(vec3 value) {
+                // Compress toward the BT.709 luminance axis. This keeps luminance
+                // and the RGB chroma direction stable, avoiding the hue shifts and
+                // flat clipped plateaus produced by per-channel hard clipping.
+                float luma = clamp(dot(value, bt709Luma), 0.0, 1.0);
+                vec3 chroma = value - vec3(luma);
+                float limit = min(
+                    channelGamutLimit(luma, chroma.r),
+                    min(
+                        channelGamutLimit(luma, chroma.g),
+                        channelGamutLimit(luma, chroma.b)));
+                if (limit >= 1000.0) return vec3(luma);
+                float occupancy = 1.0 / max(limit, 0.000001);
+                const float knee = 0.85;
+                if (occupancy <= knee) return value;
+                float mappedOccupancy = knee + (1.0 - knee) *
+                    (1.0 - exp(-(occupancy - knee) / (1.0 - knee)));
+                return vec3(luma) + chroma * (mappedOccupancy / occupancy);
+            }
+            vec3 mapOutputGamut(vec3 value, bool convertedFromWideGamut) {
+                if (uGamutMappingMode == 1 && convertedFromWideGamut) {
+                    return perceptualGamutMap(value);
+                }
+                return clamp(value, 0.0, 1.0);
+            }
             vec3 pqToTargetDisplay(vec3 sourceNits, vec3 lumaCoefficients) {
                 sourceNits = max(sourceNits, vec3(0.0));
                 float sourceLumaNits = max(dot(sourceNits, lumaCoefficients), 0.0);
@@ -912,8 +949,48 @@ private:
                 if (filmicLuma > kneeStart) {
                     float shoulderRange = 1.0 - kneeStart;
                     float excess = filmicLuma - kneeStart;
+                    float sourcePeakNits = clamp(
+                        uHdrSourcePeakNits,
+                        hdrDiffuseWhiteNits,
+                        10000.0);
+                    float peakFilmicLuma = diffuseWhiteOutput * pow(
+                        sourcePeakNits / hdrDiffuseWhiteNits,
+                        midtonePower);
+                    float peakExcess = max(peakFilmicLuma - kneeStart, 0.0001);
+                    // Preserve the pre-metadata 1000-nit curve exactly when
+                    // metadata is unavailable, ignored, or manually set to the
+                    // fallback. Other source peaks move only the shoulder.
+                    const float fallbackSourcePeakNits = 1000.0;
+                    float fallbackPeakFilmicLuma = diffuseWhiteOutput * pow(
+                        fallbackSourcePeakNits / hdrDiffuseWhiteNits,
+                        midtonePower);
+                    float fallbackPeakExcess = max(
+                        fallbackPeakFilmicLuma - kneeStart,
+                        0.0001);
+                    float fallbackPeakOutput = kneeStart +
+                        shoulderRange * fallbackPeakExcess /
+                        (fallbackPeakExcess + shoulderRange);
+                    float fallRatio = uHdrMaxFallNits > 0.0
+                        ? clamp(uHdrMaxFallNits / sourcePeakNits, 0.0, 1.0)
+                        : 0.4;
+                    // Map the validated source peak near, but never onto, the
+                    // display ceiling. MaxFALL has only a deliberately small
+                    // influence so questionable authoring metadata cannot
+                    // radically alter the image.
+                    float desiredPeakOutput = clamp(
+                        fallbackPeakOutput + (0.4 - fallRatio) * 0.01,
+                        kneeStart + shoulderRange * 0.50,
+                        0.99);
+                    float desiredShoulderFraction = clamp(
+                        (desiredPeakOutput - kneeStart) / shoulderRange,
+                        0.50,
+                        0.98);
+                    float shoulderSoftness = peakExcess *
+                        (1.0 - desiredShoulderFraction) /
+                        desiredShoulderFraction;
                     displayLuma = kneeStart +
-                        shoulderRange * excess / (excess + shoulderRange);
+                        shoulderRange * excess /
+                        (excess + max(shoulderSoftness, 0.0001));
                 }
                 // Scale all channels together so highlight compression does not
                 // introduce the hue shifts caused by per-channel tone mapping.
@@ -983,9 +1060,11 @@ private:
                 float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
                 rgb = mix(vec3(luma), rgb, uSaturation);
                 rgb += vec3(uBrightness);
-                rgb = clamp(rgb, 0.0, 1.0);
+                bool convertedFromWideGamut = primaries == 1;
+                rgb = mapOutputGamut(rgb, convertedFromWideGamut);
                 rgb = perceptualDisplayFinish(rgb);
-                fragColor = vec4(rgb, sampleColor.a);
+                rgb = mapOutputGamut(rgb, convertedFromWideGamut);
+                fragColor = vec4(clamp(rgb, 0.0, 1.0), sampleColor.a);
             }
         )glsl";
         const char* subtitleFragment = R"glsl(#version 300 es
@@ -1456,6 +1535,15 @@ private:
                 glGetUniformLocation(videoProgram_, "uHlgSystemGamma"),
                 gHlgSystemGamma.load());
             glUniform1f(
+                glGetUniformLocation(videoProgram_, "uHdrSourcePeakNits"),
+                gHdrSourcePeakNits.load());
+            glUniform1f(
+                glGetUniformLocation(videoProgram_, "uHdrMaxFallNits"),
+                gHdrMaxFallNits.load());
+            glUniform1i(
+                glGetUniformLocation(videoProgram_, "uGamutMappingMode"),
+                gGamutMappingMode.load());
+            glUniform1f(
                 glGetUniformLocation(videoProgram_, "uCinemaToneDepth"),
                 gCinemaToneDepth.load());
             glUniform1f(
@@ -1755,9 +1843,26 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetCinemaSettings(
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetVideoColorInfo(
-    JNIEnv*, jclass, jint transfer, jint primaries) {
+    JNIEnv*, jclass, jint transfer, jint primaries, jfloat sourcePeakNits,
+    jfloat maxFallNits, jint gamutMappingMode) {
     if (transfer >= 0 && transfer <= 2) gVideoTransfer.store(transfer);
     if (primaries >= 0 && primaries <= 1) gVideoPrimaries.store(primaries);
+    if (std::isfinite(sourcePeakNits)) {
+        gHdrSourcePeakNits.store(std::clamp(sourcePeakNits, 100.0f, 10000.0f));
+    }
+    if (std::isfinite(maxFallNits)) {
+        gHdrMaxFallNits.store(std::clamp(maxFallNits, 0.0f, 10000.0f));
+    }
+    if (gamutMappingMode >= 0 && gamutMappingMode <= 1) {
+        gGamutMappingMode.store(gamutMappingMode);
+    }
+    LOGI(
+        "Color pipeline: transfer=%d primaries=%d sourcePeak=%.0f MaxFALL=%.0f gamut=%s",
+        gVideoTransfer.load(),
+        gVideoPrimaries.load(),
+        gHdrSourcePeakNits.load(),
+        gHdrMaxFallNits.load(),
+        gGamutMappingMode.load() == 1 ? "perceptual" : "clip");
 }
 
 extern "C" JNIEXPORT void JNICALL

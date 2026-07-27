@@ -44,6 +44,8 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMilliseconds
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -73,6 +75,10 @@ class PlayerActivity : Activity(), Player.Listener {
     private var screenCurvature = DEFAULT_SCREEN_CURVATURE
     private var detectedVideoTransfer = VideoTransfer.SDR
     private var detectedVideoPrimaries = VideoPrimaries.BT709
+    private var detectedHdrStaticMetadata = HdrStaticMetadata.NONE
+    private var hdrMetadataMode = HdrMetadataMode.AUTO
+    private var hdrManualPeakNits = DEFAULT_HDR_SOURCE_PEAK_NITS
+    private var gamutMappingMode = GamutMappingMode.PERCEPTUAL
     private var currentMediaHasSavedPictureSettings = false
     private var hdrDefaultExposureApplied = false
     private var audioSyncMs = 0
@@ -259,7 +265,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private enum class PlaybackPopover {
-        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA,
+        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
     }
 
     private enum class PictureMode(val wireValue: Int) {
@@ -301,6 +307,38 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class VideoPrimaries(val wireValue: Int) {
         BT709(0),
         BT2020(1),
+    }
+
+    private enum class HdrMetadataMode(val wireValue: Int, val label: String) {
+        AUTO(0, "Auto"),
+        IGNORE(1, "Ignore"),
+        MANUAL(2, "Manual");
+
+        companion object {
+            fun fromWire(value: Int): HdrMetadataMode =
+                entries.firstOrNull { it.wireValue == value } ?: AUTO
+        }
+    }
+
+    private enum class GamutMappingMode(val wireValue: Int, val label: String) {
+        CLIP(0, "Clip"),
+        PERCEPTUAL(1, "Perceptual");
+
+        companion object {
+            fun fromWire(value: Int): GamutMappingMode =
+                entries.firstOrNull { it.wireValue == value } ?: PERCEPTUAL
+        }
+    }
+
+    private data class HdrStaticMetadata(
+        val masteringPeakNits: Float?,
+        val maxCllNits: Float?,
+        val maxFallNits: Float?,
+        val status: String,
+    ) {
+        companion object {
+            val NONE = HdrStaticMetadata(null, null, null, "No usable static metadata")
+        }
     }
 
     private enum class KeyboardField { HOST, USERNAME, PASSWORD, DOMAIN }
@@ -357,6 +395,12 @@ class PlayerActivity : Activity(), Player.Listener {
             .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
             .coerceIn(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX)
         val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        gamutMappingMode = GamutMappingMode.fromWire(
+            picturePreferences.getInt(
+                PREF_GAMUT_MAPPING_MODE,
+                GamutMappingMode.PERCEPTUAL.wireValue,
+            )
+        )
         loadCinemaTunings(picturePreferences)
         applyCinemaSettings(persist = false)
         smbCredentialStore.load()?.let {
@@ -873,6 +917,13 @@ class PlayerActivity : Activity(), Player.Listener {
         pictureVibrance = savedPicture?.vibrance
             ?.coerceIn(PICTURE_VIBRANCE_MIN, PICTURE_VIBRANCE_MAX)
             ?: DEFAULT_PICTURE_VIBRANCE
+        hdrMetadataMode = HdrMetadataMode.fromWire(
+            savedPlaybackState?.hdrMetadataMode ?: HdrMetadataMode.AUTO.wireValue
+        )
+        hdrManualPeakNits = savedPlaybackState?.hdrManualPeakNits
+            ?.coerceIn(HDR_SOURCE_PEAK_NITS_MIN, HDR_SOURCE_PEAK_NITS_MAX)
+            ?: DEFAULT_HDR_SOURCE_PEAK_NITS
+        detectedHdrStaticMetadata = HdrStaticMetadata.NONE
         applyPictureSettings(persist = false)
         pendingSubtitleFingerprint = savedPlaybackState?.subtitleFingerprint
         subtitleSyncMs = savedPlaybackState?.subtitleSyncMs
@@ -1708,7 +1759,8 @@ class PlayerActivity : Activity(), Player.Listener {
         PlaybackPopover.AUDIO -> PLAYBACK_LEFT_POPOVER_BOUNDS
         PlaybackPopover.PROJECTION -> PLAYBACK_PROJECTION_POPOVER_BOUNDS
         PlaybackPopover.SETTINGS,
-        PlaybackPopover.CINEMA -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
+        PlaybackPopover.CINEMA,
+        PlaybackPopover.COLOR_PIPELINE -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
         PlaybackPopover.NONE -> null
     }
 
@@ -1942,6 +1994,16 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
+            id == "color_pipeline" -> {
+                playbackPopover = PlaybackPopover.COLOR_PIPELINE
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "color_pipeline_back" -> {
+                playbackPopover = PlaybackPopover.SETTINGS
+                hoveredButton = null
+                renderVrMenu()
+            }
             id == "settings_picture" -> {
                 playbackPopover = PlaybackPopover.NONE
                 uiScreen = UiScreen.PICTURE
@@ -2023,6 +2085,42 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "swap_eyes" -> {
                 swapEyes = !swapEyes
                 nativeSetSwapEyes(swapEyes)
+                renderVrMenu()
+            }
+            id.startsWith("hdr_metadata_") -> {
+                hdrMetadataMode = when (id) {
+                    "hdr_metadata_ignore" -> HdrMetadataMode.IGNORE
+                    "hdr_metadata_manual" -> HdrMetadataMode.MANUAL
+                    else -> HdrMetadataMode.AUTO
+                }
+                persistHdrMetadataSettings()
+                applyVideoColorPipeline()
+                renderVrMenu()
+            }
+            id.startsWith("gamut_mapping_") -> {
+                gamutMappingMode = if (id == "gamut_mapping_clip") {
+                    GamutMappingMode.CLIP
+                } else {
+                    GamutMappingMode.PERCEPTUAL
+                }
+                getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                    .putInt(PREF_GAMUT_MAPPING_MODE, gamutMappingMode.wireValue)
+                    .apply()
+                applyVideoColorPipeline()
+                renderVrMenu()
+            }
+            id == "settings_slider_manual_peak" -> {
+                val fraction = (
+                    (pointerX - SETTINGS_SLIDER_LEFT) /
+                        (SETTINGS_SLIDER_RIGHT - SETTINGS_SLIDER_LEFT)
+                ).coerceIn(0f, 1f)
+                hdrManualPeakNits = logarithmicLerp(
+                    HDR_SOURCE_PEAK_NITS_MIN,
+                    HDR_SOURCE_PEAK_NITS_MAX,
+                    fraction,
+                )
+                if (persist) persistHdrMetadataSettings()
+                applyVideoColorPipeline()
                 renderVrMenu()
             }
             id.startsWith("picture_mode_") -> {
@@ -2132,6 +2230,10 @@ class PlayerActivity : Activity(), Player.Listener {
                             .putFloat(PREF_TONE_MAP_PEAK_NITS, toneMapPeakNits)
                             .apply()
                     }
+                    "manual_peak" -> {
+                        hdrManualPeakNits = DEFAULT_HDR_SOURCE_PEAK_NITS
+                        persistHdrMetadataSettings()
+                    }
                     "scene" -> {
                         sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
                         getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
@@ -2148,7 +2250,9 @@ class PlayerActivity : Activity(), Player.Listener {
                     slider == "tone_depth" ||
                         slider == "midtones" ||
                         slider == "color_intensity"
-                if (cinemaSlider) {
+                if (slider == "manual_peak") {
+                    applyVideoColorPipeline()
+                } else if (cinemaSlider) {
                     applyCinemaSettings()
                 } else {
                     applyPictureSettings(
@@ -3602,12 +3706,15 @@ class PlayerActivity : Activity(), Player.Listener {
                     "settings", "Settings", standardBounds(1756f),
                     playbackPopover == PlaybackPopover.SETTINGS ||
                         playbackPopover == PlaybackPopover.CINEMA ||
+                        playbackPopover == PlaybackPopover.COLOR_PIPELINE ||
                         pictureMode != PictureMode.AUTO ||
                         pictureBrightness != DEFAULT_PICTURE_BRIGHTNESS ||
                         pictureExposure != defaultExposureForCurrentColorMode() ||
                         pictureContrast != DEFAULT_PICTURE_CONTRAST ||
                         pictureSaturation != DEFAULT_PICTURE_SATURATION ||
                         pictureVibrance != DEFAULT_PICTURE_VIBRANCE ||
+                        hdrMetadataMode != HdrMetadataMode.AUTO ||
+                        gamutMappingMode != GamutMappingMode.PERCEPTUAL ||
                         decoderMode != DecoderMode.AUTO,
                 )
 
@@ -3872,13 +3979,18 @@ class PlayerActivity : Activity(), Player.Listener {
                         )
                         button(
                             "cinema_tune", "Tune",
-                            RectF(1210f, 605f, 1535f, 660f),
+                            RectF(1210f, 605f, 1415f, 660f),
                             fontSize = 20f,
                         )
                         button(
+                            "color_pipeline", "HDR / gamut",
+                            RectF(1425f, 605f, 1635f, 660f),
+                            fontSize = 19f,
+                        )
+                        button(
                             "picture_reset", "Reset sliders",
-                            RectF(1543f, 605f, 1860f, 660f),
-                            fontSize = 21f,
+                            RectF(1645f, 605f, 1860f, 660f),
+                            fontSize = 19f,
                         )
                     }
                     PlaybackPopover.CINEMA -> {
@@ -3935,6 +4047,77 @@ class PlayerActivity : Activity(), Player.Listener {
                         button(
                             "cinema_back", "Back",
                             RectF(1530f, 595f, 1860f, 655f),
+                            fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.COLOR_PIPELINE -> {
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "HDR metadata & gamut", 1814f)
+                        text(
+                            "HDR10 metadata",
+                            975f, 132f, 24f, Paint.Align.LEFT,
+                        )
+                        text(
+                            hdrMetadataSummary(),
+                            1860f, 132f, 20f, Paint.Align.RIGHT, colorTextMuted,
+                        )
+                        button(
+                            "hdr_metadata_auto", "Auto",
+                            RectF(975f, 160f, 1255f, 220f),
+                            hdrMetadataMode == HdrMetadataMode.AUTO,
+                            fontSize = 21f,
+                        )
+                        button(
+                            "hdr_metadata_ignore", "Ignore",
+                            RectF(1265f, 160f, 1545f, 220f),
+                            hdrMetadataMode == HdrMetadataMode.IGNORE,
+                            fontSize = 21f,
+                        )
+                        button(
+                            "hdr_metadata_manual", "Manual",
+                            RectF(1555f, 160f, 1860f, 220f),
+                            hdrMetadataMode == HdrMetadataMode.MANUAL,
+                            fontSize = 21f,
+                        )
+                        text(
+                            hdrMetadataModeDescription(),
+                            975f, 260f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        if (hdrMetadataMode == HdrMetadataMode.MANUAL) {
+                            compactSettingsSlider(
+                                "settings_slider_manual_peak", "Content peak",
+                                "%.0f nits".format(Locale.US, hdrManualPeakNits),
+                                hdrManualPeakNits,
+                                HDR_SOURCE_PEAK_NITS_MIN,
+                                HDR_SOURCE_PEAK_NITS_MAX,
+                                325f,
+                                logarithmic = true,
+                            )
+                        }
+                        text("BT.2020 gamut mapping", 975f, 420f, 24f, Paint.Align.LEFT)
+                        button(
+                            "gamut_mapping_perceptual", "Perceptual",
+                            RectF(1200f, 385f, 1520f, 445f),
+                            gamutMappingMode == GamutMappingMode.PERCEPTUAL,
+                            fontSize = 21f,
+                        )
+                        button(
+                            "gamut_mapping_clip", "Clip",
+                            RectF(1530f, 385f, 1860f, 445f),
+                            gamutMappingMode == GamutMappingMode.CLIP,
+                            fontSize = 21f,
+                        )
+                        text(
+                            "Perceptual preserves luminance and color direction near the BT.709 boundary.",
+                            975f, 495f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            "Clip reproduces the previous hard-clamped output for comparison.",
+                            975f, 530f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "color_pipeline_back", "Back",
+                            RectF(1530f, 590f, 1860f, 650f),
                             fontSize = 22f,
                         )
                     }
@@ -4186,7 +4369,8 @@ class PlayerActivity : Activity(), Player.Listener {
         detectedVideoPrimaries =
             if (color?.colorSpace == C.COLOR_SPACE_BT2020) VideoPrimaries.BT2020
             else VideoPrimaries.BT709
-        nativeSetVideoColorInfo(detectedVideoTransfer.wireValue, detectedVideoPrimaries.wireValue)
+        detectedHdrStaticMetadata = parseHdrStaticMetadata(color?.hdrStaticInfo)
+        applyVideoColorPipeline()
         applyCinemaSettings(persist = false)
         if (
             (detectedVideoTransfer == VideoTransfer.PQ ||
@@ -4202,9 +4386,126 @@ class PlayerActivity : Activity(), Player.Listener {
         Log.i(
             "DreamPlayerColor",
             "Managed color input: ${detectedVideoTransfer.label}, $detectedVideoPrimaries, " +
-                "range=${color?.colorRange}, lumaBits=${color?.lumaBitdepth}, chromaBits=${color?.chromaBitdepth}",
+                "range=${color?.colorRange}, lumaBits=${color?.lumaBitdepth}, " +
+                "chromaBits=${color?.chromaBitdepth}, ${detectedHdrStaticMetadata.status}",
         )
-        if (uiVisible && uiScreen == UiScreen.PICTURE) renderVrMenu()
+        if (
+            uiVisible &&
+            (
+                uiScreen == UiScreen.PICTURE ||
+                    playbackPopover == PlaybackPopover.COLOR_PIPELINE
+            )
+        ) {
+            renderVrMenu()
+        }
+    }
+
+    private fun parseHdrStaticMetadata(data: ByteArray?): HdrStaticMetadata {
+        if (data == null) return HdrStaticMetadata.NONE
+        if (data.size < HDR_STATIC_INFO_SIZE_BYTES) {
+            return HdrStaticMetadata(null, null, null, "Rejected: ${data.size}-byte metadata")
+        }
+        if (data[0].toInt() != HDR_STATIC_INFO_TYPE_1) {
+            return HdrStaticMetadata(
+                null,
+                null,
+                null,
+                "Rejected: unsupported descriptor ${data[0].toInt() and 0xff}",
+            )
+        }
+        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        fun nitsAt(offset: Int): Float? {
+            val value = buffer.getShort(offset).toInt() and 0xffff
+            return value.toFloat().takeIf {
+                it in HDR_METADATA_NITS_MIN..HDR_METADATA_NITS_MAX
+            }
+        }
+        val masteringPeak = nitsAt(HDR_MASTERING_PEAK_OFFSET)
+        val maxCll = nitsAt(HDR_MAX_CLL_OFFSET)
+        val rawMaxFall = nitsAt(HDR_MAX_FALL_OFFSET)
+        val sourcePeak = maxCll ?: masteringPeak
+        val maxFall = rawMaxFall?.takeIf {
+            sourcePeak == null || it <= sourcePeak
+        }
+        if (sourcePeak == null && maxFall == null) {
+            return HdrStaticMetadata(
+                null,
+                null,
+                null,
+                "Rejected: empty or implausible values",
+            )
+        }
+        val details = buildList {
+            maxCll?.let { add("MaxCLL ${it.toInt()}") }
+            maxFall?.let { add("MaxFALL ${it.toInt()}") }
+            masteringPeak?.let { add("master ${it.toInt()}") }
+        }.joinToString(" / ")
+        return HdrStaticMetadata(
+            masteringPeakNits = masteringPeak,
+            maxCllNits = maxCll,
+            maxFallNits = maxFall,
+            status = details,
+        )
+    }
+
+    private fun effectiveHdrSourcePeakNits(): Float = when (hdrMetadataMode) {
+        HdrMetadataMode.AUTO ->
+            detectedHdrStaticMetadata.maxCllNits
+                ?: detectedHdrStaticMetadata.masteringPeakNits
+                ?: DEFAULT_HDR_SOURCE_PEAK_NITS
+        HdrMetadataMode.IGNORE -> DEFAULT_HDR_SOURCE_PEAK_NITS
+        HdrMetadataMode.MANUAL -> hdrManualPeakNits
+    }
+
+    private fun effectiveHdrMaxFallNits(): Float =
+        if (hdrMetadataMode == HdrMetadataMode.AUTO) {
+            detectedHdrStaticMetadata.maxFallNits ?: 0f
+        } else {
+            0f
+        }
+
+    private fun applyVideoColorPipeline() {
+        nativeSetVideoColorInfo(
+            detectedVideoTransfer.wireValue,
+            detectedVideoPrimaries.wireValue,
+            effectiveHdrSourcePeakNits(),
+            effectiveHdrMaxFallNits(),
+            gamutMappingMode.wireValue,
+        )
+    }
+
+    private fun persistHdrMetadataSettings() {
+        if (mediaLoaded && spec.uri.isNotBlank()) {
+            mediaStateStore.saveHdrMetadataSettings(
+                spec,
+                hdrMetadataMode.wireValue,
+                hdrManualPeakNits,
+            )
+        }
+    }
+
+    private fun hdrMetadataSummary(): String =
+        if (activeCinemaTransfer() != VideoTransfer.PQ) {
+            "Not HDR10 / PQ"
+        } else {
+            detectedHdrStaticMetadata.status
+        }
+
+    private fun hdrMetadataModeDescription(): String {
+        if (activeCinemaTransfer() != VideoTransfer.PQ) {
+            return "These controls apply when the active color mode is HDR10 / PQ."
+        }
+        return when (hdrMetadataMode) {
+            HdrMetadataMode.AUTO ->
+                "Auto: ${effectiveHdrSourcePeakNits().toInt()}-nit source peak. " +
+                    "Invalid or missing data falls back to " +
+                    "${DEFAULT_HDR_SOURCE_PEAK_NITS.toInt()} nits."
+            HdrMetadataMode.IGNORE ->
+                "Ignore bypasses file metadata and uses the " +
+                    "${DEFAULT_HDR_SOURCE_PEAK_NITS.toInt()}-nit fallback."
+            HdrMetadataMode.MANUAL ->
+                "Manual uses the per-file content peak below."
+        }
     }
 
     private fun applyPictureSettings(persist: Boolean = true) {
@@ -4432,6 +4733,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PICTURE_PREFS = "picture-preferences"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
+        private const val PREF_GAMUT_MAPPING_MODE = "gamut-mapping-mode"
         // Legacy single-profile keys are retained only to migrate existing tuning.
         private const val PREF_CINEMA_TONE_DEPTH = "cinema-tone-depth"
         private const val PREF_CINEMA_MIDTONE_EV = "cinema-midtone-ev"
@@ -4465,6 +4767,16 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val SCENE_BRIGHTNESS_MAX = 1f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
+        private const val DEFAULT_HDR_SOURCE_PEAK_NITS = 1_000f
+        private const val HDR_SOURCE_PEAK_NITS_MIN = 100f
+        private const val HDR_SOURCE_PEAK_NITS_MAX = 10_000f
+        private const val HDR_METADATA_NITS_MIN = 50f
+        private const val HDR_METADATA_NITS_MAX = 10_000f
+        private const val HDR_STATIC_INFO_SIZE_BYTES = 25
+        private const val HDR_STATIC_INFO_TYPE_1 = 0
+        private const val HDR_MASTERING_PEAK_OFFSET = 17
+        private const val HDR_MAX_CLL_OFFSET = 21
+        private const val HDR_MAX_FALL_OFFSET = 23
         private const val CINEMA_TONE_DEPTH_MIN = 0f
         private const val CINEMA_TONE_DEPTH_MAX = 1f
         private const val CINEMA_TONE_DEPTH_DISPLAY_SCALE = 200f
@@ -4521,7 +4833,13 @@ class PlayerActivity : Activity(), Player.Listener {
             toneMapPeakNits: Float,
             sceneBrightness: Float,
         )
-        @JvmStatic private external fun nativeSetVideoColorInfo(transfer: Int, primaries: Int)
+        @JvmStatic private external fun nativeSetVideoColorInfo(
+            transfer: Int,
+            primaries: Int,
+            sourcePeakNits: Float,
+            maxFallNits: Float,
+            gamutMappingMode: Int,
+        )
         @JvmStatic private external fun nativeSetCinemaSettings(
             toneDepth: Float,
             midtoneEv: Float,

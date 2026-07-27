@@ -35,6 +35,8 @@ class MediaStateStore(context: Context) :
         val decoderMode: Int?,
         val decoderAutoSoftware: Boolean,
         val screenCurvature: Float?,
+        val hdrMetadataMode: Int?,
+        val hdrManualPeakNits: Float?,
     )
 
     data class PictureSettings(
@@ -91,6 +93,8 @@ class MediaStateStore(context: Context) :
                 decoder_mode INTEGER,
                 decoder_auto_software INTEGER NOT NULL DEFAULT 0,
                 screen_curvature REAL,
+                hdr_metadata_mode INTEGER,
+                hdr_manual_peak_nits REAL,
                 playback_uri TEXT,
                 smb_share TEXT,
                 last_played_at INTEGER,
@@ -147,6 +151,10 @@ class MediaStateStore(context: Context) :
         }
         if (oldVersion < 12) {
             db.execSQL("ALTER TABLE media_state ADD COLUMN vibrance REAL")
+        }
+        if (oldVersion < 13) {
+            db.execSQL("ALTER TABLE media_state ADD COLUMN hdr_metadata_mode INTEGER")
+            db.execSQL("ALTER TABLE media_state ADD COLUMN hdr_manual_peak_nits REAL")
         }
     }
 
@@ -258,6 +266,8 @@ class MediaStateStore(context: Context) :
                 "decoder_mode",
                 "decoder_auto_software",
                 "screen_curvature",
+                "hdr_metadata_mode",
+                "hdr_manual_peak_nits",
             ),
             "media_id = ?",
             arrayOf(identity.id),
@@ -297,6 +307,8 @@ class MediaStateStore(context: Context) :
                 decoderMode = if (cursor.isNull(17)) null else cursor.getInt(17),
                 decoderAutoSoftware = !cursor.isNull(18) && cursor.getInt(18) != 0,
                 screenCurvature = if (cursor.isNull(19)) null else cursor.getFloat(19),
+                hdrMetadataMode = if (cursor.isNull(20)) null else cursor.getInt(20),
+                hdrManualPeakNits = if (cursor.isNull(21)) null else cursor.getFloat(21),
             )
         }
     }
@@ -376,6 +388,13 @@ class MediaStateStore(context: Context) :
         })
     }
 
+    fun saveHdrMetadataSettings(spec: PlaybackSpec, mode: Int, manualPeakNits: Float) {
+        upsert(spec, ContentValues().apply {
+            put("hdr_metadata_mode", mode)
+            put("hdr_manual_peak_nits", manualPeakNits)
+        })
+    }
+
     private fun upsert(spec: PlaybackSpec, values: ContentValues) {
         val identity = MediaIdentity.from(spec)
         values.put("media_id", identity.id)
@@ -391,7 +410,7 @@ class MediaStateStore(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "media-state.db"
-        private const val DATABASE_VERSION = 12
+        private const val DATABASE_VERSION = 13
     }
 }
 
