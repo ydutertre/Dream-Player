@@ -473,11 +473,6 @@ class PlayerActivity : Activity(), Player.Listener {
                 ADAPTIVE_TONE_MAP_PRIORITY_MAX,
                 DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
             )
-            .sanitized(
-                ADAPTIVE_TONE_MAP_NITS_MIN,
-                ADAPTIVE_TONE_MAP_NITS_MAX,
-                DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS,
-            )
         if (
             picturePreferences.getInt(PREF_ADAPTIVE_DEFAULT_RANGE_VERSION, 0) < 1
         ) {
