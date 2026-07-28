@@ -11,6 +11,7 @@ data class LocalVideo(
     val folder: String,
     val size: Long,
     val durationMs: Long,
+    val modifiedAtMs: Long,
 )
 
 class LocalVideoRepository(private val context: Context) {
@@ -22,6 +23,7 @@ class LocalVideoRepository(private val context: Context) {
             MediaStore.Video.Media.RELATIVE_PATH,
             MediaStore.Video.Media.SIZE,
             MediaStore.Video.Media.DURATION,
+            MediaStore.Video.Media.DATE_MODIFIED,
         )
         return buildList {
             context.contentResolver.query(
@@ -36,6 +38,7 @@ class LocalVideoRepository(private val context: Context) {
                 val folderColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.RELATIVE_PATH)
                 val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
                 val durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+                val modifiedColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_MODIFIED)
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idColumn)
                     add(
@@ -45,6 +48,7 @@ class LocalVideoRepository(private val context: Context) {
                             folder = cursor.getString(folderColumn)?.trimEnd('/')?.ifBlank { "Videos" } ?: "Videos",
                             size = cursor.getLong(sizeColumn),
                             durationMs = cursor.getLong(durationColumn),
+                            modifiedAtMs = cursor.getLong(modifiedColumn) * 1_000L,
                         )
                     )
                 }

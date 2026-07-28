@@ -62,6 +62,11 @@ class MediaStateStore(context: Context) :
         val smbShare: String?,
     )
 
+    data class BrowserMetadata(
+        val durationMs: Long?,
+        val lastPlayedAt: Long?,
+    )
+
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -222,6 +227,27 @@ class MediaStateStore(context: Context) :
                 )
             }
             return recent
+        }
+    }
+
+    fun listBrowserMetadata(): Map<String, BrowserMetadata> {
+        readableDatabase.query(
+            "media_state",
+            arrayOf("media_id", "duration_ms", "last_played_at"),
+            "duration_ms IS NOT NULL OR last_played_at IS NOT NULL",
+            null,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            val result = HashMap<String, BrowserMetadata>(cursor.count)
+            while (cursor.moveToNext()) {
+                result[cursor.getString(0)] = BrowserMetadata(
+                    durationMs = if (cursor.isNull(1)) null else cursor.getLong(1),
+                    lastPlayedAt = if (cursor.isNull(2)) null else cursor.getLong(2),
+                )
+            }
+            return result
         }
     }
 
@@ -422,7 +448,13 @@ data class MediaIdentity(
         fun from(spec: PlaybackSpec): MediaIdentity {
             val parsed = Uri.parse(spec.uri)
             val canonical = if (parsed.scheme.equals("smb", ignoreCase = true)) {
-                val host = (spec.smb?.host ?: parsed.host).orEmpty().trim().lowercase(Locale.ROOT)
+                // Friendly SMB hostnames may replace a discovered IP in the UI. Keep the
+                // stable connection target in the identity so that migration does not lose
+                // resume positions and other per-file settings saved under the original IP.
+                val host = (spec.smb?.connectionTarget ?: parsed.host)
+                    .orEmpty()
+                    .trim()
+                    .lowercase(Locale.ROOT)
                 val share = spec.smb?.share.orEmpty().trim().trim('/', '\\').lowercase(Locale.ROOT)
                 val path = parsed.pathSegments
                     .joinToString("/")

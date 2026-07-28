@@ -121,9 +121,17 @@ class PlayerActivity : Activity(), Player.Listener {
     private var transientMessage: String? = null
     private val io = Executors.newSingleThreadExecutor()
     private var recentMedia: List<MediaStateStore.RecentMedia> = emptyList()
+    private var browserMetadata: Map<String, MediaStateStore.BrowserMetadata> = emptyMap()
     private var currentMediaMarkedPlayed = false
     private var localVideos: List<LocalVideo> = emptyList()
     private var localFolder: String? = null
+    private var localBrowserItems: List<LocalBrowserItem> = emptyList()
+    private var browserSearchQuery = ""
+    private var browserSearchDraft = ""
+    private var browserSearchReturnScreen = UiScreen.LOCAL_FILES
+    private var browserSortPopoverOpen = false
+    private var browserSortField = BrowserSortField.NAME
+    private var browserSortAscending = true
     private var browserScrollOffset = 0f
     private var browserJoystickInput = 0f
     private var browserScrollVelocity = 0f
@@ -150,6 +158,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var smbDisplayHost = ""
     private var smbShares: List<String> = emptyList()
     private var smbEntries: List<SmbEntry> = emptyList()
+    private var smbBrowserItems: List<SmbBrowserItem> = emptyList()
     private var smbPath = ""
     private var smbShareListScrollOffset = 0f
     private val smbNavigationStack = ArrayDeque<SmbNavigationState>()
@@ -264,6 +273,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class UiScreen {
         LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
         SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
+        FILE_SEARCH_KEYBOARD,
         PLAYBACK, PROJECTION, PICTURE, DECODER, AUDIO_SYNC, AUDIO_TRACKS, SUBTITLES,
     }
 
@@ -344,12 +354,20 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
-    private enum class KeyboardField { HOST, USERNAME, PASSWORD, DOMAIN }
+    private enum class KeyboardField { HOST, USERNAME, PASSWORD, DOMAIN, SEARCH }
+
+    private enum class BrowserSortField(val label: String) {
+        NAME("Name"),
+        DATE("Date"),
+        DURATION("Duration"),
+        RECENT("Recently played"),
+    }
 
     private sealed interface BrowserReturnState {
         data class Local(
             val folder: String,
             val scrollOffset: Float,
+            val searchQuery: String,
         ) : BrowserReturnState
 
         data class Smb(
@@ -357,6 +375,7 @@ class PlayerActivity : Activity(), Player.Listener {
             val path: String,
             val entries: List<SmbEntry>,
             val scrollOffset: Float,
+            val searchQuery: String,
         ) : BrowserReturnState
     }
 
@@ -364,6 +383,19 @@ class PlayerActivity : Activity(), Player.Listener {
         val path: String,
         val entries: List<SmbEntry>,
         val scrollOffset: Float,
+        val searchQuery: String,
+    )
+
+    private data class LocalBrowserItem(
+        val sourceIndex: Int,
+        val video: LocalVideo,
+        val metadata: MediaStateStore.BrowserMetadata?,
+    )
+
+    private data class SmbBrowserItem(
+        val sourceIndex: Int,
+        val entry: SmbEntry,
+        val metadata: MediaStateStore.BrowserMetadata?,
     )
 
     private data class UiButton(
@@ -413,6 +445,13 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         loadCinemaTunings(picturePreferences)
         applyCinemaSettings(persist = false)
+        val browserPreferences = getSharedPreferences(BROWSER_PREFS, Context.MODE_PRIVATE)
+        browserSortField = BrowserSortField.entries.getOrElse(
+            browserPreferences.getInt(PREF_BROWSER_SORT_FIELD, BrowserSortField.NAME.ordinal)
+        ) { BrowserSortField.NAME }
+        browserSortAscending =
+            browserPreferences.getBoolean(PREF_BROWSER_SORT_ASCENDING, true)
+        browserMetadata = mediaStateStore.listBrowserMetadata()
         smbCredentialStore.load()?.let {
             smbCredentials = it
             smbDisplayHost = it.host
@@ -485,8 +524,19 @@ class PlayerActivity : Activity(), Player.Listener {
             val py = v * UI_HEIGHT
             pointerUiX = px
             pointerUiY = py
-            val target = uiButtons.lastOrNull { it.bounds.contains(px, py) }
+            val rawTarget = uiButtons.lastOrNull { it.bounds.contains(px, py) }
+            val target = if (
+                browserSortPopoverOpen &&
+                BROWSER_SORT_POPOVER_BOUNDS.contains(px, py) &&
+                rawTarget?.id?.let(::isBrowserSortControl) != true
+            ) {
+                null
+            } else {
+                rawTarget
+            }
             val hoverTarget = when {
+                browserSortPopoverOpen &&
+                    target?.id?.let(::isBrowserSortControl) != true -> null
                 target?.id == BROWSER_SCROLLBAR_ID ||
                     target?.id == TRACK_LIST_SCROLLBAR_ID -> target
                 isBrowserListScreen() && browserScrollMoving -> null
@@ -501,6 +551,16 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             if (pressed) {
                 if (uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+                if (
+                    browserSortPopoverOpen &&
+                    !BROWSER_SORT_POPOVER_BOUNDS.contains(px, py) &&
+                    target?.id != "browser_sort"
+                ) {
+                    browserSortPopoverOpen = false
+                    hoveredButton = null
+                    renderVrMenu()
+                    return@runOnUiThread
+                }
                 if (target != null) {
                     Log.i("DreamPlayerUI", "Click: ${target.id}")
                     if (target.id == BROWSER_SCROLLBAR_ID) {
@@ -664,12 +724,127 @@ class PlayerActivity : Activity(), Player.Listener {
         else -> false
     }
 
+    private fun refreshBrowserMetadata() {
+        browserMetadata = mediaStateStore.listBrowserMetadata()
+        rebuildBrowserItems()
+    }
+
+    private fun localPlaybackSpec(video: LocalVideo) =
+        PlaybackSpec(video.uri.toString(), video.name, StereoMode.MONO)
+
+    private fun smbPlaybackSpec(entry: SmbEntry): PlaybackSpec {
+        val uri = Uri.Builder()
+            .scheme("smb")
+            .authority(smbCredentials.host)
+            .apply {
+                entry.path.split('\\').filter(String::isNotEmpty).forEach(::appendPath)
+            }
+            .build()
+            .toString()
+        return PlaybackSpec(uri, entry.name, StereoMode.MONO, smb = smbCredentials)
+    }
+
+    private fun directedComparison(comparison: Int): Int =
+        if (browserSortAscending) comparison else -comparison
+
+    private fun compareNames(first: String, second: String): Int =
+        directedComparison(String.CASE_INSENSITIVE_ORDER.compare(first, second))
+
+    /** Unknown metadata remains at the bottom in both directions. */
+    private fun compareKnownLongs(first: Long?, second: Long?): Int = when {
+        first == null && second == null -> 0
+        first == null -> 1
+        second == null -> -1
+        else -> directedComparison(first.compareTo(second))
+    }
+
+    private fun compareBrowserItems(
+        firstName: String,
+        secondName: String,
+        firstDate: Long?,
+        secondDate: Long?,
+        firstDuration: Long?,
+        secondDuration: Long?,
+        firstRecent: Long?,
+        secondRecent: Long?,
+    ): Int {
+        val primary = when (browserSortField) {
+            BrowserSortField.NAME -> compareNames(firstName, secondName)
+            BrowserSortField.DATE -> compareKnownLongs(firstDate, secondDate)
+            BrowserSortField.DURATION -> compareKnownLongs(firstDuration, secondDuration)
+            BrowserSortField.RECENT -> compareKnownLongs(firstRecent, secondRecent)
+        }
+        return if (primary != 0) primary else compareNames(firstName, secondName)
+    }
+
+    private fun rebuildBrowserItems() {
+        localBrowserItems = buildVisibleLocalVideos()
+        smbBrowserItems = buildVisibleSmbEntries()
+    }
+
+    private fun buildVisibleLocalVideos(): List<LocalBrowserItem> {
+        val query = browserSearchQuery.trim()
+        return localVideos.withIndex()
+            .asSequence()
+            .filter { it.value.folder == localFolder }
+            .filter { query.isBlank() || it.value.name.contains(query, ignoreCase = true) }
+            .map { indexed ->
+                val metadata = browserMetadata[MediaIdentity.from(localPlaybackSpec(indexed.value)).id]
+                LocalBrowserItem(indexed.index, indexed.value, metadata)
+            }
+            .sortedWith { first, second ->
+                compareBrowserItems(
+                    first.video.name,
+                    second.video.name,
+                    first.video.modifiedAtMs.takeIf { it > 0L },
+                    second.video.modifiedAtMs.takeIf { it > 0L },
+                    first.video.durationMs.takeIf { it > 0L } ?: first.metadata?.durationMs,
+                    second.video.durationMs.takeIf { it > 0L } ?: second.metadata?.durationMs,
+                    first.metadata?.lastPlayedAt,
+                    second.metadata?.lastPlayedAt,
+                )
+            }
+            .toList()
+    }
+
+    private fun buildVisibleSmbEntries(): List<SmbBrowserItem> {
+        val query = browserSearchQuery.trim()
+        return smbEntries.withIndex()
+            .asSequence()
+            .filter { query.isBlank() || it.value.name.contains(query, ignoreCase = true) }
+            .map { indexed ->
+                val metadata = if (indexed.value.isDirectory) {
+                    null
+                } else {
+                    browserMetadata[MediaIdentity.from(smbPlaybackSpec(indexed.value)).id]
+                }
+                SmbBrowserItem(indexed.index, indexed.value, metadata)
+            }
+            .sortedWith { first, second ->
+                when {
+                    first.entry.isDirectory && !second.entry.isDirectory -> -1
+                    !first.entry.isDirectory && second.entry.isDirectory -> 1
+                    else -> compareBrowserItems(
+                        first.entry.name,
+                        second.entry.name,
+                        first.entry.modifiedAtMs.takeIf { it > 0L },
+                        second.entry.modifiedAtMs.takeIf { it > 0L },
+                        first.metadata?.durationMs,
+                        second.metadata?.durationMs,
+                        first.metadata?.lastPlayedAt,
+                        second.metadata?.lastPlayedAt,
+                    )
+                }
+            }
+            .toList()
+    }
+
     private fun browserItemCount(): Int = when (uiScreen) {
         UiScreen.LOCAL_FOLDERS -> localVideos.map { it.folder }.distinct().size
-        UiScreen.LOCAL_FILES -> localVideos.count { it.folder == localFolder }
+        UiScreen.LOCAL_FILES -> localBrowserItems.size
         UiScreen.SMB_SERVERS -> smbServers.size
         UiScreen.SMB_SHARES -> smbShares.size
-        UiScreen.SMB_FILES -> smbEntries.size
+        UiScreen.SMB_FILES -> smbBrowserItems.size
         else -> 0
     }
 
@@ -1261,7 +1436,11 @@ class PlayerActivity : Activity(), Player.Listener {
         val saved = smbCredentialStore.load()
             ?.takeIf { hostsMatch(it.host, host) }
         val credentials = (saved ?: SmbCredentials(host, share, "", "", ""))
-            .copy(host = host, share = share)
+            .copy(
+                host = host,
+                share = share,
+                connectionHost = saved?.connectionTarget ?: host,
+            )
         val path = parsed.pathSegments.joinToString("\\")
         transientMessage = "Opening ${recent.title}..."
         renderVrMenu()
@@ -1304,9 +1483,12 @@ class PlayerActivity : Activity(), Player.Listener {
         hoveredButton = null
         transientMessage = null
         mainHandler.removeCallbacks(uiTicker)
+        refreshBrowserMetadata()
         when (destination) {
             is BrowserReturnState.Local -> {
                 localFolder = destination.folder
+                browserSearchQuery = destination.searchQuery
+                rebuildBrowserItems()
                 browserScrollOffset = destination.scrollOffset
                 uiScreen = UiScreen.LOCAL_FILES
                 renderVrMenu()
@@ -1315,6 +1497,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 smbCredentials = destination.credentials
                 smbPath = destination.path
                 smbEntries = destination.entries
+                browserSearchQuery = destination.searchQuery
+                rebuildBrowserItems()
                 browserScrollOffset = destination.scrollOffset
                 uiScreen = UiScreen.SMB_FILES
                 renderVrMenu()
@@ -1345,6 +1529,8 @@ class PlayerActivity : Activity(), Player.Listener {
                     runOnUiThread {
                         localVideos = videos
                         localFolder = null
+                        browserSearchQuery = ""
+                        rebuildBrowserItems()
                         browserScrollOffset = 0f
                         localFolderListScrollOffset = 0f
                         transientMessage = null
@@ -1370,8 +1556,13 @@ class PlayerActivity : Activity(), Player.Listener {
         io.execute {
             runCatching { SmbDiscovery(this).discover() }
                 .onSuccess { servers -> runOnUiThread {
-                    val remembered = smbCredentials.host.takeIf { rememberSmbCredentials && it.isNotBlank() }
-                    smbServers = (listOfNotNull(remembered?.let(::SmbServer)) + servers).distinctBy { it.host }
+                    val remembered = smbCredentials.takeIf {
+                        rememberSmbCredentials && it.host.isNotBlank()
+                    }?.let {
+                        SmbServer(it.connectionTarget, it.host)
+                    }
+                    smbServers = (listOfNotNull(remembered) + servers)
+                        .distinctBy { it.host.lowercase(Locale.ROOT) }
                     transientMessage = if (smbServers.isEmpty()) "No SMB servers found; use Add server" else null
                     renderVrMenu()
                 } }
@@ -1385,11 +1576,24 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun showSmbLogin(
         host: String = smbCredentials.host,
         displayHost: String = smbDisplayHost.ifBlank { host },
+        connectionHost: String = smbCredentials.connectionTarget.ifBlank { host },
         errorMessage: String? = null,
     ) {
         smbDisplayHost = displayHost.ifBlank { host }
-        smbCredentials = if (host == smbCredentials.host) smbCredentials.copy(share = "")
-        else SmbCredentials(host, "", "", "", "")
+        smbCredentials = if (host == smbCredentials.host) {
+            smbCredentials.copy(
+                share = "",
+                connectionHost = connectionHost.ifBlank { host },
+            )
+        }
+        else SmbCredentials(
+            host = host,
+            share = "",
+            username = "",
+            password = "",
+            domain = "",
+            connectionHost = connectionHost.ifBlank { host },
+        )
         uiScreen = UiScreen.SMB_LOGIN
         hoveredButton = null
         transientMessage = errorMessage
@@ -1397,7 +1601,10 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun openSmbServer(server: SmbServer) {
-        smbDisplayHost = server.displayName
+        val preferredHost = server.displayName
+            .takeIf { it.isNotBlank() && !it.equals(server.host, ignoreCase = true) }
+            ?: server.host
+        smbDisplayHost = preferredHost
         val saved = smbCredentialStore.load()
         val savedMatches = saved != null && sequenceOf(
             server.host,
@@ -1405,10 +1612,18 @@ class PlayerActivity : Activity(), Player.Listener {
         ).any { candidate -> hostsMatch(saved.host, candidate) }
         if (savedMatches) {
             rememberSmbCredentials = true
-            smbCredentials = requireNotNull(saved).copy(host = server.host, share = "")
+            smbCredentials = requireNotNull(saved).copy(
+                host = preferredHost,
+                share = "",
+                connectionHost = server.host,
+            )
             connectSmb(autoLogin = true)
         } else {
-            showSmbLogin(server.host, server.displayName)
+            showSmbLogin(
+                host = preferredHost,
+                displayHost = preferredHost,
+                connectionHost = server.host,
+            )
         }
     }
 
@@ -1456,6 +1671,7 @@ class PlayerActivity : Activity(), Player.Listener {
                         showSmbLogin(
                             host = credentials.host,
                             displayHost = smbDisplayHost,
+                            connectionHost = credentials.connectionTarget,
                             errorMessage = message,
                         )
                     } else {
@@ -1469,6 +1685,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun browseSmb(
         path: String,
         restoreScrollOffset: Float = 0f,
+        restoreSearchQuery: String = "",
         rollbackNavigationOnFailure: Boolean = false,
     ) {
         val credentials = smbCredentials
@@ -1482,6 +1699,8 @@ class PlayerActivity : Activity(), Player.Listener {
             }.onSuccess { entries -> runOnUiThread {
                 smbPath = path
                 smbEntries = entries
+                browserSearchQuery = restoreSearchQuery
+                refreshBrowserMetadata()
                 browserScrollOffset = restoreScrollOffset
                 transientMessage = null
                 uiScreen = UiScreen.SMB_FILES
@@ -2029,6 +2248,47 @@ class PlayerActivity : Activity(), Player.Listener {
         }, durationMs)
     }
 
+    private fun openBrowserSearch() {
+        if (uiScreen != UiScreen.LOCAL_FILES && uiScreen != UiScreen.SMB_FILES) return
+        browserSortPopoverOpen = false
+        browserSearchReturnScreen = uiScreen
+        browserSearchDraft = browserSearchQuery
+        keyboardField = KeyboardField.SEARCH
+        keyboardSymbols = false
+        keyboardUppercase = false
+        uiScreen = UiScreen.FILE_SEARCH_KEYBOARD
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun openBrowserSort() {
+        if (uiScreen != UiScreen.LOCAL_FILES && uiScreen != UiScreen.SMB_FILES) return
+        browserSortPopoverOpen = !browserSortPopoverOpen
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun isBrowserSortControl(id: String): Boolean =
+        id == "browser_sort" ||
+            id.startsWith("browser_sort_field_") ||
+            id == "browser_sort_ascending" ||
+            id == "browser_sort_descending"
+
+    private fun persistBrowserSort() {
+        getSharedPreferences(BROWSER_PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(PREF_BROWSER_SORT_FIELD, browserSortField.ordinal)
+            .putBoolean(PREF_BROWSER_SORT_ASCENDING, browserSortAscending)
+            .apply()
+    }
+
+    private fun applyBrowserSortChange() {
+        persistBrowserSort()
+        rebuildBrowserItems()
+        browserScrollOffset = 0f
+        hoveredButton = null
+        renderVrMenu()
+    }
+
     private fun handleUiAction(id: String, pointerX: Float, persist: Boolean = true) {
         when {
             id.startsWith("recent_") ->
@@ -2074,6 +2334,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 smbShareListScrollOffset = browserScrollOffset
                 smbCredentials = smbCredentials.copy(share = share)
                 smbNavigationStack.clear()
+                browserSearchQuery = ""
                 browseSmb("")
             }
             id == "smb_shares_back" -> {
@@ -2090,6 +2351,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 if (parent != null) {
                     smbPath = parent.path
                     smbEntries = parent.entries
+                    browserSearchQuery = parent.searchQuery
+                    rebuildBrowserItems()
                     browserScrollOffset = parent.scrollOffset
                     transientMessage = null
                     hoveredButton = null
@@ -2105,23 +2368,23 @@ class PlayerActivity : Activity(), Player.Listener {
                 val entry = smbEntries[id.removePrefix("smb_entry_").toInt()]
                 if (entry.isDirectory) {
                     smbNavigationStack.addLast(
-                        SmbNavigationState(smbPath, smbEntries.toList(), browserScrollOffset)
+                        SmbNavigationState(
+                            smbPath,
+                            smbEntries.toList(),
+                            browserScrollOffset,
+                            browserSearchQuery,
+                        )
                     )
                     browseSmb(entry.path, rollbackNavigationOnFailure = true)
                 } else {
-                    val uri = Uri.Builder()
-                        .scheme("smb")
-                        .authority(smbCredentials.host)
-                        .apply { entry.path.split('\\').filter { it.isNotEmpty() }.forEach(::appendPath) }
-                        .build()
-                        .toString()
                     loadMedia(
-                        PlaybackSpec(uri, entry.name, StereoMode.MONO, smb = smbCredentials),
+                        smbPlaybackSpec(entry),
                         BrowserReturnState.Smb(
                             credentials = smbCredentials,
                             path = smbPath,
                             entries = smbEntries.toList(),
                             scrollOffset = browserScrollOffset,
+                            searchQuery = browserSearchQuery,
                         ),
                     )
                 }
@@ -2148,8 +2411,24 @@ class PlayerActivity : Activity(), Player.Listener {
                 setKeyboardValue(keyboardValue() + " ")
                 renderVrMenu()
             }
-            id == "key_done" || id == "key_cancel" -> {
-                uiScreen = UiScreen.SMB_LOGIN
+            id == "key_done" -> {
+                if (uiScreen == UiScreen.FILE_SEARCH_KEYBOARD) {
+                    browserSearchQuery = browserSearchDraft.trim()
+                    rebuildBrowserItems()
+                    browserScrollOffset = 0f
+                    uiScreen = browserSearchReturnScreen
+                } else {
+                    uiScreen = UiScreen.SMB_LOGIN
+                }
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "key_cancel" -> {
+                uiScreen = if (uiScreen == UiScreen.FILE_SEARCH_KEYBOARD) {
+                    browserSearchReturnScreen
+                } else {
+                    UiScreen.SMB_LOGIN
+                }
                 hoveredButton = null
                 renderVrMenu()
             }
@@ -2159,10 +2438,27 @@ class PlayerActivity : Activity(), Player.Listener {
                 renderVrMenu()
             }
             id == "exit" -> finish()
+            id == "browser_search" -> openBrowserSearch()
+            id == "browser_sort" -> openBrowserSort()
+            id.startsWith("browser_sort_field_") -> {
+                browserSortField = when (id.removePrefix("browser_sort_field_")) {
+                    "date" -> BrowserSortField.DATE
+                    "duration" -> BrowserSortField.DURATION
+                    "recent" -> BrowserSortField.RECENT
+                    else -> BrowserSortField.NAME
+                }
+                applyBrowserSortChange()
+            }
+            id == "browser_sort_ascending" || id == "browser_sort_descending" -> {
+                browserSortAscending = id == "browser_sort_ascending"
+                applyBrowserSortChange()
+            }
             id == "local_back" -> {
                 if (uiScreen == UiScreen.LOCAL_FILES) {
                     uiScreen = UiScreen.LOCAL_FOLDERS
                     localFolder = null
+                    browserSearchQuery = ""
+                    rebuildBrowserItems()
                     browserScrollOffset = localFolderListScrollOffset
                     hoveredButton = null
                     renderVrMenu()
@@ -2172,6 +2468,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 val folders = localVideos.map { it.folder }.distinct().sortedWith(String.CASE_INSENSITIVE_ORDER)
                 localFolderListScrollOffset = browserScrollOffset
                 localFolder = folders[id.removePrefix("folder_").toInt()]
+                browserSearchQuery = ""
+                rebuildBrowserItems()
                 uiScreen = UiScreen.LOCAL_FILES
                 browserScrollOffset = 0f
                 hoveredButton = null
@@ -2180,10 +2478,11 @@ class PlayerActivity : Activity(), Player.Listener {
             id.startsWith("video_") -> {
                 val video = localVideos[id.removePrefix("video_").toInt()]
                 loadMedia(
-                    PlaybackSpec(video.uri.toString(), video.name, StereoMode.MONO),
+                    localPlaybackSpec(video),
                     BrowserReturnState.Local(
                         folder = requireNotNull(localFolder),
                         scrollOffset = browserScrollOffset,
+                        searchQuery = browserSearchQuery,
                     ),
                 )
             }
@@ -2709,14 +3008,19 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.USERNAME -> smbCredentials.username
         KeyboardField.PASSWORD -> smbCredentials.password
         KeyboardField.DOMAIN -> smbCredentials.domain
+        KeyboardField.SEARCH -> browserSearchDraft
     }
 
     private fun setKeyboardValue(value: String) {
         smbCredentials = when (keyboardField) {
-            KeyboardField.HOST -> smbCredentials.copy(host = value)
+            KeyboardField.HOST -> smbCredentials.copy(host = value, connectionHost = value)
             KeyboardField.USERNAME -> smbCredentials.copy(username = value)
             KeyboardField.PASSWORD -> smbCredentials.copy(password = value)
             KeyboardField.DOMAIN -> smbCredentials.copy(domain = value)
+            KeyboardField.SEARCH -> {
+                browserSearchDraft = value
+                smbCredentials
+            }
         }
     }
 
@@ -2725,6 +3029,7 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.USERNAME -> "Username"
         KeyboardField.PASSWORD -> "Password"
         KeyboardField.DOMAIN -> "Domain (usually blank)"
+        KeyboardField.SEARCH -> "Search file names"
     }
 
     private fun renderSubtitle(lines: List<String>): Bitmap {
@@ -3791,6 +4096,102 @@ class PlayerActivity : Activity(), Player.Listener {
             }
         }
 
+        fun browserTools() {
+            val searchLabel = if (browserSearchQuery.isBlank()) {
+                "Search"
+            } else {
+                "Search: ${browserSearchQuery.take(11)}"
+            }
+            button(
+                "browser_search",
+                searchLabel,
+                RectF(1355f, 75f, 1595f, 142f),
+                browserSearchQuery.isNotBlank(),
+                fontSize = 25f,
+            )
+            button(
+                "browser_sort",
+                "${browserSortField.label} ${if (browserSortAscending) "↑" else "↓"}",
+                RectF(1610f, 75f, 1880f, 142f),
+                browserSortPopoverOpen ||
+                    browserSortField != BrowserSortField.NAME ||
+                    !browserSortAscending,
+                fontSize = 24f,
+            )
+        }
+
+        fun browserSortPopover() {
+            val bounds = BROWSER_SORT_POPOVER_BOUNDS
+            canvas.drawRoundRect(
+                bounds,
+                28f,
+                28f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel },
+            )
+            canvas.drawRoundRect(
+                bounds,
+                28f,
+                28f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                },
+            )
+            val pointer = Path().apply {
+                moveTo(1718f, bounds.top + 1f)
+                lineTo(1766f, bounds.top + 1f)
+                lineTo(1742f, bounds.top - 22f)
+                close()
+            }
+            canvas.drawPath(pointer, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel })
+            text("Sort by", bounds.left + 34f, bounds.top + 56f, 34f, Paint.Align.LEFT)
+            button(
+                "browser_sort_field_name", "Name",
+                RectF(bounds.left + 28f, bounds.top + 82f, bounds.right - 28f, bounds.top + 152f),
+                browserSortField == BrowserSortField.NAME,
+                fontSize = 29f,
+            )
+            button(
+                "browser_sort_field_date", "Date",
+                RectF(bounds.left + 28f, bounds.top + 164f, bounds.right - 28f, bounds.top + 234f),
+                browserSortField == BrowserSortField.DATE,
+                fontSize = 29f,
+            )
+            button(
+                "browser_sort_field_duration", "Duration",
+                RectF(bounds.left + 28f, bounds.top + 246f, bounds.right - 28f, bounds.top + 316f),
+                browserSortField == BrowserSortField.DURATION,
+                fontSize = 29f,
+            )
+            button(
+                "browser_sort_field_recent", "Recently played",
+                RectF(bounds.left + 28f, bounds.top + 328f, bounds.right - 28f, bounds.top + 398f),
+                browserSortField == BrowserSortField.RECENT,
+                fontSize = 27f,
+            )
+            text(
+                "Direction",
+                bounds.left + 34f,
+                bounds.top + 447f,
+                25f,
+                Paint.Align.LEFT,
+                colorTextMuted,
+            )
+            button(
+                "browser_sort_ascending", "↑",
+                RectF(bounds.left + 180f, bounds.top + 412f, bounds.left + 290f, bounds.top + 472f),
+                browserSortAscending,
+                fontSize = 40f,
+            )
+            button(
+                "browser_sort_descending", "↓",
+                RectF(bounds.left + 304f, bounds.top + 412f, bounds.left + 414f, bounds.top + 472f),
+                !browserSortAscending,
+                fontSize = 40f,
+            )
+        }
+
         when (uiScreen) {
             UiScreen.LIBRARY -> {
                 canvas.drawRoundRect(90f, 60f, 845f, 955f, 42f, 42f, panelPaint)
@@ -3846,17 +4247,27 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             UiScreen.LOCAL_FILES -> {
                 canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
-                text(localFolder ?: "Local videos", 1024f, 135f, 58f)
-                val indexed = localVideos.withIndex().filter { it.value.folder == localFolder }
-                scrollableList(indexed.size, 98f, 80f) { index, bounds ->
-                    val indexedVideo = indexed[index]
-                    val video = indexedVideo.value
+                text((localFolder ?: "Local videos").takeLast(39), 180f, 128f, 43f, Paint.Align.LEFT)
+                browserTools()
+                scrollableList(localBrowserItems.size, 98f, 80f) { index, bounds ->
+                    val item = localBrowserItems[index]
+                    val video = item.video
                     val details = "${formatTime(video.durationMs)}  •  ${formatBytes(video.size)}"
-                    browserEntryButton("video_${indexedVideo.index}", video.name, details,
+                    browserEntryButton("video_${item.sourceIndex}", video.name, details,
                         RectF(230f, bounds.top, 1818f, bounds.bottom), false)
                 }
+                if (localBrowserItems.isEmpty()) {
+                    text(
+                        if (browserSearchQuery.isBlank()) {
+                            "No videos were found in this folder."
+                        } else {
+                            "No file names match \"$browserSearchQuery\"."
+                        },
+                        1024f, 450f, 42f,
+                    )
+                }
                 button("local_back", "Folders", RectF(250f, 885f, 570f, 950f))
-                text("${indexed.size} videos  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
+                text("${localBrowserItems.size} videos  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
             }
             UiScreen.SMB_SERVERS -> {
                 canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
@@ -3906,20 +4317,42 @@ class PlayerActivity : Activity(), Player.Listener {
             UiScreen.SMB_FILES -> {
                 canvas.drawRoundRect(120f, 55f, 1928f, 975f, 42f, 42f, panelPaint)
                 val location = if (smbPath.isBlank()) smbCredentials.share else "${smbCredentials.share} / ${smbPath.replace('\\', '/')}"
-                text(location.takeLast(56), 1024f, 135f, 48f)
-                scrollableList(smbEntries.size, 92f, 75f) { index, bounds ->
-                    val entry = smbEntries[index]
+                text(location.takeLast(40), 170f, 128f, 40f, Paint.Align.LEFT)
+                browserTools()
+                scrollableList(smbBrowserItems.size, 92f, 75f) { index, bounds ->
+                    val item = smbBrowserItems[index]
+                    val entry = item.entry
+                    val detail = if (entry.isDirectory) {
+                        ""
+                    } else {
+                        listOfNotNull(
+                            item.metadata?.durationMs
+                                ?.takeIf { it > 0L }
+                                ?.let(::formatTime),
+                            formatBytes(entry.size),
+                        ).joinToString("  •  ")
+                    }
                     browserEntryButton(
-                        "smb_entry_$index", entry.name,
-                        if (entry.isDirectory) "" else formatBytes(entry.size),
+                        "smb_entry_${item.sourceIndex}", entry.name,
+                        detail,
                         RectF(210f, bounds.top, 1838f, bounds.bottom), entry.isDirectory,
                     )
                 }
-                if (smbEntries.isEmpty()) text("No video files or folders found.", 1024f, 450f, 42f)
+                if (smbBrowserItems.isEmpty()) {
+                    text(
+                        if (browserSearchQuery.isBlank()) {
+                            "No video files or folders found."
+                        } else {
+                            "No file names match \"$browserSearchQuery\"."
+                        },
+                        1024f, 450f, 42f,
+                    )
+                }
                 button("smb_files_back", "Up", RectF(250f, 885f, 570f, 950f), fontSize = 36f)
-                text("${smbEntries.size} items  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
+                text("${smbBrowserItems.size} items  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
             }
-            UiScreen.SMB_KEYBOARD -> {
+            UiScreen.SMB_KEYBOARD,
+            UiScreen.FILE_SEARCH_KEYBOARD -> {
                 canvas.drawRoundRect(95f, 35f, 1953f, 995f, 42f, 42f, panelPaint)
                 text(keyboardTitle(), 1024f, 105f, 50f)
                 val raw = keyboardValue()
@@ -3951,7 +4384,12 @@ class PlayerActivity : Activity(), Player.Listener {
                 button("key_backspace", "Backspace", RectF(1060f, 755f, 1410f, 850f), fontSize = 31f)
                 button("key_clear", "Clear", RectF(1430f, 755f, 1710f, 850f), fontSize = 34f)
                 button("key_cancel", "Cancel", RectF(480f, 885f, 900f, 960f), fontSize = 36f)
-                button("key_done", "Done", RectF(1148f, 885f, 1568f, 960f), fontSize = 36f)
+                button(
+                    "key_done",
+                    if (uiScreen == UiScreen.FILE_SEARCH_KEYBOARD) "Search" else "Done",
+                    RectF(1148f, 885f, 1568f, 960f),
+                    fontSize = 36f,
+                )
             }
             UiScreen.PLAYBACK -> {
                 canvas.drawRoundRect(PLAYBACK_TOOLBAR_BOUNDS, 34f, 34f, panelPaint)
@@ -4633,6 +5071,13 @@ class PlayerActivity : Activity(), Player.Listener {
             }
         }
 
+        if (
+            browserSortPopoverOpen &&
+            (uiScreen == UiScreen.LOCAL_FILES || uiScreen == UiScreen.SMB_FILES)
+        ) {
+            browserSortPopover()
+        }
+
         transientMessage?.let {
             canvas.drawRoundRect(280f, 35f, 1768f, 115f, 24f, 24f,
                 Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(245, 91, 31, 39) })
@@ -5071,6 +5516,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val BROWSER_LIST_BOTTOM = 855f
         private const val BROWSER_LIST_LEFT = 170f
         private const val BROWSER_LIST_RIGHT = 1850f
+        private val BROWSER_SORT_POPOVER_BOUNDS = RectF(1378f, 164f, 1880f, 664f)
         private const val BROWSER_SCROLLBAR_ID = "browser_scrollbar"
         private const val BROWSER_SCROLLBAR_MIN_THUMB_HEIGHT = 65f
         private const val BROWSER_SCROLLBAR_HIT_PADDING = 26f
@@ -5117,6 +5563,9 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_3D_SUBTITLE_DEPTH_METERS = 0.12f
         private const val AUDIO_AUTO = "audio:auto"
         private const val PICTURE_PREFS = "picture-preferences"
+        private const val BROWSER_PREFS = "browser-preferences"
+        private const val PREF_BROWSER_SORT_FIELD = "sort-field"
+        private const val PREF_BROWSER_SORT_ASCENDING = "sort-ascending"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
         private const val PREF_RENDER_RESOLUTION_SCALE = "render-resolution-scale"

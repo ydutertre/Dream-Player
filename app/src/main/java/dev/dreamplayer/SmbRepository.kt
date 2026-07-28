@@ -14,11 +14,12 @@ data class SmbEntry(
     val path: String,
     val isDirectory: Boolean,
     val size: Long,
+    val modifiedAtMs: Long,
 )
 
 class SmbRepository(private val credentials: SmbCredentials) : Closeable {
     private val client = SMBClient()
-    private val connection = client.connect(credentials.host)
+    private val connection = client.connect(credentials.connectionTarget)
     private val session = connection.authenticate(
         AuthenticationContext(
             credentials.username,
@@ -40,6 +41,7 @@ class SmbRepository(private val credentials: SmbCredentials) : Closeable {
                 path = join(path, it.fileName),
                 isDirectory = isDirectory,
                 size = it.endOfFile,
+                modifiedAtMs = it.lastWriteTime.toEpochMillis(),
             )
         }
         .sortedWith(compareBy<SmbEntry>({ !it.isDirectory }, { it.name.lowercase() }))
@@ -69,4 +71,3 @@ class SmbRepository(private val credentials: SmbCredentials) : Closeable {
         }
     }
 }
-
