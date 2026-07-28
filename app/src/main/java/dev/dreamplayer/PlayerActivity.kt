@@ -129,7 +129,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var browserSearchQuery = ""
     private var browserSearchDraft = ""
     private var browserSearchReturnScreen = UiScreen.LOCAL_FILES
-    private var browserSortReturnScreen = UiScreen.LOCAL_FILES
+    private var browserSortPopoverOpen = false
     private var browserSortField = BrowserSortField.NAME
     private var browserSortAscending = true
     private var browserScrollOffset = 0f
@@ -273,7 +273,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class UiScreen {
         LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
         SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
-        FILE_SEARCH_KEYBOARD, BROWSER_SORT,
+        FILE_SEARCH_KEYBOARD,
         PLAYBACK, PROJECTION, PICTURE, DECODER, AUDIO_SYNC, AUDIO_TRACKS, SUBTITLES,
     }
 
@@ -524,8 +524,19 @@ class PlayerActivity : Activity(), Player.Listener {
             val py = v * UI_HEIGHT
             pointerUiX = px
             pointerUiY = py
-            val target = uiButtons.lastOrNull { it.bounds.contains(px, py) }
+            val rawTarget = uiButtons.lastOrNull { it.bounds.contains(px, py) }
+            val target = if (
+                browserSortPopoverOpen &&
+                BROWSER_SORT_POPOVER_BOUNDS.contains(px, py) &&
+                rawTarget?.id?.let(::isBrowserSortControl) != true
+            ) {
+                null
+            } else {
+                rawTarget
+            }
             val hoverTarget = when {
+                browserSortPopoverOpen &&
+                    target?.id?.let(::isBrowserSortControl) != true -> null
                 target?.id == BROWSER_SCROLLBAR_ID ||
                     target?.id == TRACK_LIST_SCROLLBAR_ID -> target
                 isBrowserListScreen() && browserScrollMoving -> null
@@ -540,6 +551,16 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             if (pressed) {
                 if (uiScreen == UiScreen.PLAYBACK) armControlsAutoHide()
+                if (
+                    browserSortPopoverOpen &&
+                    !BROWSER_SORT_POPOVER_BOUNDS.contains(px, py) &&
+                    target?.id != "browser_sort"
+                ) {
+                    browserSortPopoverOpen = false
+                    hoveredButton = null
+                    renderVrMenu()
+                    return@runOnUiThread
+                }
                 if (target != null) {
                     Log.i("DreamPlayerUI", "Click: ${target.id}")
                     if (target.id == BROWSER_SCROLLBAR_ID) {
@@ -2229,6 +2250,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun openBrowserSearch() {
         if (uiScreen != UiScreen.LOCAL_FILES && uiScreen != UiScreen.SMB_FILES) return
+        browserSortPopoverOpen = false
         browserSearchReturnScreen = uiScreen
         browserSearchDraft = browserSearchQuery
         keyboardField = KeyboardField.SEARCH
@@ -2241,11 +2263,16 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun openBrowserSort() {
         if (uiScreen != UiScreen.LOCAL_FILES && uiScreen != UiScreen.SMB_FILES) return
-        browserSortReturnScreen = uiScreen
-        uiScreen = UiScreen.BROWSER_SORT
+        browserSortPopoverOpen = !browserSortPopoverOpen
         hoveredButton = null
         renderVrMenu()
     }
+
+    private fun isBrowserSortControl(id: String): Boolean =
+        id == "browser_sort" ||
+            id.startsWith("browser_sort_field_") ||
+            id == "browser_sort_ascending" ||
+            id == "browser_sort_descending"
 
     private fun persistBrowserSort() {
         getSharedPreferences(BROWSER_PREFS, Context.MODE_PRIVATE).edit()
@@ -2425,11 +2452,6 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "browser_sort_ascending" || id == "browser_sort_descending" -> {
                 browserSortAscending = id == "browser_sort_ascending"
                 applyBrowserSortChange()
-            }
-            id == "browser_sort_back" -> {
-                uiScreen = browserSortReturnScreen
-                hoveredButton = null
-                renderVrMenu()
             }
             id == "local_back" -> {
                 if (uiScreen == UiScreen.LOCAL_FILES) {
@@ -4089,10 +4111,84 @@ class PlayerActivity : Activity(), Player.Listener {
             )
             button(
                 "browser_sort",
-                "${browserSortField.label} ${if (browserSortAscending) "ASC" else "DESC"}",
+                "${browserSortField.label} ${if (browserSortAscending) "↑" else "↓"}",
                 RectF(1610f, 75f, 1880f, 142f),
-                browserSortField != BrowserSortField.NAME || !browserSortAscending,
+                browserSortPopoverOpen ||
+                    browserSortField != BrowserSortField.NAME ||
+                    !browserSortAscending,
                 fontSize = 24f,
+            )
+        }
+
+        fun browserSortPopover() {
+            val bounds = BROWSER_SORT_POPOVER_BOUNDS
+            canvas.drawRoundRect(
+                bounds,
+                28f,
+                28f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel },
+            )
+            canvas.drawRoundRect(
+                bounds,
+                28f,
+                28f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = colorOutline
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                },
+            )
+            val pointer = Path().apply {
+                moveTo(1718f, bounds.top + 1f)
+                lineTo(1766f, bounds.top + 1f)
+                lineTo(1742f, bounds.top - 22f)
+                close()
+            }
+            canvas.drawPath(pointer, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorPanel })
+            text("Sort by", bounds.left + 34f, bounds.top + 56f, 34f, Paint.Align.LEFT)
+            button(
+                "browser_sort_field_name", "Name",
+                RectF(bounds.left + 28f, bounds.top + 82f, bounds.right - 28f, bounds.top + 152f),
+                browserSortField == BrowserSortField.NAME,
+                fontSize = 29f,
+            )
+            button(
+                "browser_sort_field_date", "Date",
+                RectF(bounds.left + 28f, bounds.top + 164f, bounds.right - 28f, bounds.top + 234f),
+                browserSortField == BrowserSortField.DATE,
+                fontSize = 29f,
+            )
+            button(
+                "browser_sort_field_duration", "Duration",
+                RectF(bounds.left + 28f, bounds.top + 246f, bounds.right - 28f, bounds.top + 316f),
+                browserSortField == BrowserSortField.DURATION,
+                fontSize = 29f,
+            )
+            button(
+                "browser_sort_field_recent", "Recently played",
+                RectF(bounds.left + 28f, bounds.top + 328f, bounds.right - 28f, bounds.top + 398f),
+                browserSortField == BrowserSortField.RECENT,
+                fontSize = 27f,
+            )
+            text(
+                "Direction",
+                bounds.left + 34f,
+                bounds.top + 447f,
+                25f,
+                Paint.Align.LEFT,
+                colorTextMuted,
+            )
+            button(
+                "browser_sort_ascending", "↑",
+                RectF(bounds.left + 180f, bounds.top + 412f, bounds.left + 290f, bounds.top + 472f),
+                browserSortAscending,
+                fontSize = 40f,
+            )
+            button(
+                "browser_sort_descending", "↓",
+                RectF(bounds.left + 304f, bounds.top + 412f, bounds.left + 414f, bounds.top + 472f),
+                !browserSortAscending,
+                fontSize = 40f,
             )
         }
 
@@ -4293,47 +4389,6 @@ class PlayerActivity : Activity(), Player.Listener {
                     if (uiScreen == UiScreen.FILE_SEARCH_KEYBOARD) "Search" else "Done",
                     RectF(1148f, 885f, 1568f, 960f),
                     fontSize = 36f,
-                )
-            }
-            UiScreen.BROWSER_SORT -> {
-                canvas.drawRoundRect(300f, 100f, 1748f, 930f, 42f, 42f, panelPaint)
-                text("Sort files", 1024f, 205f, 64f)
-                button(
-                    "browser_sort_field_name", "Name",
-                    RectF(410f, 275f, 980f, 385f),
-                    browserSortField == BrowserSortField.NAME,
-                )
-                button(
-                    "browser_sort_field_date", "Date",
-                    RectF(1068f, 275f, 1638f, 385f),
-                    browserSortField == BrowserSortField.DATE,
-                )
-                button(
-                    "browser_sort_field_duration", "Duration",
-                    RectF(410f, 425f, 980f, 535f),
-                    browserSortField == BrowserSortField.DURATION,
-                )
-                button(
-                    "browser_sort_field_recent", "Recently played",
-                    RectF(1068f, 425f, 1638f, 535f),
-                    browserSortField == BrowserSortField.RECENT,
-                    fontSize = 34f,
-                )
-                text("Direction", 1024f, 620f, 35f, color = colorTextMuted)
-                button(
-                    "browser_sort_ascending", "Ascending",
-                    RectF(410f, 655f, 980f, 755f),
-                    browserSortAscending,
-                )
-                button(
-                    "browser_sort_descending", "Descending",
-                    RectF(1068f, 655f, 1638f, 755f),
-                    !browserSortAscending,
-                )
-                button(
-                    "browser_sort_back", "Back",
-                    RectF(750f, 810f, 1298f, 885f),
-                    fontSize = 32f,
                 )
             }
             UiScreen.PLAYBACK -> {
@@ -5016,6 +5071,13 @@ class PlayerActivity : Activity(), Player.Listener {
             }
         }
 
+        if (
+            browserSortPopoverOpen &&
+            (uiScreen == UiScreen.LOCAL_FILES || uiScreen == UiScreen.SMB_FILES)
+        ) {
+            browserSortPopover()
+        }
+
         transientMessage?.let {
             canvas.drawRoundRect(280f, 35f, 1768f, 115f, 24f, 24f,
                 Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(245, 91, 31, 39) })
@@ -5454,6 +5516,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val BROWSER_LIST_BOTTOM = 855f
         private const val BROWSER_LIST_LEFT = 170f
         private const val BROWSER_LIST_RIGHT = 1850f
+        private val BROWSER_SORT_POPOVER_BOUNDS = RectF(1378f, 164f, 1880f, 664f)
         private const val BROWSER_SCROLLBAR_ID = "browser_scrollbar"
         private const val BROWSER_SCROLLBAR_MIN_THUMB_HEIGHT = 65f
         private const val BROWSER_SCROLLBAR_HIT_PADDING = 26f
