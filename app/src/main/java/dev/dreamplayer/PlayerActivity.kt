@@ -79,6 +79,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var adaptiveToneMapEnabled = false
     private var adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
     private var adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
+    private var adaptiveToneMapPriority = DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY
     private var adaptiveToneMapMode = AdaptiveToneMapMode.SMOOTH
     private var renderResolutionScale = DEFAULT_RENDER_RESOLUTION_SCALE
     private var screenCurvature = DEFAULT_SCREEN_CURVATURE
@@ -461,6 +462,16 @@ class PlayerActivity : Activity(), Player.Listener {
             .getFloat(
                 PREF_ADAPTIVE_TONE_MAP_MAX_NITS,
                 DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS,
+            )
+        adaptiveToneMapPriority = picturePreferences
+            .getFloat(
+                PREF_ADAPTIVE_TONE_MAP_PRIORITY,
+                DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
+            )
+            .sanitized(
+                ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+                ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+                DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
             )
             .sanitized(
                 ADAPTIVE_TONE_MAP_NITS_MIN,
@@ -2879,6 +2890,13 @@ class PlayerActivity : Activity(), Player.Listener {
                             adaptiveToneMapMinNits = adaptiveToneMapMaxNits
                         }
                     }
+                    "tone_priority" -> {
+                        adaptiveToneMapPriority = lerp(
+                            ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+                            ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+                            fraction,
+                        )
+                    }
                     "scene" -> {
                         sceneBrightness = lerp(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, fraction)
                         if (persist) {
@@ -2916,9 +2934,12 @@ class PlayerActivity : Activity(), Player.Listener {
                         slider == "tone_peak" ||
                         slider == "adaptive_min" ||
                         slider == "adaptive_max" ||
+                        slider == "tone_priority" ||
                         slider == "resolution_scale"
                 val adaptiveSlider =
-                    slider == "adaptive_min" || slider == "adaptive_max"
+                    slider == "adaptive_min" ||
+                        slider == "adaptive_max" ||
+                        slider == "tone_priority"
                 if (cinemaSlider) {
                     applyCinemaSettings(persist)
                 } else if (adaptiveSlider) {
@@ -2962,6 +2983,9 @@ class PlayerActivity : Activity(), Player.Listener {
                         adaptiveToneMapMinNits =
                             adaptiveToneMapMinNits.coerceAtMost(adaptiveToneMapMaxNits)
                     }
+                    "tone_priority" -> {
+                        adaptiveToneMapPriority = DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY
+                    }
                     "manual_peak" -> {
                         hdrManualPeakNits = DEFAULT_HDR_SOURCE_PEAK_NITS
                         persistHdrMetadataSettings()
@@ -2990,7 +3014,11 @@ class PlayerActivity : Activity(), Player.Listener {
                         slider == "color_intensity"
                 if (slider == "manual_peak") {
                     applyVideoColorPipeline()
-                } else if (slider == "adaptive_min" || slider == "adaptive_max") {
+                } else if (
+                    slider == "adaptive_min" ||
+                    slider == "adaptive_max" ||
+                    slider == "tone_priority"
+                ) {
                     applyAdaptiveToneMapping()
                 } else if (cinemaSlider) {
                     applyCinemaSettings()
@@ -5034,7 +5062,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             adaptiveToneMapMinNits,
                             ADAPTIVE_TONE_MAP_NITS_MIN,
                             ADAPTIVE_TONE_MAP_NITS_MAX,
-                            292f,
+                            240f,
                         )
                         compactSettingsSlider(
                             "settings_slider_adaptive_max", "Range maximum",
@@ -5042,7 +5070,33 @@ class PlayerActivity : Activity(), Player.Listener {
                             adaptiveToneMapMaxNits,
                             ADAPTIVE_TONE_MAP_NITS_MIN,
                             ADAPTIVE_TONE_MAP_NITS_MAX,
-                            382f,
+                            305f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_tone_priority", "Tone priority",
+                            "%.0f%%".format(
+                                Locale.US,
+                                adaptiveToneMapPriority * 100f,
+                            ),
+                            adaptiveToneMapPriority,
+                            ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+                            ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+                            375f,
+                        )
+                        text(
+                            "Shadows",
+                            SETTINGS_SLIDER_LEFT, 412f, 17f,
+                            Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            "Current",
+                            (SETTINGS_SLIDER_LEFT + SETTINGS_SLIDER_RIGHT) / 2f,
+                            412f, 17f, Paint.Align.CENTER, colorTextMuted,
+                        )
+                        text(
+                            "Highlights",
+                            SETTINGS_SLIDER_RIGHT, 412f, 17f,
+                            Paint.Align.RIGHT, colorTextMuted,
                         )
                         text(
                             "Adaptation",
@@ -5070,7 +5124,7 @@ class PlayerActivity : Activity(), Player.Listener {
                         }
                         text(
                             effectiveLabel,
-                            975f, 555f, 22f, Paint.Align.LEFT, colorTextMuted,
+                            975f, 540f, 22f, Paint.Align.LEFT, colorTextMuted,
                         )
                         text(
                             if (adaptiveToneMapMode == AdaptiveToneMapMode.SMOOTH) {
@@ -5078,7 +5132,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             } else {
                                 "Cinema responds in 2–5 seconds; hard cuts still switch immediately."
                             },
-                            975f, 585f, 19f, Paint.Align.LEFT, colorTextMuted,
+                            975f, 570f, 19f, Paint.Align.LEFT, colorTextMuted,
                         )
                         button(
                             "adaptive_hdr_back", "Back",
@@ -5551,6 +5605,11 @@ class PlayerActivity : Activity(), Player.Listener {
             ADAPTIVE_TONE_MAP_NITS_MAX,
             DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS,
         )
+        adaptiveToneMapPriority = adaptiveToneMapPriority.sanitized(
+            ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+            ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+            DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
+        )
         if (adaptiveToneMapMinNits > adaptiveToneMapMaxNits) {
             adaptiveToneMapMinNits = adaptiveToneMapMaxNits
         }
@@ -5558,6 +5617,7 @@ class PlayerActivity : Activity(), Player.Listener {
             adaptiveToneMapEnabled,
             adaptiveToneMapMinNits,
             adaptiveToneMapMaxNits,
+            adaptiveToneMapPriority,
             adaptiveToneMapMode.wireValue,
         )
         if (persist) {
@@ -5565,6 +5625,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 .putBoolean(PREF_ADAPTIVE_TONE_MAP_ENABLED, adaptiveToneMapEnabled)
                 .putFloat(PREF_ADAPTIVE_TONE_MAP_MIN_NITS, adaptiveToneMapMinNits)
                 .putFloat(PREF_ADAPTIVE_TONE_MAP_MAX_NITS, adaptiveToneMapMaxNits)
+                .putFloat(PREF_ADAPTIVE_TONE_MAP_PRIORITY, adaptiveToneMapPriority)
                 .putInt(PREF_ADAPTIVE_TONE_MAP_MODE, adaptiveToneMapMode.wireValue)
                 .apply()
         }
@@ -5817,6 +5878,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
         private const val PREF_ADAPTIVE_TONE_MAP_MIN_NITS = "adaptive-tone-map-min-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_MAX_NITS = "adaptive-tone-map-max-nits"
+        private const val PREF_ADAPTIVE_TONE_MAP_PRIORITY = "adaptive-tone-map-priority"
         private const val PREF_ADAPTIVE_TONE_MAP_MODE = "adaptive-tone-map-mode"
         private const val PREF_ADAPTIVE_DEFAULT_RANGE_VERSION =
             "adaptive-default-range-version"
@@ -5836,6 +5898,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
         private const val DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS = 100f
         private const val DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS = 600f
+        private const val DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY = 0.5f
         private const val DEFAULT_RENDER_RESOLUTION_SCALE = 1f
         private const val DEFAULT_CINEMA_TONE_DEPTH = 0.22f
         private const val DEFAULT_PQ_CINEMA_TONE_DEPTH = 0f
@@ -5860,6 +5923,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
         private const val ADAPTIVE_TONE_MAP_NITS_MIN = 100f
         private const val ADAPTIVE_TONE_MAP_NITS_MAX = 1_000f
+        private const val ADAPTIVE_TONE_MAP_PRIORITY_MIN = 0f
+        private const val ADAPTIVE_TONE_MAP_PRIORITY_MAX = 1f
         private const val RENDER_RESOLUTION_SCALE_MIN = 1f
         private const val RENDER_RESOLUTION_SCALE_MAX = 1.6f
         private const val RENDER_RESOLUTION_SCALE_STEP = 0.05f
@@ -5937,6 +6002,7 @@ class PlayerActivity : Activity(), Player.Listener {
             enabled: Boolean,
             minimumNits: Float,
             maximumNits: Float,
+            priority: Float,
             mode: Int,
         )
         @JvmStatic private external fun nativeGetAdaptiveToneMapTarget(): Float

@@ -47,6 +47,9 @@ std::atomic<float> gToneMapPeakNits{100.0f};
 std::atomic<bool> gAdaptiveToneMapEnabled{false};
 std::atomic<float> gAdaptiveToneMapMinNits{100.0f};
 std::atomic<float> gAdaptiveToneMapMaxNits{600.0f};
+// 0 = favor shadow visibility, 0.5 = original adaptive algorithm,
+// 1 = favor highlight preservation.
+std::atomic<float> gAdaptiveToneMapPriority{0.5f};
 // 0 = Cinema (moderately responsive), 1 = Smooth (heavier temporal smoothing).
 std::atomic<int> gAdaptiveToneMapMode{1};
 std::atomic<float> gAdaptiveToneMapEffectiveNits{100.0f};
@@ -1751,6 +1754,7 @@ private:
                 fraction * static_cast<float>(sortedNits.size() - 1)));
             return sortedNits[std::min(index, sortedNits.size() - 1)];
         };
+        const float p50Nits = percentile(0.50f);
         const float p90Nits = percentile(0.90f);
         const float p99Nits = percentile(0.99f);
 
@@ -1758,10 +1762,33 @@ private:
         const float highlightScore =
             smoothstepLogNits(p99Nits, 250.0f, 1200.0f);
         const float averageScore = smoothstepLogNits(meanNits, 20.0f, 160.0f);
-        const float brightnessScore = std::clamp(
+        const float baseBrightnessScore = std::clamp(
             fieldScore * 0.50f +
                 highlightScore * 0.35f +
                 averageScore * 0.15f,
+            0.0f,
+            1.0f);
+        // Tone Priority should not globally behave like another exposure
+        // control. It becomes influential only when a dark foreground and a
+        // bright upper range coexist. At the 0.5 default the bias is exactly
+        // zero, preserving the original adaptive algorithm bit-for-bit.
+        const float contrastStops = std::log2(
+            (p90Nits + 1.0f) / (p50Nits + 1.0f));
+        float contrastStrength = std::clamp(
+            (contrastStops - 2.5f) / (6.0f - 2.5f),
+            0.0f,
+            1.0f);
+        contrastStrength =
+            contrastStrength * contrastStrength * (3.0f - 2.0f * contrastStrength);
+        const float darkForegroundStrength =
+            1.0f - smoothstepLogNits(p50Nits, 20.0f, 100.0f);
+        const float highContrastStrength =
+            contrastStrength * (0.40f + 0.60f * darkForegroundStrength);
+        const float priorityBias =
+            (gAdaptiveToneMapPriority.load() - 0.5f) * 2.0f;
+        const float brightnessScore = std::clamp(
+            baseBrightnessScore +
+                priorityBias * highContrastStrength * 0.30f,
             0.0f,
             1.0f);
         const float minimumTarget = gAdaptiveToneMapMinNits.load();
@@ -2344,13 +2371,15 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPictureSettings(
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetAdaptiveToneMapping(
     JNIEnv*, jclass, jboolean enabled, jfloat minimumNits,
-    jfloat maximumNits, jint mode) {
-    if (!std::isfinite(minimumNits) || !std::isfinite(maximumNits)) return;
+    jfloat maximumNits, jfloat priority, jint mode) {
+    if (!std::isfinite(minimumNits) || !std::isfinite(maximumNits) ||
+        !std::isfinite(priority)) return;
     float minimum = std::clamp(static_cast<float>(minimumNits), 50.0f, 5000.0f);
     float maximum = std::clamp(static_cast<float>(maximumNits), 50.0f, 5000.0f);
     if (minimum > maximum) std::swap(minimum, maximum);
     gAdaptiveToneMapMinNits.store(minimum);
     gAdaptiveToneMapMaxNits.store(maximum);
+    gAdaptiveToneMapPriority.store(std::clamp(static_cast<float>(priority), 0.0f, 1.0f));
     gAdaptiveToneMapMode.store(mode == 0 ? 0 : 1);
     gAdaptiveToneMapEnabled.store(enabled == JNI_TRUE);
     if (enabled != JNI_TRUE) {
@@ -2358,10 +2387,11 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetAdaptiveToneMapping(
     }
     gAdaptiveToneMapResetGeneration.fetch_add(1);
     LOGI(
-        "Adaptive HDR: %s, range %.0f-%.0f nits, response=%s",
+        "Adaptive HDR: %s, range %.0f-%.0f nits, priority=%.0f%%, response=%s",
         enabled == JNI_TRUE ? "on" : "off",
         minimum,
         maximum,
+        gAdaptiveToneMapPriority.load() * 100.0f,
         mode == 0 ? "Cinema" : "Smooth");
 }
 
