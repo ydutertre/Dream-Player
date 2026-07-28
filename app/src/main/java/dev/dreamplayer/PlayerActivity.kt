@@ -5089,7 +5089,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             Paint.Align.LEFT, colorTextMuted,
                         )
                         text(
-                            "Current",
+                            "Mid",
                             (SETTINGS_SLIDER_LEFT + SETTINGS_SLIDER_RIGHT) / 2f,
                             412f, 17f, Paint.Align.CENTER, colorTextMuted,
                         )
