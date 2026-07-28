@@ -76,6 +76,11 @@ class PlayerActivity : Activity(), Player.Listener {
     )
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
     private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
+    private var adaptiveToneMapEnabled = false
+    private var adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
+    private var adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
+    private var adaptiveToneMapPriority = DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY
+    private var adaptiveToneMapMode = AdaptiveToneMapMode.SMOOTH
     private var renderResolutionScale = DEFAULT_RENDER_RESOLUTION_SCALE
     private var screenCurvature = DEFAULT_SCREEN_CURVATURE
     private var detectedVideoTransfer = VideoTransfer.SDR
@@ -278,7 +283,8 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private enum class PlaybackPopover {
-        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE, RENDER_QUALITY,
+        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
+        ADAPTIVE_HDR, RENDER_QUALITY,
     }
 
     private enum class PictureMode(val wireValue: Int) {
@@ -340,6 +346,16 @@ class PlayerActivity : Activity(), Player.Listener {
         companion object {
             fun fromWire(value: Int): GamutMappingMode =
                 entries.firstOrNull { it.wireValue == value } ?: CLIP
+        }
+    }
+
+    private enum class AdaptiveToneMapMode(val wireValue: Int, val label: String) {
+        CINEMA(0, "Cinema"),
+        SMOOTH(1, "Smooth");
+
+        companion object {
+            fun fromWire(value: Int): AdaptiveToneMapMode =
+                entries.firstOrNull { it.wireValue == value } ?: SMOOTH
         }
     }
 
@@ -430,6 +446,69 @@ class PlayerActivity : Activity(), Player.Listener {
             .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
             .sanitized(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX, DEFAULT_TONE_MAP_PEAK_NITS)
         val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        adaptiveToneMapEnabled =
+            picturePreferences.getBoolean(PREF_ADAPTIVE_TONE_MAP_ENABLED, false)
+        adaptiveToneMapMinNits = picturePreferences
+            .getFloat(
+                PREF_ADAPTIVE_TONE_MAP_MIN_NITS,
+                DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS,
+            )
+            .sanitized(
+                ADAPTIVE_TONE_MAP_NITS_MIN,
+                ADAPTIVE_TONE_MAP_NITS_MAX,
+                DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS,
+            )
+        adaptiveToneMapMaxNits = picturePreferences
+            .getFloat(
+                PREF_ADAPTIVE_TONE_MAP_MAX_NITS,
+                DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS,
+            )
+        adaptiveToneMapPriority = picturePreferences
+            .getFloat(
+                PREF_ADAPTIVE_TONE_MAP_PRIORITY,
+                DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
+            )
+            .sanitized(
+                ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+                ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+                DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
+            )
+        if (
+            picturePreferences.getInt(PREF_ADAPTIVE_DEFAULT_RANGE_VERSION, 0) < 1
+        ) {
+            val migration = picturePreferences.edit()
+                .putInt(PREF_ADAPTIVE_DEFAULT_RANGE_VERSION, 1)
+            // Migrate only the original experimental default. Any range the
+            // user actually changed remains untouched.
+            if (
+                kotlin.math.abs(adaptiveToneMapMinNits - 300f) < 0.5f &&
+                kotlin.math.abs(adaptiveToneMapMaxNits - 500f) < 0.5f
+            ) {
+                adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
+                adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
+                migration
+                    .putFloat(
+                        PREF_ADAPTIVE_TONE_MAP_MIN_NITS,
+                        adaptiveToneMapMinNits,
+                    )
+                    .putFloat(
+                        PREF_ADAPTIVE_TONE_MAP_MAX_NITS,
+                        adaptiveToneMapMaxNits,
+                    )
+            }
+            migration.apply()
+        }
+        if (adaptiveToneMapMinNits > adaptiveToneMapMaxNits) {
+            adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
+            adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
+        }
+        adaptiveToneMapMode = AdaptiveToneMapMode.fromWire(
+            picturePreferences.getInt(
+                PREF_ADAPTIVE_TONE_MAP_MODE,
+                AdaptiveToneMapMode.SMOOTH.wireValue,
+            )
+        )
+        applyAdaptiveToneMapping(persist = false)
         renderResolutionScale = picturePreferences
             .getFloat(PREF_RENDER_RESOLUTION_SCALE, DEFAULT_RENDER_RESOLUTION_SCALE)
             .sanitized(
@@ -2232,6 +2311,7 @@ class PlayerActivity : Activity(), Player.Listener {
         PlaybackPopover.SETTINGS,
         PlaybackPopover.CINEMA,
         PlaybackPopover.COLOR_PIPELINE,
+        PlaybackPopover.ADAPTIVE_HDR,
         PlaybackPopover.RENDER_QUALITY -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
         PlaybackPopover.NONE -> null
     }
@@ -2556,6 +2636,30 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
+            id == "adaptive_hdr" -> {
+                playbackPopover = PlaybackPopover.ADAPTIVE_HDR
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "adaptive_hdr_back" -> {
+                playbackPopover = PlaybackPopover.SETTINGS
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "adaptive_hdr_off" || id == "adaptive_hdr_on" -> {
+                adaptiveToneMapEnabled = id == "adaptive_hdr_on"
+                applyAdaptiveToneMapping()
+                renderVrMenu()
+            }
+            id == "adaptive_hdr_cinema" || id == "adaptive_hdr_smooth" -> {
+                adaptiveToneMapMode = if (id == "adaptive_hdr_cinema") {
+                    AdaptiveToneMapMode.CINEMA
+                } else {
+                    AdaptiveToneMapMode.SMOOTH
+                }
+                applyAdaptiveToneMapping()
+                renderVrMenu()
+            }
             id == "render_quality" -> {
                 playbackPopover = PlaybackPopover.RENDER_QUALITY
                 hoveredButton = null
@@ -2761,6 +2865,33 @@ class PlayerActivity : Activity(), Player.Listener {
                                 .apply()
                         }
                     }
+                    "adaptive_min" -> {
+                        adaptiveToneMapMinNits = lerp(
+                            ADAPTIVE_TONE_MAP_NITS_MIN,
+                            ADAPTIVE_TONE_MAP_NITS_MAX,
+                            fraction,
+                        )
+                        if (adaptiveToneMapMinNits > adaptiveToneMapMaxNits) {
+                            adaptiveToneMapMaxNits = adaptiveToneMapMinNits
+                        }
+                    }
+                    "adaptive_max" -> {
+                        adaptiveToneMapMaxNits = lerp(
+                            ADAPTIVE_TONE_MAP_NITS_MIN,
+                            ADAPTIVE_TONE_MAP_NITS_MAX,
+                            fraction,
+                        )
+                        if (adaptiveToneMapMaxNits < adaptiveToneMapMinNits) {
+                            adaptiveToneMapMinNits = adaptiveToneMapMaxNits
+                        }
+                    }
+                    "tone_priority" -> {
+                        adaptiveToneMapPriority = lerp(
+                            ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+                            ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+                            fraction,
+                        )
+                    }
                     "scene" -> {
                         sceneBrightness = lerp(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, fraction)
                         if (persist) {
@@ -2796,9 +2927,18 @@ class PlayerActivity : Activity(), Player.Listener {
                 val globalOnlySlider =
                     slider == "scene" ||
                         slider == "tone_peak" ||
+                        slider == "adaptive_min" ||
+                        slider == "adaptive_max" ||
+                        slider == "tone_priority" ||
                         slider == "resolution_scale"
+                val adaptiveSlider =
+                    slider == "adaptive_min" ||
+                        slider == "adaptive_max" ||
+                        slider == "tone_priority"
                 if (cinemaSlider) {
                     applyCinemaSettings(persist)
+                } else if (adaptiveSlider) {
+                    applyAdaptiveToneMapping(persist)
                 } else if (slider == "resolution_scale") {
                     // The panel already explains that restart is required. Keep it open so
                     // the user can continue dragging or compare nearby scale values.
@@ -2828,6 +2968,19 @@ class PlayerActivity : Activity(), Player.Listener {
                             .putFloat(PREF_TONE_MAP_PEAK_NITS, toneMapPeakNits)
                             .apply()
                     }
+                    "adaptive_min" -> {
+                        adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
+                        adaptiveToneMapMaxNits =
+                            adaptiveToneMapMaxNits.coerceAtLeast(adaptiveToneMapMinNits)
+                    }
+                    "adaptive_max" -> {
+                        adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
+                        adaptiveToneMapMinNits =
+                            adaptiveToneMapMinNits.coerceAtMost(adaptiveToneMapMaxNits)
+                    }
+                    "tone_priority" -> {
+                        adaptiveToneMapPriority = DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY
+                    }
                     "manual_peak" -> {
                         hdrManualPeakNits = DEFAULT_HDR_SOURCE_PEAK_NITS
                         persistHdrMetadataSettings()
@@ -2856,6 +3009,12 @@ class PlayerActivity : Activity(), Player.Listener {
                         slider == "color_intensity"
                 if (slider == "manual_peak") {
                     applyVideoColorPipeline()
+                } else if (
+                    slider == "adaptive_min" ||
+                    slider == "adaptive_max" ||
+                    slider == "tone_priority"
+                ) {
+                    applyAdaptiveToneMapping()
                 } else if (cinemaSlider) {
                     applyCinemaSettings()
                 } else if (slider == "resolution_scale") {
@@ -4453,6 +4612,7 @@ class PlayerActivity : Activity(), Player.Listener {
                         playbackPopover == PlaybackPopover.SETTINGS ||
                         playbackPopover == PlaybackPopover.CINEMA ||
                         playbackPopover == PlaybackPopover.COLOR_PIPELINE ||
+                        playbackPopover == PlaybackPopover.ADAPTIVE_HDR ||
                         playbackPopover == PlaybackPopover.RENDER_QUALITY ||
                         pictureMode != PictureMode.AUTO ||
                         pictureBrightness != DEFAULT_PICTURE_BRIGHTNESS ||
@@ -4720,29 +4880,31 @@ class PlayerActivity : Activity(), Player.Listener {
                             SCENE_BRIGHTNESS_MAX,
                             566f,
                         )
-                        text(
-                            "Cinema \u2022 ${activeCinemaTransfer().label}",
-                            975f, 637f, 21f, Paint.Align.LEFT, colorTextMuted,
-                        )
                         button(
                             "cinema_tune", "Tune",
-                            RectF(975f, 605f, 1185f, 660f),
-                            fontSize = 19f,
+                            RectF(975f, 605f, 1137f, 660f),
+                            fontSize = 17f,
                         )
                         button(
                             "color_pipeline", "HDR / gamut",
-                            RectF(1195f, 605f, 1405f, 660f),
-                            fontSize = 18f,
+                            RectF(1147f, 605f, 1309f, 660f),
+                            fontSize = 16f,
+                        )
+                        button(
+                            "adaptive_hdr", "Adaptive HDR",
+                            RectF(1319f, 605f, 1481f, 660f),
+                            adaptiveToneMapEnabled,
+                            fontSize = 16f,
                         )
                         button(
                             "render_quality", "Resolution",
-                            RectF(1415f, 605f, 1635f, 660f),
-                            fontSize = 18f,
+                            RectF(1491f, 605f, 1653f, 660f),
+                            fontSize = 16f,
                         )
                         button(
                             "picture_reset", "Reset sliders",
-                            RectF(1645f, 605f, 1860f, 660f),
-                            fontSize = 19f,
+                            RectF(1663f, 605f, 1860f, 660f),
+                            fontSize = 16f,
                         )
                     }
                     PlaybackPopover.CINEMA -> {
@@ -4867,6 +5029,109 @@ class PlayerActivity : Activity(), Player.Listener {
                         button(
                             "color_pipeline_back", "Back",
                             RectF(1530f, 590f, 1860f, 650f),
+                            fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.ADAPTIVE_HDR -> {
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Adaptive HDR tone mapping", 1814f)
+                        text(
+                            "Optional scene analysis for HDR10 / PQ only",
+                            975f, 122f, 21f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "adaptive_hdr_off", "Off",
+                            RectF(1200f, 150f, 1515f, 212f),
+                            !adaptiveToneMapEnabled,
+                            fontSize = 22f,
+                        )
+                        button(
+                            "adaptive_hdr_on", "On",
+                            RectF(1525f, 150f, 1860f, 212f),
+                            adaptiveToneMapEnabled,
+                            fontSize = 22f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_adaptive_min", "Range minimum",
+                            "%.0f nits".format(Locale.US, adaptiveToneMapMinNits),
+                            adaptiveToneMapMinNits,
+                            ADAPTIVE_TONE_MAP_NITS_MIN,
+                            ADAPTIVE_TONE_MAP_NITS_MAX,
+                            240f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_adaptive_max", "Range maximum",
+                            "%.0f nits".format(Locale.US, adaptiveToneMapMaxNits),
+                            adaptiveToneMapMaxNits,
+                            ADAPTIVE_TONE_MAP_NITS_MIN,
+                            ADAPTIVE_TONE_MAP_NITS_MAX,
+                            305f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_tone_priority", "Tone priority",
+                            "%.0f%%".format(
+                                Locale.US,
+                                adaptiveToneMapPriority * 100f,
+                            ),
+                            adaptiveToneMapPriority,
+                            ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+                            ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+                            375f,
+                        )
+                        text(
+                            "Shadows",
+                            SETTINGS_SLIDER_LEFT, 412f, 17f,
+                            Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            "Mid",
+                            (SETTINGS_SLIDER_LEFT + SETTINGS_SLIDER_RIGHT) / 2f,
+                            412f, 17f, Paint.Align.CENTER, colorTextMuted,
+                        )
+                        text(
+                            "Highlights",
+                            SETTINGS_SLIDER_RIGHT, 412f, 17f,
+                            Paint.Align.RIGHT, colorTextMuted,
+                        )
+                        text(
+                            "Adaptation",
+                            975f, 475f, 24f, Paint.Align.LEFT,
+                        )
+                        button(
+                            "adaptive_hdr_cinema", "Cinema",
+                            RectF(1200f, 435f, 1515f, 500f),
+                            adaptiveToneMapMode == AdaptiveToneMapMode.CINEMA,
+                            fontSize = 21f,
+                        )
+                        button(
+                            "adaptive_hdr_smooth", "Smooth",
+                            RectF(1525f, 435f, 1860f, 500f),
+                            adaptiveToneMapMode == AdaptiveToneMapMode.SMOOTH,
+                            fontSize = 21f,
+                        )
+                        val effectiveLabel = when {
+                            !adaptiveToneMapEnabled ->
+                                "Effective target: static ${toneMapPeakNits.toInt()} nits"
+                            activeCinemaTransfer() != VideoTransfer.PQ ->
+                                "Effective target: waiting for HDR10 / PQ"
+                            else ->
+                                "Effective target: ${nativeGetAdaptiveToneMapTarget().toInt()} nits"
+                        }
+                        text(
+                            effectiveLabel,
+                            975f, 540f, 22f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        text(
+                            if (adaptiveToneMapMode == AdaptiveToneMapMode.SMOOTH) {
+                                "Smooth uses heavier 4–8 second within-shot averaging."
+                            } else {
+                                "Cinema responds in 2–5 seconds; hard cuts still switch immediately."
+                            },
+                            975f, 570f, 19f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "adaptive_hdr_back", "Back",
+                            RectF(1530f, 605f, 1860f, 655f),
                             fontSize = 22f,
                         )
                     }
@@ -5324,6 +5589,43 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
+    private fun applyAdaptiveToneMapping(persist: Boolean = true) {
+        adaptiveToneMapMinNits = adaptiveToneMapMinNits.sanitized(
+            ADAPTIVE_TONE_MAP_NITS_MIN,
+            ADAPTIVE_TONE_MAP_NITS_MAX,
+            DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS,
+        )
+        adaptiveToneMapMaxNits = adaptiveToneMapMaxNits.sanitized(
+            ADAPTIVE_TONE_MAP_NITS_MIN,
+            ADAPTIVE_TONE_MAP_NITS_MAX,
+            DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS,
+        )
+        adaptiveToneMapPriority = adaptiveToneMapPriority.sanitized(
+            ADAPTIVE_TONE_MAP_PRIORITY_MIN,
+            ADAPTIVE_TONE_MAP_PRIORITY_MAX,
+            DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY,
+        )
+        if (adaptiveToneMapMinNits > adaptiveToneMapMaxNits) {
+            adaptiveToneMapMinNits = adaptiveToneMapMaxNits
+        }
+        nativeSetAdaptiveToneMapping(
+            adaptiveToneMapEnabled,
+            adaptiveToneMapMinNits,
+            adaptiveToneMapMaxNits,
+            adaptiveToneMapPriority,
+            adaptiveToneMapMode.wireValue,
+        )
+        if (persist) {
+            getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(PREF_ADAPTIVE_TONE_MAP_ENABLED, adaptiveToneMapEnabled)
+                .putFloat(PREF_ADAPTIVE_TONE_MAP_MIN_NITS, adaptiveToneMapMinNits)
+                .putFloat(PREF_ADAPTIVE_TONE_MAP_MAX_NITS, adaptiveToneMapMaxNits)
+                .putFloat(PREF_ADAPTIVE_TONE_MAP_PRIORITY, adaptiveToneMapPriority)
+                .putInt(PREF_ADAPTIVE_TONE_MAP_MODE, adaptiveToneMapMode.wireValue)
+                .apply()
+        }
+    }
+
     private fun activeCinemaTransfer(): VideoTransfer = when (pictureMode) {
         PictureMode.FORCE_SDR -> VideoTransfer.SDR
         PictureMode.FORCE_PQ -> VideoTransfer.PQ
@@ -5568,6 +5870,13 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_BROWSER_SORT_ASCENDING = "sort-ascending"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
+        private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
+        private const val PREF_ADAPTIVE_TONE_MAP_MIN_NITS = "adaptive-tone-map-min-nits"
+        private const val PREF_ADAPTIVE_TONE_MAP_MAX_NITS = "adaptive-tone-map-max-nits"
+        private const val PREF_ADAPTIVE_TONE_MAP_PRIORITY = "adaptive-tone-map-priority"
+        private const val PREF_ADAPTIVE_TONE_MAP_MODE = "adaptive-tone-map-mode"
+        private const val PREF_ADAPTIVE_DEFAULT_RANGE_VERSION =
+            "adaptive-default-range-version"
         private const val PREF_RENDER_RESOLUTION_SCALE = "render-resolution-scale"
         private const val PREF_GAMUT_MAPPING_MODE = "gamut-mapping-mode"
         // Legacy single-profile keys are retained only to migrate existing tuning.
@@ -5582,6 +5891,9 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
         private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
+        private const val DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS = 100f
+        private const val DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS = 600f
+        private const val DEFAULT_ADAPTIVE_TONE_MAP_PRIORITY = 0.5f
         private const val DEFAULT_RENDER_RESOLUTION_SCALE = 1f
         private const val DEFAULT_CINEMA_TONE_DEPTH = 0.22f
         private const val DEFAULT_PQ_CINEMA_TONE_DEPTH = 0f
@@ -5604,6 +5916,10 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val SCENE_BRIGHTNESS_MAX = 1f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
+        private const val ADAPTIVE_TONE_MAP_NITS_MIN = 100f
+        private const val ADAPTIVE_TONE_MAP_NITS_MAX = 1_000f
+        private const val ADAPTIVE_TONE_MAP_PRIORITY_MIN = 0f
+        private const val ADAPTIVE_TONE_MAP_PRIORITY_MAX = 1f
         private const val RENDER_RESOLUTION_SCALE_MIN = 1f
         private const val RENDER_RESOLUTION_SCALE_MAX = 1.6f
         private const val RENDER_RESOLUTION_SCALE_STEP = 0.05f
@@ -5677,6 +5993,14 @@ class PlayerActivity : Activity(), Player.Listener {
             toneMapPeakNits: Float,
             sceneBrightness: Float,
         )
+        @JvmStatic private external fun nativeSetAdaptiveToneMapping(
+            enabled: Boolean,
+            minimumNits: Float,
+            maximumNits: Float,
+            priority: Float,
+            mode: Int,
+        )
+        @JvmStatic private external fun nativeGetAdaptiveToneMapTarget(): Float
         @JvmStatic private external fun nativeSetVideoColorInfo(
             transfer: Int,
             primaries: Int,
