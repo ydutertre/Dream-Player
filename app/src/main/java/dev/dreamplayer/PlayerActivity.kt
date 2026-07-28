@@ -167,11 +167,20 @@ class PlayerActivity : Activity(), Player.Listener {
     private var smbPath = ""
     private var smbShareListScrollOffset = 0f
     private val smbNavigationStack = ArrayDeque<SmbNavigationState>()
+    private var sftpProfiles: List<SftpProfile> = emptyList()
+    private var sftpProfile = SftpProfile()
+    private var sftpPortDraft = SftpProfile.DEFAULT_PORT.toString()
+    private var sftpEntries: List<SftpEntry> = emptyList()
+    private var sftpPath = "."
+    private var sftpProfileListScrollOffset = 0f
+    private val sftpNavigationStack = ArrayDeque<SftpNavigationState>()
+    private var pendingSftpHostKey: SftpHostKeyException? = null
     private var menuBitmap: Bitmap? = null
     private var keyboardField = KeyboardField.HOST
     private var keyboardSymbols = false
     private var keyboardUppercase = false
     private lateinit var smbCredentialStore: SmbCredentialStore
+    private lateinit var sftpProfileStore: SftpProfileStore
     private lateinit var mediaStateStore: MediaStateStore
     private var rememberSmbCredentials = false
     private var playbackBrowserReturn: BrowserReturnState? = null
@@ -278,6 +287,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class UiScreen {
         LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
         SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
+        SFTP_PROFILES, SFTP_LOGIN, SFTP_TRUST, SFTP_FILES, SFTP_KEYBOARD,
+        SFTP_DELETE_CONFIRM,
         FILE_SEARCH_KEYBOARD,
         PLAYBACK, PROJECTION, PICTURE, DECODER, AUDIO_SYNC, AUDIO_TRACKS, SUBTITLES,
     }
@@ -370,7 +381,11 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
-    private enum class KeyboardField { HOST, USERNAME, PASSWORD, DOMAIN, SEARCH }
+    private enum class KeyboardField {
+        HOST, USERNAME, PASSWORD, DOMAIN, SEARCH,
+        SFTP_NAME, SFTP_HOST, SFTP_PORT, SFTP_USERNAME, SFTP_PASSWORD,
+        SFTP_PATH,
+    }
 
     private enum class BrowserSortField(val label: String) {
         NAME("Name"),
@@ -438,6 +453,8 @@ class PlayerActivity : Activity(), Player.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         smbCredentialStore = SmbCredentialStore(this)
+        sftpProfileStore = SftpProfileStore(this)
+        sftpProfiles = sftpProfileStore.load()
         mediaStateStore = MediaStateStore(this)
         sceneBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
@@ -799,7 +816,9 @@ class PlayerActivity : Activity(), Player.Listener {
         UiScreen.LOCAL_FILES,
         UiScreen.SMB_SERVERS,
         UiScreen.SMB_SHARES,
-        UiScreen.SMB_FILES -> true
+        UiScreen.SMB_FILES,
+        UiScreen.SFTP_PROFILES,
+        UiScreen.SFTP_FILES -> true
         else -> false
     }
 
@@ -924,6 +943,8 @@ class PlayerActivity : Activity(), Player.Listener {
         UiScreen.SMB_SERVERS -> smbServers.size
         UiScreen.SMB_SHARES -> smbShares.size
         UiScreen.SMB_FILES -> smbBrowserItems.size
+        UiScreen.SFTP_PROFILES -> sftpProfiles.size
+        UiScreen.SFTP_FILES -> sftpEntries.size
         else -> 0
     }
 
@@ -1804,6 +1825,148 @@ class PlayerActivity : Activity(), Player.Listener {
         }.take(100)
     }
 
+    private fun showSftpProfiles() {
+        sftpProfiles = sftpProfileStore.load()
+        uiScreen = UiScreen.SFTP_PROFILES
+        browserScrollOffset = sftpProfileListScrollOffset
+        transientMessage = null
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun showSftpLogin(
+        profile: SftpProfile = SftpProfile(),
+        errorMessage: String? = null,
+    ) {
+        sftpProfile = profile
+        sftpPortDraft = profile.port.toString()
+        pendingSftpHostKey = null
+        uiScreen = UiScreen.SFTP_LOGIN
+        transientMessage = errorMessage
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun persistSftpProfile(profile: SftpProfile) {
+        val normalized = profile.normalized()
+        sftpProfiles = (
+            sftpProfiles.filterNot { it.id == normalized.id } + normalized
+        ).sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName })
+        sftpProfileStore.save(sftpProfiles)
+    }
+
+    private fun connectSftp() {
+        val profile = sftpProfile.normalized()
+        when {
+            profile.host.isBlank() -> {
+                transientMessage = "Enter an SFTP hostname or IP address"
+                renderVrMenu()
+                return
+            }
+            profile.username.isBlank() -> {
+                transientMessage = "Enter an SFTP username"
+                renderVrMenu()
+                return
+            }
+            profile.password.isBlank() -> {
+                transientMessage = "Enter the SFTP password"
+                renderVrMenu()
+                return
+            }
+        }
+        sftpProfile = profile
+        transientMessage = "Connecting securely to ${profile.host}..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                SftpRepository(profile).use { repository ->
+                    val root = repository.canonicalize(profile.startPath)
+                    root to repository.list(root)
+                        .filter { it.isDirectory || isVideoFile(it.name) }
+                }
+            }.onSuccess { (root, entries) -> runOnUiThread {
+                sftpPath = root
+                sftpEntries = entries
+                sftpNavigationStack.clear()
+                browserScrollOffset = 0f
+                pendingSftpHostKey = null
+                persistSftpProfile(profile)
+                transientMessage = null
+                uiScreen = UiScreen.SFTP_FILES
+                hoveredButton = null
+                renderVrMenu()
+            } }.onFailure { error -> runOnUiThread {
+                val hostKeyError = generateSequence(error) { it.cause }
+                    .filterIsInstance<SftpHostKeyException>()
+                    .firstOrNull()
+                if (hostKeyError != null) {
+                    pendingSftpHostKey = hostKeyError
+                    transientMessage = null
+                    uiScreen = UiScreen.SFTP_TRUST
+                    hoveredButton = null
+                    renderVrMenu()
+                } else {
+                    transientMessage =
+                        "SFTP connection failed: ${friendlySftpError(error)}"
+                    uiScreen = UiScreen.SFTP_LOGIN
+                    renderVrMenu()
+                }
+            } }
+        }
+    }
+
+    private fun browseSftp(
+        path: String,
+        restoreScrollOffset: Float = 0f,
+        rollbackNavigationOnFailure: Boolean = false,
+    ) {
+        val profile = sftpProfile
+        transientMessage = "Loading $path..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                SftpRepository(profile).use { repository ->
+                    repository.list(path)
+                        .filter { it.isDirectory || isVideoFile(it.name) }
+                }
+            }.onSuccess { entries -> runOnUiThread {
+                sftpPath = path
+                sftpEntries = entries
+                browserScrollOffset = restoreScrollOffset
+                transientMessage = null
+                uiScreen = UiScreen.SFTP_FILES
+                hoveredButton = null
+                renderVrMenu()
+            } }.onFailure { error -> runOnUiThread {
+                if (
+                    rollbackNavigationOnFailure &&
+                    sftpNavigationStack.isNotEmpty()
+                ) {
+                    sftpNavigationStack.removeLast()
+                }
+                transientMessage =
+                    "SFTP folder error: ${friendlySftpError(error)}"
+                renderVrMenu()
+            } }
+        }
+    }
+
+    private fun friendlySftpError(error: Throwable): String {
+        val chain = generateSequence(error) { it.cause }.toList()
+        val message = chain.mapNotNull { it.message }
+            .firstOrNull { it.isNotBlank() }
+            .orEmpty()
+        return when {
+            message.contains("auth", true) ||
+                message.contains("permission", true) -> "check username and password"
+            message.contains("timed out", true) ||
+                message.contains("connect", true) -> "server did not respond"
+            message.contains("refused", true) -> "connection was refused"
+            message.contains("no such file", true) -> "start folder was not found"
+            else -> message.ifBlank { error.javaClass.simpleName }
+        }.replace('\n', ' ').take(120)
+    }
+
     private fun isVideoFile(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in setOf(
         "mkv", "mp4", "m4v", "mov", "avi", "webm", "ts", "m2ts", "mts", "mpg", "mpeg", "wmv",
     )
@@ -2375,6 +2538,124 @@ class PlayerActivity : Activity(), Player.Listener {
                 playRecent(id.removePrefix("recent_").toInt())
             id == "open_local" -> openLocalBrowser()
             id == "open_smb" -> discoverSmbServers()
+            id == "open_sftp" -> showSftpProfiles()
+            id == "sftp_profiles_back" -> {
+                sftpProfileListScrollOffset = browserScrollOffset
+                showLibrary()
+            }
+            id == "sftp_add_profile" -> showSftpLogin()
+            id.startsWith("sftp_profile_") -> {
+                sftpProfileListScrollOffset = browserScrollOffset
+                val profile =
+                    sftpProfiles[id.removePrefix("sftp_profile_").toInt()]
+                if (profile.password.isBlank()) {
+                    showSftpLogin(
+                        profile,
+                        "Enter the password to connect",
+                    )
+                } else {
+                    sftpProfile = profile
+                    connectSftp()
+                }
+            }
+            id.startsWith("sftp_edit_") -> {
+                sftpProfileListScrollOffset = browserScrollOffset
+                showSftpLogin(
+                    sftpProfiles[id.removePrefix("sftp_edit_").toInt()]
+                )
+            }
+            id.startsWith("sftp_field_") -> {
+                keyboardField = when (id.removePrefix("sftp_field_")) {
+                    "name" -> KeyboardField.SFTP_NAME
+                    "port" -> KeyboardField.SFTP_PORT
+                    "user" -> KeyboardField.SFTP_USERNAME
+                    "password" -> KeyboardField.SFTP_PASSWORD
+                    "path" -> KeyboardField.SFTP_PATH
+                    else -> KeyboardField.SFTP_HOST
+                }
+                keyboardSymbols = false
+                keyboardUppercase = false
+                uiScreen = UiScreen.SFTP_KEYBOARD
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_remember_password" -> {
+                sftpProfile = sftpProfile.copy(
+                    rememberPassword = !sftpProfile.rememberPassword,
+                )
+                renderVrMenu()
+            }
+            id == "sftp_connect" -> connectSftp()
+            id == "sftp_login_back" -> showSftpProfiles()
+            id == "sftp_delete" -> {
+                uiScreen = UiScreen.SFTP_DELETE_CONFIRM
+                transientMessage = null
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_delete_cancel" -> {
+                uiScreen = UiScreen.SFTP_LOGIN
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_delete_confirm" -> {
+                sftpProfiles =
+                    sftpProfiles.filterNot { it.id == sftpProfile.id }
+                sftpProfileStore.save(sftpProfiles)
+                showSftpProfiles()
+            }
+            id == "sftp_trust_cancel" -> {
+                pendingSftpHostKey = null
+                uiScreen = UiScreen.SFTP_LOGIN
+                transientMessage = "Server identity was not trusted"
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_trust_accept" -> {
+                val pending = pendingSftpHostKey
+                if (pending != null) {
+                    sftpProfile = sftpProfile.copy(
+                        hostKeyFingerprint = pending.actualFingerprint,
+                    )
+                    pendingSftpHostKey = null
+                    connectSftp()
+                }
+            }
+            id == "sftp_files_back" -> {
+                val parent = if (sftpNavigationStack.isEmpty()) null
+                else sftpNavigationStack.removeLast()
+                if (parent != null) {
+                    sftpPath = parent.path
+                    sftpEntries = parent.entries
+                    browserScrollOffset = parent.scrollOffset
+                    transientMessage = null
+                    hoveredButton = null
+                    renderVrMenu()
+                } else {
+                    showSftpProfiles()
+                }
+            }
+            id.startsWith("sftp_entry_") -> {
+                val entry =
+                    sftpEntries[id.removePrefix("sftp_entry_").toInt()]
+                if (entry.isDirectory) {
+                    sftpNavigationStack.addLast(
+                        SftpNavigationState(
+                            sftpPath,
+                            sftpEntries.toList(),
+                            browserScrollOffset,
+                        )
+                    )
+                    browseSftp(
+                        entry.path,
+                        rollbackNavigationOnFailure = true,
+                    )
+                } else {
+                    transientMessage =
+                        "SFTP playback is coming in the next milestone"
+                    renderVrMenu()
+                }
+            }
             id == "smb_add_server" -> showSmbLogin("", "")
             id == "smb_discover_again" -> discoverSmbServers()
             id == "smb_servers_back" -> showLibrary()
@@ -2497,6 +2778,8 @@ class PlayerActivity : Activity(), Player.Listener {
                     rebuildBrowserItems()
                     browserScrollOffset = 0f
                     uiScreen = browserSearchReturnScreen
+                } else if (uiScreen == UiScreen.SFTP_KEYBOARD) {
+                    uiScreen = UiScreen.SFTP_LOGIN
                 } else {
                     uiScreen = UiScreen.SMB_LOGIN
                 }
@@ -2506,6 +2789,8 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "key_cancel" -> {
                 uiScreen = if (uiScreen == UiScreen.FILE_SEARCH_KEYBOARD) {
                     browserSearchReturnScreen
+                } else if (uiScreen == UiScreen.SFTP_KEYBOARD) {
+                    UiScreen.SFTP_LOGIN
                 } else {
                     UiScreen.SMB_LOGIN
                 }
@@ -2514,7 +2799,14 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             id.startsWith("key_char_") -> {
                 val character = id.removePrefix("key_char_").toInt().toChar()
-                if (keyboardValue().length < 64) setKeyboardValue(keyboardValue() + character)
+                val maximumLength = when (keyboardField) {
+                    KeyboardField.SFTP_PATH,
+                    KeyboardField.SFTP_PASSWORD -> 256
+                    else -> 64
+                }
+                if (keyboardValue().length < maximumLength) {
+                    setKeyboardValue(keyboardValue() + character)
+                }
                 renderVrMenu()
             }
             id == "exit" -> finish()
@@ -3168,6 +3460,12 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.PASSWORD -> smbCredentials.password
         KeyboardField.DOMAIN -> smbCredentials.domain
         KeyboardField.SEARCH -> browserSearchDraft
+        KeyboardField.SFTP_NAME -> sftpProfile.name
+        KeyboardField.SFTP_HOST -> sftpProfile.host
+        KeyboardField.SFTP_PORT -> sftpPortDraft
+        KeyboardField.SFTP_USERNAME -> sftpProfile.username
+        KeyboardField.SFTP_PASSWORD -> sftpProfile.password
+        KeyboardField.SFTP_PATH -> sftpProfile.startPath
     }
 
     private fun setKeyboardValue(value: String) {
@@ -3180,6 +3478,45 @@ class PlayerActivity : Activity(), Player.Listener {
                 browserSearchDraft = value
                 smbCredentials
             }
+            else -> smbCredentials
+        }
+        sftpProfile = when (keyboardField) {
+            KeyboardField.SFTP_NAME -> sftpProfile.copy(name = value)
+            KeyboardField.SFTP_HOST -> sftpProfile.copy(
+                host = value,
+                hostKeyFingerprint = if (
+                    value.trim().equals(
+                        sftpProfile.host.trim(),
+                        ignoreCase = true,
+                    )
+                ) {
+                    sftpProfile.hostKeyFingerprint
+                } else {
+                    ""
+                },
+            )
+            KeyboardField.SFTP_PORT -> {
+                sftpPortDraft = value.filter(Char::isDigit).take(5)
+                val adjustedPort = sftpPortDraft.toIntOrNull()
+                    ?.coerceIn(1, 65_535)
+                    ?: sftpProfile.port
+                sftpProfile.copy(
+                    port = adjustedPort,
+                    hostKeyFingerprint = if (
+                        adjustedPort == sftpProfile.port
+                    ) {
+                        sftpProfile.hostKeyFingerprint
+                    } else {
+                        ""
+                    },
+                )
+            }
+            KeyboardField.SFTP_USERNAME ->
+                sftpProfile.copy(username = value)
+            KeyboardField.SFTP_PASSWORD ->
+                sftpProfile.copy(password = value)
+            KeyboardField.SFTP_PATH -> sftpProfile.copy(startPath = value)
+            else -> sftpProfile
         }
     }
 
@@ -3189,6 +3526,12 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.PASSWORD -> "Password"
         KeyboardField.DOMAIN -> "Domain (usually blank)"
         KeyboardField.SEARCH -> "Search file names"
+        KeyboardField.SFTP_NAME -> "Profile name"
+        KeyboardField.SFTP_HOST -> "SFTP hostname or IP"
+        KeyboardField.SFTP_PORT -> "SFTP port"
+        KeyboardField.SFTP_USERNAME -> "SFTP username"
+        KeyboardField.SFTP_PASSWORD -> "SFTP password"
+        KeyboardField.SFTP_PATH -> "Starting folder"
     }
 
     private fun renderSubtitle(lines: List<String>): Bitmap {
@@ -4357,16 +4700,17 @@ class PlayerActivity : Activity(), Player.Listener {
                 canvas.drawRoundRect(885f, 60f, 1958f, 955f, 42f, 42f, panelPaint)
                 text("Dream Player", 468f, 190f, 76f)
                 text("Choose a source", 468f, 252f, 36f, color = colorTextMuted)
-                button("open_local", "Local video library", RectF(155f, 330f, 780f, 465f), fontSize = 42f)
-                button("open_smb", "Network shares (SMB)", RectF(155f, 505f, 780f, 640f), fontSize = 42f)
+                button("open_local", "Local video library", RectF(155f, 295f, 780f, 405f), fontSize = 38f)
+                button("open_smb", "Network shares (SMB)", RectF(155f, 435f, 780f, 545f), fontSize = 38f)
+                button("open_sftp", "Internet server (SFTP)", RectF(155f, 575f, 780f, 685f), fontSize = 38f)
                 text(
                     "Browse without leaving VR.",
                     468f,
-                    715f,
+                    750f,
                     29f,
                     color = colorTextMuted,
                 )
-                button("exit", "Exit", RectF(265f, 795f, 670f, 895f), fontSize = 38f)
+                button("exit", "Exit", RectF(265f, 825f, 670f, 910f), fontSize = 36f)
 
                 text("Recently played", 1422f, 145f, 50f)
                 if (recentMedia.isEmpty()) {
@@ -4510,12 +4854,196 @@ class PlayerActivity : Activity(), Player.Listener {
                 button("smb_files_back", "Up", RectF(250f, 885f, 570f, 950f), fontSize = 36f)
                 text("${smbBrowserItems.size} items  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
             }
+            UiScreen.SFTP_PROFILES -> {
+                canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
+                text("SFTP servers", 1024f, 135f, 64f)
+                scrollableList(sftpProfiles.size, 90f, 72f) { index, bounds ->
+                    val profile = sftpProfiles[index]
+                    browserEntryButton(
+                        "sftp_profile_$index",
+                        profile.displayName,
+                        "${profile.username}@${profile.host}:${profile.port}",
+                        RectF(250f, bounds.top, 1580f, bounds.bottom),
+                        true,
+                    )
+                    button(
+                        "sftp_edit_$index", "Edit",
+                        RectF(1600f, bounds.top, 1810f, bounds.bottom),
+                        fontSize = 28f,
+                    )
+                }
+                if (sftpProfiles.isEmpty()) {
+                    text("No SFTP servers saved yet.", 1024f, 440f, 44f)
+                    text(
+                        "Add a server to browse it securely over the Internet.",
+                        1024f, 500f, 27f, color = colorTextMuted,
+                    )
+                }
+                button(
+                    "sftp_profiles_back", "Back",
+                    RectF(250f, 885f, 570f, 950f), fontSize = 36f,
+                )
+                button(
+                    "sftp_add_profile", "Add server",
+                    RectF(620f, 885f, 1010f, 950f), fontSize = 36f,
+                )
+                text(
+                    "${sftpProfiles.size} servers  •  Joystick ↑/↓ to scroll",
+                    1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted,
+                )
+            }
+            UiScreen.SFTP_LOGIN -> {
+                canvas.drawRoundRect(170f, 35f, 1878f, 990f, 42f, 42f, panelPaint)
+                text("SFTP server profile", 1024f, 105f, 56f)
+                fun field(
+                    id: String,
+                    label: String,
+                    value: String,
+                    top: Float,
+                    secret: Boolean = false,
+                ) {
+                    text(label, 310f, top + 51f, 30f, Paint.Align.LEFT)
+                    val shown = if (secret && value.isNotEmpty()) {
+                        "•".repeat(value.length.coerceAtMost(24))
+                    } else {
+                        value.ifBlank { "Select to enter" }
+                    }
+                    button(
+                        "sftp_field_$id", shown.take(42),
+                        RectF(665f, top, 1710f, top + 70f),
+                        fontSize = 31f,
+                    )
+                }
+                field("name", "Profile name", sftpProfile.name, 135f)
+                field("host", "Host", sftpProfile.host, 225f)
+                field("port", "Port", sftpPortDraft, 315f)
+                field("user", "Username", sftpProfile.username, 405f)
+                field("password", "Password", sftpProfile.password, 495f, true)
+                field("path", "Start folder", sftpProfile.startPath, 585f)
+                checkbox(
+                    "sftp_remember_password",
+                    "Remember password securely",
+                    RectF(560f, 680f, 1488f, 742f),
+                    sftpProfile.rememberPassword,
+                )
+                if (sftpProfiles.any { it.id == sftpProfile.id }) {
+                    button(
+                        "sftp_delete", "Delete",
+                        RectF(260f, 805f, 540f, 895f), fontSize = 32f,
+                    )
+                }
+                button(
+                    "sftp_login_back", "Back",
+                    RectF(600f, 805f, 940f, 895f), fontSize = 34f,
+                )
+                button(
+                    "sftp_connect", "Save & browse",
+                    RectF(980f, 805f, 1690f, 895f), fontSize = 34f,
+                )
+                text(
+                    "The SSH server fingerprint is verified before your password is sent.",
+                    1024f, 945f, 22f, color = colorTextMuted,
+                )
+            }
+            UiScreen.SFTP_TRUST -> {
+                val pending = pendingSftpHostKey
+                val changed = pending is SftpHostKeyException.Changed
+                canvas.drawRoundRect(240f, 90f, 1808f, 930f, 42f, 42f, panelPaint)
+                text(
+                    if (changed) "Warning: server identity changed" else "Verify SFTP server",
+                    1024f, 190f, 55f,
+                    color = if (changed) Color.rgb(255, 150, 150) else colorText,
+                )
+                text(
+                    if (changed) {
+                        "Continue only if you intentionally changed the server key."
+                    } else {
+                        "Confirm this fingerprint matches the one shown by your server."
+                    },
+                    1024f, 270f, 27f, color = colorTextMuted,
+                )
+                text(
+                    "${sftpProfile.host}:${sftpProfile.port}",
+                    1024f, 350f, 34f,
+                )
+                text(
+                    pending?.algorithm.orEmpty(),
+                    1024f, 405f, 24f, color = colorTextMuted,
+                )
+                val fingerprint = pending?.actualFingerprint.orEmpty()
+                text(fingerprint.take(36), 1024f, 495f, 32f)
+                text(fingerprint.drop(36), 1024f, 545f, 32f)
+                button(
+                    "sftp_trust_cancel", "Cancel",
+                    RectF(390f, 700f, 900f, 815f), fontSize = 36f,
+                )
+                button(
+                    "sftp_trust_accept",
+                    if (changed) "Trust new key" else "Trust & connect",
+                    RectF(950f, 700f, 1658f, 815f), fontSize = 36f,
+                )
+            }
+            UiScreen.SFTP_DELETE_CONFIRM -> {
+                canvas.drawRoundRect(310f, 160f, 1738f, 850f, 42f, 42f, panelPaint)
+                text("Delete SFTP profile?", 1024f, 285f, 62f)
+                text(sftpProfile.displayName, 1024f, 385f, 40f)
+                text(
+                    "This removes the saved server details and credentials.",
+                    1024f, 465f, 27f, color = colorTextMuted,
+                )
+                button(
+                    "sftp_delete_cancel", "Cancel",
+                    RectF(430f, 625f, 920f, 745f), fontSize = 38f,
+                )
+                button(
+                    "sftp_delete_confirm", "Delete",
+                    RectF(970f, 625f, 1618f, 745f), fontSize = 38f,
+                )
+            }
+            UiScreen.SFTP_FILES -> {
+                canvas.drawRoundRect(120f, 55f, 1928f, 975f, 42f, 42f, panelPaint)
+                text(
+                    "${sftpProfile.displayName}  /  ${sftpPath.takeLast(42)}",
+                    170f, 128f, 38f, Paint.Align.LEFT,
+                )
+                scrollableList(sftpEntries.size, 92f, 75f) { index, bounds ->
+                    val entry = sftpEntries[index]
+                    browserEntryButton(
+                        "sftp_entry_$index", entry.name,
+                        if (entry.isDirectory) "" else formatBytes(entry.size),
+                        RectF(210f, bounds.top, 1838f, bounds.bottom),
+                        entry.isDirectory,
+                    )
+                }
+                if (sftpEntries.isEmpty()) {
+                    text(
+                        "No video files or folders found.",
+                        1024f, 450f, 42f,
+                    )
+                }
+                button(
+                    "sftp_files_back", "Up",
+                    RectF(250f, 885f, 570f, 950f), fontSize = 36f,
+                )
+                text(
+                    "${sftpEntries.size} items  •  Joystick ↑/↓ to scroll",
+                    1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted,
+                )
+            }
             UiScreen.SMB_KEYBOARD,
+            UiScreen.SFTP_KEYBOARD,
             UiScreen.FILE_SEARCH_KEYBOARD -> {
                 canvas.drawRoundRect(95f, 35f, 1953f, 995f, 42f, 42f, panelPaint)
                 text(keyboardTitle(), 1024f, 105f, 50f)
                 val raw = keyboardValue()
-                val shown = if (keyboardField == KeyboardField.PASSWORD) "•".repeat(raw.length) else raw
+                val shown = if (
+                    keyboardField == KeyboardField.PASSWORD ||
+                    keyboardField == KeyboardField.SFTP_PASSWORD
+                ) {
+                    "•".repeat(raw.length)
+                } else {
+                    raw
+                }
                 canvas.drawRoundRect(
                     230f, 135f, 1818f, 225f, 20f, 20f,
                     Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorSurfaceRaised },
