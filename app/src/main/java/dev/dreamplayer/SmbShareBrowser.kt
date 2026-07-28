@@ -10,7 +10,7 @@ import java.util.Properties
 class SmbShareBrowser {
     fun listShares(credentials: SmbCredentials): List<String> {
         val context = createContext(credentials)
-        return SmbFile("smb://${credentials.host.trim('/')}/", context).use { root ->
+        return SmbFile("smb://${credentials.connectionTarget.trim('/')}/", context).use { root ->
             root.listFiles()
                 .asSequence()
                 .map { it.name.trimEnd('/') }

@@ -27,6 +27,7 @@ class SmbCredentialStore(context: Context) {
                 output.writeUTF(credentials.username)
                 output.writeUTF(credentials.password)
                 output.writeUTF(credentials.domain)
+                output.writeUTF(credentials.connectionHost)
             }
             bytes.toByteArray()
         }
@@ -44,7 +45,12 @@ class SmbCredentialStore(context: Context) {
             init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(128, iv))
         }
         DataInputStream(ByteArrayInputStream(cipher.doFinal(encrypted))).use { input ->
-            SmbCredentials(input.readUTF(), "", input.readUTF(), input.readUTF(), input.readUTF())
+            val host = input.readUTF()
+            val username = input.readUTF()
+            val password = input.readUTF()
+            val domain = input.readUTF()
+            val connectionHost = if (input.available() > 0) input.readUTF() else host
+            SmbCredentials(host, "", username, password, domain, connectionHost)
         }
     }.getOrNull()
 

@@ -34,6 +34,7 @@ data class PlaybackSpec(
             intent.putExtra(EXTRA_SMB_USER, it.username)
             intent.putExtra(EXTRA_SMB_PASSWORD, it.password)
             intent.putExtra(EXTRA_SMB_DOMAIN, it.domain)
+            intent.putExtra(EXTRA_SMB_CONNECTION_HOST, it.connectionHost)
         }
     }
 
@@ -48,6 +49,7 @@ data class PlaybackSpec(
         private const val EXTRA_SMB_USER = "smb_user"
         private const val EXTRA_SMB_PASSWORD = "smb_password"
         private const val EXTRA_SMB_DOMAIN = "smb_domain"
+        private const val EXTRA_SMB_CONNECTION_HOST = "smb_connection_host"
 
         fun from(intent: Intent): PlaybackSpec {
             val uri = requireNotNull(intent.getStringExtra(EXTRA_URI)) { "Missing media URI" }
@@ -58,6 +60,8 @@ data class PlaybackSpec(
                 username = intent.getStringExtra(EXTRA_SMB_USER).orEmpty(),
                 password = intent.getStringExtra(EXTRA_SMB_PASSWORD).orEmpty(),
                 domain = intent.getStringExtra(EXTRA_SMB_DOMAIN).orEmpty(),
+                connectionHost = intent.getStringExtra(EXTRA_SMB_CONNECTION_HOST).orEmpty()
+                    .ifBlank { host },
             )
             return PlaybackSpec(
                 uri = uri,
@@ -77,4 +81,9 @@ data class SmbCredentials(
     val username: String,
     val password: String,
     val domain: String,
+    /** Resolvable address used for the socket; [host] remains the friendly user-facing identity. */
+    val connectionHost: String = host,
 )
+
+val SmbCredentials.connectionTarget: String
+    get() = connectionHost.ifBlank { host }
