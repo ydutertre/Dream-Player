@@ -467,6 +467,31 @@ class PlayerActivity : Activity(), Player.Listener {
                 ADAPTIVE_TONE_MAP_NITS_MAX,
                 DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS,
             )
+        if (
+            picturePreferences.getInt(PREF_ADAPTIVE_DEFAULT_RANGE_VERSION, 0) < 1
+        ) {
+            val migration = picturePreferences.edit()
+                .putInt(PREF_ADAPTIVE_DEFAULT_RANGE_VERSION, 1)
+            // Migrate only the original experimental default. Any range the
+            // user actually changed remains untouched.
+            if (
+                kotlin.math.abs(adaptiveToneMapMinNits - 300f) < 0.5f &&
+                kotlin.math.abs(adaptiveToneMapMaxNits - 500f) < 0.5f
+            ) {
+                adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
+                adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
+                migration
+                    .putFloat(
+                        PREF_ADAPTIVE_TONE_MAP_MIN_NITS,
+                        adaptiveToneMapMinNits,
+                    )
+                    .putFloat(
+                        PREF_ADAPTIVE_TONE_MAP_MAX_NITS,
+                        adaptiveToneMapMaxNits,
+                    )
+            }
+            migration.apply()
+        }
         if (adaptiveToneMapMinNits > adaptiveToneMapMaxNits) {
             adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
             adaptiveToneMapMaxNits = DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS
@@ -4832,10 +4857,6 @@ class PlayerActivity : Activity(), Player.Listener {
                             SCENE_BRIGHTNESS_MAX,
                             566f,
                         )
-                        text(
-                            "Cinema \u2022 ${activeCinemaTransfer().label}",
-                            975f, 637f, 21f, Paint.Align.LEFT, colorTextMuted,
-                        )
                         button(
                             "cinema_tune", "Tune",
                             RectF(975f, 605f, 1137f, 660f),
@@ -5797,6 +5818,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_ADAPTIVE_TONE_MAP_MIN_NITS = "adaptive-tone-map-min-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_MAX_NITS = "adaptive-tone-map-max-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_MODE = "adaptive-tone-map-mode"
+        private const val PREF_ADAPTIVE_DEFAULT_RANGE_VERSION =
+            "adaptive-default-range-version"
         private const val PREF_RENDER_RESOLUTION_SCALE = "render-resolution-scale"
         private const val PREF_GAMUT_MAPPING_MODE = "gamut-mapping-mode"
         // Legacy single-profile keys are retained only to migrate existing tuning.
@@ -5811,8 +5834,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
         private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
-        private const val DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS = 300f
-        private const val DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS = 500f
+        private const val DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS = 100f
+        private const val DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS = 600f
         private const val DEFAULT_RENDER_RESOLUTION_SCALE = 1f
         private const val DEFAULT_CINEMA_TONE_DEPTH = 0.22f
         private const val DEFAULT_PQ_CINEMA_TONE_DEPTH = 0f

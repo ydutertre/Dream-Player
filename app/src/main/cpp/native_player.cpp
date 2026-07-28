@@ -45,8 +45,8 @@ std::atomic<float> gCinemaMidtoneEv{0.15f};
 std::atomic<float> gCinemaColorIntensity{1.10f};
 std::atomic<float> gToneMapPeakNits{100.0f};
 std::atomic<bool> gAdaptiveToneMapEnabled{false};
-std::atomic<float> gAdaptiveToneMapMinNits{300.0f};
-std::atomic<float> gAdaptiveToneMapMaxNits{500.0f};
+std::atomic<float> gAdaptiveToneMapMinNits{100.0f};
+std::atomic<float> gAdaptiveToneMapMaxNits{600.0f};
 // 0 = Cinema (moderately responsive), 1 = Smooth (heavier temporal smoothing).
 std::atomic<int> gAdaptiveToneMapMode{1};
 std::atomic<float> gAdaptiveToneMapEffectiveNits{100.0f};
