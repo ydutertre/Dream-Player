@@ -400,7 +400,11 @@ class PlayerActivity : Activity(), Player.Listener {
         val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
         renderResolutionScale = picturePreferences
             .getFloat(PREF_RENDER_RESOLUTION_SCALE, DEFAULT_RENDER_RESOLUTION_SCALE)
-            .coerceIn(RENDER_RESOLUTION_SCALE_MIN, RENDER_RESOLUTION_SCALE_MAX)
+            .sanitized(
+                RENDER_RESOLUTION_SCALE_MIN,
+                RENDER_RESOLUTION_SCALE_MAX,
+                DEFAULT_RENDER_RESOLUTION_SCALE,
+            )
         gamutMappingMode = GamutMappingMode.fromWire(
             picturePreferences.getInt(
                 PREF_GAMUT_MAPPING_MODE,
@@ -1011,30 +1015,60 @@ class PlayerActivity : Activity(), Player.Listener {
                 DecoderMode.SOFTWARE
             else -> DecoderMode.HARDWARE
         }
-        val savedPicture = savedPlaybackState?.pictureSettings
+        val savedPicture = savedPlaybackState?.pictureSettings?.takeIf {
+            it.brightness.isFinite() &&
+                it.exposure.isFinite() &&
+                it.contrast.isFinite() &&
+                it.saturation.isFinite() &&
+                it.vibrance.isFinite()
+        }
         currentMediaHasSavedPictureSettings = savedPicture != null
         hdrDefaultExposureApplied = false
         pictureMode = PictureMode.fromWire(savedPicture?.mode ?: PictureMode.AUTO.wireValue)
         pictureBrightness = savedPicture?.brightness
-            ?.coerceIn(PICTURE_BRIGHTNESS_MIN, PICTURE_BRIGHTNESS_MAX)
+            ?.sanitized(
+                PICTURE_BRIGHTNESS_MIN,
+                PICTURE_BRIGHTNESS_MAX,
+                DEFAULT_PICTURE_BRIGHTNESS,
+            )
             ?: DEFAULT_PICTURE_BRIGHTNESS
         pictureExposure = savedPicture?.exposure
-            ?.coerceIn(PICTURE_EXPOSURE_MIN, PICTURE_EXPOSURE_MAX)
+            ?.sanitized(
+                PICTURE_EXPOSURE_MIN,
+                PICTURE_EXPOSURE_MAX,
+                DEFAULT_PICTURE_EXPOSURE,
+            )
             ?: DEFAULT_PICTURE_EXPOSURE
         pictureContrast = savedPicture?.contrast
-            ?.coerceIn(PICTURE_CONTRAST_MIN, PICTURE_CONTRAST_MAX)
+            ?.sanitized(
+                PICTURE_CONTRAST_MIN,
+                PICTURE_CONTRAST_MAX,
+                DEFAULT_PICTURE_CONTRAST,
+            )
             ?: DEFAULT_PICTURE_CONTRAST
         pictureSaturation = savedPicture?.saturation
-            ?.coerceIn(PICTURE_SATURATION_MIN, PICTURE_SATURATION_MAX)
+            ?.sanitized(
+                PICTURE_SATURATION_MIN,
+                PICTURE_SATURATION_MAX,
+                DEFAULT_PICTURE_SATURATION,
+            )
             ?: DEFAULT_PICTURE_SATURATION
         pictureVibrance = savedPicture?.vibrance
-            ?.coerceIn(PICTURE_VIBRANCE_MIN, PICTURE_VIBRANCE_MAX)
+            ?.sanitized(
+                PICTURE_VIBRANCE_MIN,
+                PICTURE_VIBRANCE_MAX,
+                DEFAULT_PICTURE_VIBRANCE,
+            )
             ?: DEFAULT_PICTURE_VIBRANCE
         hdrMetadataMode = HdrMetadataMode.fromWire(
             savedPlaybackState?.hdrMetadataMode ?: HdrMetadataMode.AUTO.wireValue
         )
         hdrManualPeakNits = savedPlaybackState?.hdrManualPeakNits
-            ?.coerceIn(HDR_SOURCE_PEAK_NITS_MIN, HDR_SOURCE_PEAK_NITS_MAX)
+            ?.sanitized(
+                HDR_SOURCE_PEAK_NITS_MIN,
+                HDR_SOURCE_PEAK_NITS_MAX,
+                DEFAULT_HDR_SOURCE_PEAK_NITS,
+            )
             ?: DEFAULT_HDR_SOURCE_PEAK_NITS
         detectedHdrStaticMetadata = HdrStaticMetadata.NONE
         applyPictureSettings(persist = false)
@@ -1065,16 +1099,33 @@ class PlayerActivity : Activity(), Player.Listener {
                 }}, mediaId=${MediaIdentity.from(spec).id.take(12)})",
         )
         nativeSetStereoMode(currentStereoMode.wireValue)
-        subtitleDepthIsCustom = savedPlaybackState?.subtitleDepthMeters != null
-        subtitleDepthMeters = savedPlaybackState?.subtitleDepthMeters
-            ?.coerceIn(SUBTITLE_DEPTH_MIN_METERS, SUBTITLE_DEPTH_MAX_METERS)
+        val savedSubtitleDepth = savedPlaybackState?.subtitleDepthMeters
+            ?.takeIf(Float::isFinite)
+        subtitleDepthIsCustom = savedSubtitleDepth != null
+        subtitleDepthMeters = savedSubtitleDepth
+            ?.sanitized(
+                SUBTITLE_DEPTH_MIN_METERS,
+                SUBTITLE_DEPTH_MAX_METERS,
+                defaultSubtitleDepth(currentStereoMode),
+            )
             ?: defaultSubtitleDepth(currentStereoMode)
         nativeSetSubtitleDepth(subtitleDepthMeters)
         screenCurvature = savedPlaybackState?.screenCurvature
-            ?.coerceIn(SCREEN_CURVATURE_MIN, SCREEN_CURVATURE_MAX)
+            ?.sanitized(
+                SCREEN_CURVATURE_MIN,
+                SCREEN_CURVATURE_MAX,
+                DEFAULT_SCREEN_CURVATURE,
+            )
             ?: DEFAULT_SCREEN_CURVATURE
         nativeSetScreenCurvature(screenCurvature)
-        val transform = savedPlaybackState?.screenTransform ?: DEFAULT_SCREEN_TRANSFORM
+        val transform = savedPlaybackState?.screenTransform
+            ?.takeIf {
+                it.x.isFinite() &&
+                    it.y.isFinite() &&
+                    it.z.isFinite() &&
+                    it.halfHeight.isFinite()
+            }
+            ?: DEFAULT_SCREEN_TRANSFORM
         nativeSetScreenTransform(transform.x, transform.y, transform.z, transform.halfHeight)
         audioSyncMs = savedPlaybackState?.audioSyncMs
             ?.coerceIn(-AudioSyncAudioProcessor.MAX_DELAY_MS, AudioSyncAudioProcessor.MAX_DELAY_MS)
@@ -2239,6 +2290,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     (pointerX - SUBTITLE_DEPTH_SLIDER_LEFT) /
                         (SUBTITLE_DEPTH_SLIDER_RIGHT - SUBTITLE_DEPTH_SLIDER_LEFT)
                 ).coerceIn(0f, 1f)
+                if (!fraction.isFinite()) return
                 setSubtitleDepth(
                     lerp(
                         SUBTITLE_DEPTH_MIN_METERS,
@@ -2265,6 +2317,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     (pointerX - SCREEN_CURVATURE_SLIDER_LEFT) /
                         (SCREEN_CURVATURE_SLIDER_RIGHT - SCREEN_CURVATURE_SLIDER_LEFT)
                 ).coerceIn(0f, 1f)
+                if (!fraction.isFinite()) return
                 setScreenCurvature(
                     lerp(SCREEN_CURVATURE_MIN, SCREEN_CURVATURE_MAX, fraction),
                     persist,
@@ -2448,7 +2501,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 if (cinemaSlider) {
                     applyCinemaSettings(persist)
                 } else if (slider == "resolution_scale") {
-                    if (persist) showOsd("Render resolution applies next time Dream Player starts")
+                    // The panel already explains that restart is required. Keep it open so
+                    // the user can continue dragging or compare nearby scale values.
                 } else {
                     applyPictureSettings(persist && !globalOnlySlider)
                 }
@@ -2506,7 +2560,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 } else if (cinemaSlider) {
                     applyCinemaSettings()
                 } else if (slider == "resolution_scale") {
-                    showOsd("Render resolution applies next time Dream Player starts")
+                    // Keep the render-quality panel open after resetting this slider.
                 } else {
                     applyPictureSettings(
                         persist = slider != "scene" && slider != "tone_peak"
@@ -4398,7 +4452,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             975f, 345f, 20f, Paint.Align.LEFT, colorTextMuted,
                         )
                         text(
-                            "GPU work grows quickly: 1.5x uses 2.25x pixels; 2.0x uses 4x pixels.",
+                            "GPU work grows quickly: 1.5x uses 2.25x as many rendered pixels.",
                             975f, 385f, 20f, Paint.Align.LEFT, colorTextMuted,
                         )
                         text(
@@ -5102,7 +5156,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
         private const val RENDER_RESOLUTION_SCALE_MIN = 1f
-        private const val RENDER_RESOLUTION_SCALE_MAX = 2f
+        private const val RENDER_RESOLUTION_SCALE_MAX = 1.6f
         private const val RENDER_RESOLUTION_SCALE_STEP = 0.05f
         private const val DEFAULT_HDR_SOURCE_PEAK_NITS = 1_000f
         private const val HDR_SOURCE_PEAK_NITS_MIN = 100f

@@ -547,7 +547,10 @@ public:
     Renderer(JNIEnv* env, jobject activity, int stereoMode, float renderResolutionScale)
         : env_(env),
           activity_(activity),
-          renderResolutionScale_(std::clamp(renderResolutionScale, 1.0f, 2.0f)) {
+          renderResolutionScale_(
+                  std::isfinite(renderResolutionScale)
+                      ? std::clamp(renderResolutionScale, 1.0f, 1.6f)
+                      : 1.0f) {
         gStereoMode.store(stereoMode);
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
