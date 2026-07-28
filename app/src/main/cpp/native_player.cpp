@@ -44,6 +44,13 @@ std::atomic<float> gCinemaToneDepth{0.22f};
 std::atomic<float> gCinemaMidtoneEv{0.15f};
 std::atomic<float> gCinemaColorIntensity{1.10f};
 std::atomic<float> gToneMapPeakNits{100.0f};
+std::atomic<bool> gAdaptiveToneMapEnabled{false};
+std::atomic<float> gAdaptiveToneMapMinNits{300.0f};
+std::atomic<float> gAdaptiveToneMapMaxNits{500.0f};
+// 0 = Cinema (moderately responsive), 1 = Smooth (heavier temporal smoothing).
+std::atomic<int> gAdaptiveToneMapMode{1};
+std::atomic<float> gAdaptiveToneMapEffectiveNits{100.0f};
+std::atomic<uint32_t> gAdaptiveToneMapResetGeneration{0};
 std::atomic<float> gHlgSystemGamma{0.8459066f};
 std::atomic<float> gHdrSourcePeakNits{1000.0f};
 std::atomic<float> gHdrMaxFallNits{0.0f};
@@ -73,6 +80,8 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr int kScreenSegments = 40;
 constexpr float kMaximumScreenEdgeAngle = 38.0f * kPi / 180.0f;
 constexpr float kMaximumOverlayEdgeAngle = 50.0f * kPi / 180.0f;
+constexpr int kAdaptiveAnalysisWidth = 32;
+constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
 // its native aspect instead of stretching it to each video's display aspect.
 constexpr float kMenuAspect = 2.0f;
@@ -465,6 +474,7 @@ struct JavaVideoSurface {
     jobject surface = nullptr;
     jmethodID updateTexImage = nullptr;
     jmethodID getTransformMatrix = nullptr;
+    jmethodID getTimestamp = nullptr;
     jmethodID releaseTexture = nullptr;
     jmethodID releaseSurface = nullptr;
 
@@ -477,6 +487,7 @@ struct JavaVideoSurface {
         surfaceTexture = env->NewGlobalRef(localTexture);
         updateTexImage = env->GetMethodID(textureClass, "updateTexImage", "()V");
         getTransformMatrix = env->GetMethodID(textureClass, "getTransformMatrix", "([F)V");
+        getTimestamp = env->GetMethodID(textureClass, "getTimestamp", "()J");
         releaseTexture = env->GetMethodID(textureClass, "release", "()V");
 
         jclass surfaceClass = env->FindClass("android/view/Surface");
@@ -496,7 +507,7 @@ struct JavaVideoSurface {
         env->DeleteLocalRef(textureClass);
     }
 
-    bool update(JNIEnv* env, float* matrix) {
+    bool update(JNIEnv* env, float* matrix, int64_t* timestampNanos) {
         if (!surfaceTexture) return false;
         env->ExceptionClear();
         env->CallVoidMethod(surfaceTexture, updateTexImage);
@@ -508,6 +519,14 @@ struct JavaVideoSurface {
         env->CallVoidMethod(surfaceTexture, getTransformMatrix, values);
         env->GetFloatArrayRegion(values, 0, 16, matrix);
         env->DeleteLocalRef(values);
+        if (timestampNanos && getTimestamp) {
+            *timestampNanos = static_cast<int64_t>(
+                env->CallLongMethod(surfaceTexture, getTimestamp));
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                *timestampNanos = 0;
+            }
+        }
         return true;
     }
 
@@ -531,7 +550,8 @@ struct JavaVideoSurface {
         if (activity) env->DeleteGlobalRef(activity);
         surface = surfaceTexture = activity = nullptr;
         vm = nullptr;
-        updateTexImage = getTransformMatrix = releaseTexture = releaseSurface = nullptr;
+        updateTexImage = getTransformMatrix = getTimestamp =
+            releaseTexture = releaseSurface = nullptr;
     }
 };
 
@@ -596,11 +616,14 @@ private:
     std::vector<XrView> views_;
     std::vector<Swapchain> swapchains_;
     GLuint framebuffer_ = 0;
+    GLuint adaptiveAnalysisFramebuffer_ = 0;
+    GLuint adaptiveAnalysisTexture_ = 0;
     GLuint videoTexture_ = 0;
     GLuint subtitleTexture_ = 0;
     int subtitleTextureWidth_ = 0;
     int subtitleTextureHeight_ = 0;
     GLuint videoProgram_ = 0;
+    GLuint adaptiveAnalysisProgram_ = 0;
     GLuint subtitleProgram_ = 0;
     GLuint pointerProgram_ = 0;
     GLuint vertexBuffer_ = 0;
@@ -622,6 +645,14 @@ private:
     Vec3 dragStartCenter_{};
     bool dragMoved_ = false;
     bool shutdownComplete_ = false;
+    int64_t lastAnalyzedVideoTimestampNanos_ = 0;
+    uint32_t adaptiveResetGeneration_ = 0;
+    bool adaptiveHistoryValid_ = false;
+    float adaptiveEffectiveTargetNits_ = 100.0f;
+    std::array<float, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight>
+        previousAdaptiveLogLuma_{};
+    std::array<uint8_t, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight * 4>
+        adaptiveReadback_{};
 
     void initializeOpenXr() {
         PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
@@ -1138,10 +1169,83 @@ private:
             out vec4 fragColor;
             void main() { fragColor = uColor; }
         )glsl";
+        const char* adaptiveAnalysisVertex = R"glsl(#version 300 es
+            layout(location=0) in vec3 aPosition;
+            layout(location=1) in vec2 aUv;
+            out vec2 vUv;
+            void main() {
+                gl_Position = vec4(aPosition.xy, 0.0, 1.0);
+                vUv = aUv;
+            }
+        )glsl";
+        const char* adaptiveAnalysisFragment = R"glsl(#version 300 es
+            #extension GL_OES_EGL_image_external_essl3 : require
+            precision highp float;
+            in vec2 vUv;
+            uniform samplerExternalOES uVideo;
+            uniform mat4 uTexTransform;
+            uniform int uPrimaries;
+            out vec4 fragColor;
+            vec3 pqToNits(vec3 value) {
+                const float m1 = 2610.0 / 16384.0;
+                const float m2 = 2523.0 / 32.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 128.0;
+                const float c3 = 2392.0 / 128.0;
+                vec3 p = pow(max(value, vec3(0.0)), vec3(1.0 / m2));
+                vec3 numerator = max(p - vec3(c1), vec3(0.0));
+                vec3 denominator = max(vec3(c2) - vec3(c3) * p, vec3(0.000001));
+                return 10000.0 * pow(numerator / denominator, vec3(1.0 / m1));
+            }
+            void main() {
+                vec2 transformed =
+                    (uTexTransform * vec4(vUv, 0.0, 1.0)).xy;
+                vec3 sourceNits = pqToNits(texture(uVideo, transformed).rgb);
+                vec3 luma = uPrimaries == 1
+                    ? vec3(0.2627, 0.6780, 0.0593)
+                    : vec3(0.2126, 0.7152, 0.0722);
+                float sourceLumaNits = max(dot(sourceNits, luma), 0.0);
+                float encoded = clamp(
+                    log2(1.0 + sourceLumaNits) / log2(10001.0),
+                    0.0,
+                    1.0);
+                fragColor = vec4(encoded, encoded, encoded, 1.0);
+            }
+        )glsl";
         videoProgram_ = makeProgram(vertex, videoFragment);
+        adaptiveAnalysisProgram_ =
+            makeProgram(adaptiveAnalysisVertex, adaptiveAnalysisFragment);
         subtitleProgram_ = makeProgram(vertex, subtitleFragment);
         pointerProgram_ = makeProgram(vertex, pointerFragment);
         glGenFramebuffers(1, &framebuffer_);
+        glGenFramebuffers(1, &adaptiveAnalysisFramebuffer_);
+        glGenTextures(1, &adaptiveAnalysisTexture_);
+        glBindTexture(GL_TEXTURE_2D, adaptiveAnalysisTexture_);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA8,
+            kAdaptiveAnalysisWidth,
+            kAdaptiveAnalysisHeight,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, adaptiveAnalysisFramebuffer_);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            adaptiveAnalysisTexture_,
+            0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            throw std::runtime_error("Adaptive tone-map analysis framebuffer is incomplete");
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glGenVertexArrays(1, &vertexArray_);
         glGenBuffers(1, &vertexBuffer_);
         glBindVertexArray(vertexArray_);
@@ -1527,6 +1631,221 @@ private:
         resetHorizontalSeek();
     }
 
+    bool adaptiveToneMappingActive() const {
+        if (!gAdaptiveToneMapEnabled.load() || !gHasVideo.load()) return false;
+        const int pictureMode = gPictureMode.load();
+        if (pictureMode == 0 || pictureMode == 2 || pictureMode == 4) return false;
+        const int effectiveTransfer = pictureMode == 3 ? 1 : gVideoTransfer.load();
+        return effectiveTransfer == 1;
+    }
+
+    static float smoothstepLogNits(float value, float lower, float upper) {
+        const float logValue = std::log2(std::max(value, 0.0f) + 1.0f);
+        const float logLower = std::log2(lower + 1.0f);
+        const float logUpper = std::log2(upper + 1.0f);
+        float normalized = std::clamp(
+            (logValue - logLower) / std::max(logUpper - logLower, 0.0001f),
+            0.0f,
+            1.0f);
+        return normalized * normalized * (3.0f - 2.0f * normalized);
+    }
+
+    void resetAdaptiveAnalysis(float staticTargetNits) {
+        adaptiveHistoryValid_ = false;
+        lastAnalyzedVideoTimestampNanos_ = 0;
+        adaptiveEffectiveTargetNits_ = staticTargetNits;
+        gAdaptiveToneMapEffectiveNits.store(staticTargetNits);
+    }
+
+    void analyzeAdaptiveToneMapping(int64_t videoTimestampNanos) {
+        const float staticTargetNits = gToneMapPeakNits.load();
+        if (!adaptiveToneMappingActive()) {
+            if (adaptiveHistoryValid_ ||
+                gAdaptiveToneMapEffectiveNits.load() != staticTargetNits) {
+                resetAdaptiveAnalysis(staticTargetNits);
+            }
+            return;
+        }
+
+        const uint32_t resetGeneration = gAdaptiveToneMapResetGeneration.load();
+        if (resetGeneration != adaptiveResetGeneration_) {
+            adaptiveResetGeneration_ = resetGeneration;
+            resetAdaptiveAnalysis(staticTargetNits);
+        }
+        if (videoTimestampNanos <= 0 ||
+            videoTimestampNanos == lastAnalyzedVideoTimestampNanos_) {
+            return;
+        }
+
+        constexpr std::array<float, 6 * 5> analysisVertices = {
+            -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+             1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
+             1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
+            -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+             1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
+            -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
+        };
+        glBindFramebuffer(GL_FRAMEBUFFER, adaptiveAnalysisFramebuffer_);
+        glViewport(0, 0, kAdaptiveAnalysisWidth, kAdaptiveAnalysisHeight);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(adaptiveAnalysisProgram_);
+        glBindVertexArray(vertexArray_);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
+        glBufferSubData(
+            GL_ARRAY_BUFFER,
+            0,
+            analysisVertices.size() * sizeof(float),
+            analysisVertices.data());
+        glUniformMatrix4fv(
+            glGetUniformLocation(adaptiveAnalysisProgram_, "uTexTransform"),
+            1,
+            GL_FALSE,
+            textureTransform_);
+        const int pictureMode = gPictureMode.load();
+        const int effectivePrimaries =
+            pictureMode == 3 ? 1 : gVideoPrimaries.load();
+        glUniform1i(
+            glGetUniformLocation(adaptiveAnalysisProgram_, "uPrimaries"),
+            effectivePrimaries);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
+        glUniform1i(
+            glGetUniformLocation(adaptiveAnalysisProgram_, "uVideo"),
+            0);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glReadPixels(
+            0,
+            0,
+            kAdaptiveAnalysisWidth,
+            kAdaptiveAnalysisHeight,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            adaptiveReadback_.data());
+
+        constexpr size_t sampleCount =
+            kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight;
+        std::array<float, sampleCount> sourceNits{};
+        std::array<float, 16> histogram{};
+        float meanNits = 0.0f;
+        float meanEncoded = 0.0f;
+        for (size_t index = 0; index < sampleCount; ++index) {
+            const float encoded =
+                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
+            const float nits =
+                std::exp2(encoded * std::log2(10001.0f)) - 1.0f;
+            sourceNits[index] = nits;
+            meanNits += nits;
+            meanEncoded += encoded;
+            const size_t bin = std::min(
+                static_cast<size_t>(encoded * histogram.size()),
+                histogram.size() - 1);
+            histogram[bin] += 1.0f;
+        }
+        meanNits /= static_cast<float>(sampleCount);
+        meanEncoded /= static_cast<float>(sampleCount);
+
+        auto sortedNits = sourceNits;
+        std::sort(sortedNits.begin(), sortedNits.end());
+        const auto percentile = [&sortedNits](float fraction) {
+            const size_t index = static_cast<size_t>(std::lround(
+                fraction * static_cast<float>(sortedNits.size() - 1)));
+            return sortedNits[std::min(index, sortedNits.size() - 1)];
+        };
+        const float p90Nits = percentile(0.90f);
+        const float p99Nits = percentile(0.99f);
+
+        const float fieldScore = smoothstepLogNits(p90Nits, 40.0f, 250.0f);
+        const float highlightScore =
+            smoothstepLogNits(p99Nits, 250.0f, 1200.0f);
+        const float averageScore = smoothstepLogNits(meanNits, 20.0f, 160.0f);
+        const float brightnessScore = std::clamp(
+            fieldScore * 0.50f +
+                highlightScore * 0.35f +
+                averageScore * 0.15f,
+            0.0f,
+            1.0f);
+        const float minimumTarget = gAdaptiveToneMapMinNits.load();
+        const float maximumTarget = gAdaptiveToneMapMaxNits.load();
+        const float desiredTarget =
+            minimumTarget + (maximumTarget - minimumTarget) * brightnessScore;
+
+        bool cutDetected = false;
+        float elapsedSeconds = 0.0f;
+        if (adaptiveHistoryValid_) {
+            elapsedSeconds = static_cast<float>(
+                videoTimestampNanos - lastAnalyzedVideoTimestampNanos_) /
+                1'000'000'000.0f;
+            float structuralDifference = 0.0f;
+            std::array<float, 16> previousHistogram{};
+            float previousMean = 0.0f;
+            for (float previous : previousAdaptiveLogLuma_) {
+                previousMean += previous;
+                const size_t bin = std::min(
+                    static_cast<size_t>(previous * previousHistogram.size()),
+                    previousHistogram.size() - 1);
+                previousHistogram[bin] += 1.0f;
+            }
+            previousMean /= static_cast<float>(sampleCount);
+            for (size_t index = 0; index < sampleCount; ++index) {
+                const float current =
+                    static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
+                const float previous = previousAdaptiveLogLuma_[index];
+                structuralDifference += std::abs(
+                    (current - meanEncoded) - (previous - previousMean));
+            }
+            structuralDifference /= static_cast<float>(sampleCount);
+            float histogramDistance = 0.0f;
+            for (size_t bin = 0; bin < histogram.size(); ++bin) {
+                histogramDistance +=
+                    std::abs(histogram[bin] - previousHistogram[bin]);
+            }
+            histogramDistance /= 2.0f * static_cast<float>(sampleCount);
+            const bool timestampDiscontinuity =
+                elapsedSeconds <= 0.0f || elapsedSeconds > 0.50f;
+            cutDetected =
+                timestampDiscontinuity ||
+                (histogramDistance > 0.28f &&
+                    structuralDifference > 0.045f) ||
+                structuralDifference > 0.13f;
+        }
+
+        if (!adaptiveHistoryValid_ || cutDetected) {
+            adaptiveEffectiveTargetNits_ = desiredTarget;
+            if (cutDetected) {
+                LOGI(
+                    "Adaptive HDR cut: target %.0f nits (P90 %.0f, P99 %.0f, mean %.0f)",
+                    desiredTarget,
+                    p90Nits,
+                    p99Nits,
+                    meanNits);
+            }
+        } else {
+            const float difference =
+                desiredTarget - adaptiveEffectiveTargetNits_;
+            if (std::abs(difference) > 4.0f) {
+                const bool smoothMode = gAdaptiveToneMapMode.load() == 1;
+                const float timeConstant = difference > 0.0f
+                    ? (smoothMode ? 4.0f : 2.0f)
+                    : (smoothMode ? 8.0f : 5.0f);
+                const float alpha = 1.0f - std::exp(
+                    -std::clamp(elapsedSeconds, 0.0f, 0.25f) /
+                    timeConstant);
+                adaptiveEffectiveTargetNits_ += difference * alpha;
+            }
+        }
+        adaptiveEffectiveTargetNits_ = std::clamp(
+            adaptiveEffectiveTargetNits_,
+            minimumTarget,
+            maximumTarget);
+        gAdaptiveToneMapEffectiveNits.store(adaptiveEffectiveTargetNits_);
+        for (size_t index = 0; index < sampleCount; ++index) {
+            previousAdaptiveLogLuma_[index] =
+                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
+        }
+        adaptiveHistoryValid_ = true;
+        lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
+    }
+
     void renderFrame() {
         XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState state{XR_TYPE_FRAME_STATE};
@@ -1548,7 +1867,9 @@ private:
             uint32_t count = 0;
             checkXr(xrLocateViews(session_, &locate, &viewState,
                 static_cast<uint32_t>(views_.size()), &count, views_.data()), "xrLocateViews");
-            videoSurface_.update(env_, textureTransform_);
+            int64_t videoTimestampNanos = 0;
+            videoSurface_.update(env_, textureTransform_, &videoTimestampNanos);
+            analyzeAdaptiveToneMapping(videoTimestampNanos);
             uploadSubtitleIfNeeded();
             projectionViews.resize(count, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
             for (uint32_t eye = 0; eye < count; ++eye) {
@@ -1659,7 +1980,9 @@ private:
             glUniform1f(glGetUniformLocation(videoProgram_, "uVibrance"), gPictureVibrance.load());
             glUniform1f(
                 glGetUniformLocation(videoProgram_, "uToneMapPeakNits"),
-                gToneMapPeakNits.load());
+                adaptiveToneMappingActive()
+                    ? gAdaptiveToneMapEffectiveNits.load()
+                    : gToneMapPeakNits.load());
             glUniform1f(
                 glGetUniformLocation(videoProgram_, "uHlgSystemGamma"),
                 gHlgSystemGamma.load());
@@ -1870,16 +2193,22 @@ private:
         thumbstickAction_ = XR_NULL_HANDLE;
         instance_ = XR_NULL_HANDLE;
         if (videoProgram_) glDeleteProgram(videoProgram_);
+        if (adaptiveAnalysisProgram_) glDeleteProgram(adaptiveAnalysisProgram_);
         if (subtitleProgram_) glDeleteProgram(subtitleProgram_);
         if (pointerProgram_) glDeleteProgram(pointerProgram_);
         if (videoTexture_) glDeleteTextures(1, &videoTexture_);
         if (subtitleTexture_) glDeleteTextures(1, &subtitleTexture_);
+        if (adaptiveAnalysisTexture_) glDeleteTextures(1, &adaptiveAnalysisTexture_);
         if (framebuffer_) glDeleteFramebuffers(1, &framebuffer_);
+        if (adaptiveAnalysisFramebuffer_) glDeleteFramebuffers(
+            1, &adaptiveAnalysisFramebuffer_);
         if (vertexBuffer_) glDeleteBuffers(1, &vertexBuffer_);
         if (vertexArray_) glDeleteVertexArrays(1, &vertexArray_);
-        videoProgram_ = subtitleProgram_ = pointerProgram_ = 0;
-        videoTexture_ = subtitleTexture_ = 0;
-        framebuffer_ = vertexBuffer_ = vertexArray_ = 0;
+        videoProgram_ = adaptiveAnalysisProgram_ =
+            subtitleProgram_ = pointerProgram_ = 0;
+        videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ = 0;
+        framebuffer_ = adaptiveAnalysisFramebuffer_ =
+            vertexBuffer_ = vertexArray_ = 0;
         egl_.destroy();
     }
 };
@@ -1998,7 +2327,10 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPictureSettings(
     if (std::isfinite(toneMapPeakNits)) {
         const float clampedPeakNits =
             std::clamp(static_cast<float>(toneMapPeakNits), 50.0f, 5000.0f);
-        gToneMapPeakNits.store(clampedPeakNits);
+        const float previousPeakNits = gToneMapPeakNits.exchange(clampedPeakNits);
+        if (std::abs(previousPeakNits - clampedPeakNits) > 0.1f) {
+            gAdaptiveToneMapResetGeneration.fetch_add(1);
+        }
         // ITU-R BT.2390 extended HLG display-gamma model for peak
         // luminances outside the usual reference-display range.
         gHlgSystemGamma.store(
@@ -2007,6 +2339,36 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPictureSettings(
     if (std::isfinite(sceneBrightness)) {
         gSceneBrightness.store(std::clamp(sceneBrightness, 0.0f, 1.0f));
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetAdaptiveToneMapping(
+    JNIEnv*, jclass, jboolean enabled, jfloat minimumNits,
+    jfloat maximumNits, jint mode) {
+    if (!std::isfinite(minimumNits) || !std::isfinite(maximumNits)) return;
+    float minimum = std::clamp(static_cast<float>(minimumNits), 50.0f, 5000.0f);
+    float maximum = std::clamp(static_cast<float>(maximumNits), 50.0f, 5000.0f);
+    if (minimum > maximum) std::swap(minimum, maximum);
+    gAdaptiveToneMapMinNits.store(minimum);
+    gAdaptiveToneMapMaxNits.store(maximum);
+    gAdaptiveToneMapMode.store(mode == 0 ? 0 : 1);
+    gAdaptiveToneMapEnabled.store(enabled == JNI_TRUE);
+    if (enabled != JNI_TRUE) {
+        gAdaptiveToneMapEffectiveNits.store(gToneMapPeakNits.load());
+    }
+    gAdaptiveToneMapResetGeneration.fetch_add(1);
+    LOGI(
+        "Adaptive HDR: %s, range %.0f-%.0f nits, response=%s",
+        enabled == JNI_TRUE ? "on" : "off",
+        minimum,
+        maximum,
+        mode == 0 ? "Cinema" : "Smooth");
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeGetAdaptiveToneMapTarget(
+    JNIEnv*, jclass) {
+    return gAdaptiveToneMapEffectiveNits.load();
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2046,6 +2408,7 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetVideoColorInfo(
     if (gamutMappingMode >= 0 && gamutMappingMode <= 1) {
         gGamutMappingMode.store(gamutMappingMode);
     }
+    gAdaptiveToneMapResetGeneration.fetch_add(1);
     LOGI(
         "Color pipeline: transfer=%d primaries=%d sourcePeak=%.0f MaxFALL=%.0f gamut=%s",
         gVideoTransfer.load(),
@@ -2063,6 +2426,7 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetSwapEyes(JNIEnv*, jclass, jboolean 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAvailable(JNIEnv*, jclass, jboolean available) {
     gHasVideo.store(available == JNI_TRUE);
+    gAdaptiveToneMapResetGeneration.fetch_add(1);
 }
 
 extern "C" JNIEXPORT void JNICALL
