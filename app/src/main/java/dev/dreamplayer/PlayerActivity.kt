@@ -705,7 +705,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             armControlsAutoHide()
                             renderVrMenu()
                         }
-                    } else if (!PLAYBACK_TOOLBAR_BOUNDS.contains(px, py)) {
+                    } else if (!playbackToolbarBounds().contains(px, py)) {
                         hideControls()
                     }
                 }
@@ -786,7 +786,7 @@ class PlayerActivity : Activity(), Player.Listener {
             val px = u * UI_WIDTH
             val py = v * UI_HEIGHT
             if (uiVisible) {
-                val overToolbar = PLAYBACK_TOOLBAR_BOUNDS.contains(px, py)
+                val overToolbar = playbackToolbarBounds().contains(px, py)
                 val overPopover = playbackPopoverBounds(playbackPopover)?.contains(px, py) == true
                 val overControl = uiButtons.any { it.bounds.contains(px, py) }
                 if (overToolbar || overPopover || overControl) return@runOnUiThread
@@ -2720,6 +2720,27 @@ class PlayerActivity : Activity(), Player.Listener {
             "${currentProjection.label} • ${stereoLabel()}"
         }
 
+    private fun playbackToolbarBounds(): RectF =
+        if (currentProjection == VideoProjection.EQUIRECTANGULAR_360) {
+            PLAYBACK_TOOLBAR_360_BOUNDS
+        } else {
+            PLAYBACK_TOOLBAR_BOUNDS
+        }
+
+    private fun playbackSeekLeft(): Float =
+        if (currentProjection == VideoProjection.EQUIRECTANGULAR_360) {
+            PLAYBACK_SEEK_360_LEFT
+        } else {
+            PLAYBACK_SEEK_LEFT
+        }
+
+    private fun playbackSeekRight(): Float =
+        if (currentProjection == VideoProjection.EQUIRECTANGULAR_360) {
+            PLAYBACK_SEEK_360_RIGHT
+        } else {
+            PLAYBACK_SEEK_RIGHT
+        }
+
     private fun persistProjectionSettings() {
         mediaStateStore.saveProjection(
             spec,
@@ -3389,8 +3410,10 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "seek_bar" -> {
                 val duration = player.duration
                 if (duration > 0) {
-                    val fraction = ((pointerX - PLAYBACK_SEEK_LEFT) /
-                        (PLAYBACK_SEEK_RIGHT - PLAYBACK_SEEK_LEFT)).coerceIn(0f, 1f)
+                    val seekLeft = playbackSeekLeft()
+                    val seekRight = playbackSeekRight()
+                    val fraction = ((pointerX - seekLeft) /
+                        (seekRight - seekLeft)).coerceIn(0f, 1f)
                     player.seekTo((duration * fraction).toLong())
                     renderVrMenu()
                 }
@@ -5550,11 +5573,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 )
             }
             UiScreen.PLAYBACK -> {
-                canvas.drawRoundRect(PLAYBACK_TOOLBAR_BOUNDS, 34f, 34f, panelPaint)
+                val compact360 =
+                    currentProjection == VideoProjection.EQUIRECTANGULAR_360
+                val toolbarBounds = playbackToolbarBounds()
+                val sideInset = if (compact360) 100f else 0f
+                canvas.drawRoundRect(toolbarBounds, 34f, 34f, panelPaint)
                 val duration = player.duration.takeIf { it > 0 } ?: 0L
                 val fraction = if (duration > 0) player.currentPosition.toFloat() / duration else 0f
-                val seekLeft = PLAYBACK_SEEK_LEFT
-                val seekRight = PLAYBACK_SEEK_RIGHT
+                val seekLeft = playbackSeekLeft()
+                val seekRight = playbackSeekRight()
                 val seekWidth = seekRight - seekLeft
                 val seekBounds = RectF(seekLeft, 720f, seekRight, 790f)
                 canvas.drawRoundRect(seekLeft, 749f, seekRight, 763f, 7f, 7f,
@@ -5564,8 +5591,22 @@ class PlayerActivity : Activity(), Player.Listener {
                 canvas.drawCircle(seekLeft + seekWidth * fraction.coerceIn(0f, 1f), 756f, 18f,
                     Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText })
                 buttons += UiButton("seek_bar", "Seek", seekBounds)
-                text(formatTime(player.currentPosition), 320f, 765f, 26f, Paint.Align.RIGHT, colorTextMuted)
-                text(formatTime(duration), 1728f, 765f, 26f, Paint.Align.LEFT, colorTextMuted)
+                text(
+                    formatTime(player.currentPosition),
+                    320f + sideInset,
+                    765f,
+                    26f,
+                    Paint.Align.RIGHT,
+                    colorTextMuted,
+                )
+                text(
+                    formatTime(duration),
+                    1728f - sideInset,
+                    765f,
+                    26f,
+                    Paint.Align.LEFT,
+                    colorTextMuted,
+                )
                 val iconTop = 820f
                 val iconBottom = 936f
                 val standardButtonSize = iconBottom - iconTop
@@ -5573,15 +5614,20 @@ class PlayerActivity : Activity(), Player.Listener {
                     RectF(left, iconTop, left + standardButtonSize, iconBottom)
 
                 // Left: navigation and language controls.
-                iconButton("back_library", "Library", standardBounds(176f))
                 iconButton(
-                    "subtitles", "Subtitles", standardBounds(316f),
+                    "back_library", "Library",
+                    standardBounds(176f + sideInset),
+                )
+                iconButton(
+                    "subtitles", "Subtitles",
+                    standardBounds(316f + sideInset),
                     playbackPopover == PlaybackPopover.SUBTITLES ||
                         subtitleChoiceIndex > 1 ||
                         subtitleSyncMs != 0,
                 )
                 iconButton(
-                    "audio", "Audio", standardBounds(456f),
+                    "audio", "Audio",
+                    standardBounds(456f + sideInset),
                     playbackPopover == PlaybackPopover.AUDIO ||
                         audioChoiceIndex > 0 ||
                         audioSyncMs != 0,
@@ -5600,14 +5646,17 @@ class PlayerActivity : Activity(), Player.Listener {
 
                 // Right: presentation and player configuration.
                 iconButton(
-                    "projection", projectionLabel(), standardBounds(1616f),
+                    "projection", projectionLabel(),
+                    standardBounds(1616f - sideInset),
                     playbackPopover == PlaybackPopover.PROJECTION ||
+                        currentProjection != VideoProjection.FLAT ||
                         currentStereoMode != StereoMode.MONO ||
                         swapEyes ||
                         screenCurvature != DEFAULT_SCREEN_CURVATURE,
                 )
                 iconButton(
-                    "settings", "Settings", standardBounds(1756f),
+                    "settings", "Settings",
+                    standardBounds(1756f - sideInset),
                         playbackPopover == PlaybackPopover.SETTINGS ||
                         playbackPopover == PlaybackPopover.CINEMA ||
                         playbackPopover == PlaybackPopover.COLOR_PIPELINE ||
@@ -5628,8 +5677,16 @@ class PlayerActivity : Activity(), Player.Listener {
                     color = colorOutline
                     strokeWidth = 2f
                 }
-                canvas.drawLine(622f, 838f, 622f, 918f, groupDividerPaint)
-                canvas.drawLine(1426f, 838f, 1426f, 918f, groupDividerPaint)
+                canvas.drawLine(
+                    622f + sideInset, 838f,
+                    622f + sideInset, 918f,
+                    groupDividerPaint,
+                )
+                canvas.drawLine(
+                    1426f - sideInset, 838f,
+                    1426f - sideInset, 918f,
+                    groupDividerPaint,
+                )
                 buttons.lastOrNull { it.id == hoveredButton }?.takeIf {
                     it.id != "seek_bar" &&
                         playbackPopover == PlaybackPopover.NONE &&
@@ -5637,8 +5694,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 }?.let { focused ->
                     val tooltipWidth = (focused.label.length * 17f + 52f).coerceIn(180f, 430f)
                     val tooltipCenter = focused.bounds.centerX().coerceIn(
-                        PLAYBACK_TOOLBAR_BOUNDS.left + tooltipWidth / 2f + 20f,
-                        PLAYBACK_TOOLBAR_BOUNDS.right - tooltipWidth / 2f - 20f,
+                        toolbarBounds.left + tooltipWidth / 2f + 20f,
+                        toolbarBounds.right - tooltipWidth / 2f - 20f,
                     )
                     val tooltip = RectF(
                         tooltipCenter - tooltipWidth / 2f, 778f,
@@ -6944,6 +7001,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PGS_REFERENCE_HEIGHT = 1080f
         private const val PLAYBACK_SEEK_LEFT = 350f
         private const val PLAYBACK_SEEK_RIGHT = 1698f
+        private const val PLAYBACK_SEEK_360_LEFT = 420f
+        private const val PLAYBACK_SEEK_360_RIGHT = 1628f
         private const val PLAYBACK_AUTO_HIDE_MS = 8_000L
         private const val STATE_SAVE_INTERVAL_MS = 5_000L
         private const val AUTO_FALLBACK_RATIO_MIN = 1.55
@@ -7063,6 +7122,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private val BROWSER_LIST_HIT_BOUNDS =
             RectF(BROWSER_LIST_LEFT, BROWSER_LIST_TOP, BROWSER_LIST_RIGHT, BROWSER_LIST_BOTTOM)
         private val PLAYBACK_TOOLBAR_BOUNDS = RectF(120f, 700f, 1928f, 970f)
+        private val PLAYBACK_TOOLBAR_360_BOUNDS =
+            RectF(220f, 700f, 1828f, 970f)
         private val PLAYBACK_LEFT_POPOVER_BOUNDS = RectF(150f, 105f, 860f, 720f)
         private val PLAYBACK_PROJECTION_POPOVER_BOUNDS =
             RectF(1185f, 105f, 1898f, 720f)

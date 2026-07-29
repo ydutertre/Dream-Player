@@ -35,6 +35,7 @@ std::atomic<float> gImmersiveYawDegrees{0.0f};
 std::atomic<float> gImmersivePitchDegrees{0.0f};
 std::atomic<float> gLatestHeadYawDegrees{0.0f};
 std::atomic<float> gLatestHeadPitchDegrees{0.0f};
+std::atomic<uint64_t> gImmersiveMenuAnchorGeneration{1};
 // 0 = original samples, 1 = metadata-driven managed color.
 std::atomic<int> gPictureMode{1};
 // 0 = SDR transfer, 1 = ST 2084/PQ, 2 = HLG.
@@ -653,6 +654,13 @@ private:
         {0.0f, 1.0f, 0.0f},
         {0.0f, 0.0f, 1.0f},
     };
+    ScreenBasis anchoredImmersiveMenuBasis_{
+        {0.0f, 0.0f, -2.0f},
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+    };
+    uint64_t immersiveMenuAnchorGeneration_ = 0;
     XrTime lastPointerCallback_ = 0;
     XrTime lastScrollCallback_ = 0;
     float lastScrollValue_ = 0.0f;
@@ -1512,7 +1520,7 @@ private:
             const bool immersiveProjection = gVideoProjection.load() != 0;
             const ScreenBasis basis =
                 gMenuInteractive.load() && immersiveProjection
-                    ? headRelativeMenuBasis_
+                    ? anchoredImmersiveMenuBasis_
                     : currentScreenBasis();
             const float halfHeight = gScreenHalfHeight.load();
             const float videoHalfWidth =
@@ -1936,6 +1944,15 @@ private:
             up,
             forward * -1.0f,
         };
+        const uint64_t requestedAnchorGeneration =
+            gImmersiveMenuAnchorGeneration.load();
+        if (
+            requestedAnchorGeneration !=
+            immersiveMenuAnchorGeneration_
+        ) {
+            anchoredImmersiveMenuBasis_ = headRelativeMenuBasis_;
+            immersiveMenuAnchorGeneration_ = requestedAnchorGeneration;
+        }
         gLatestHeadYawDegrees.store(
             std::atan2(forward.x, -forward.z) * 180.0f / kPi);
         gLatestHeadPitchDegrees.store(
@@ -2021,7 +2038,7 @@ private:
         const float halfWidth = halfHeight * aspect;
         const ScreenBasis basis =
             gMenuInteractive.load() && gVideoProjection.load() != 0
-                ? headRelativeMenuBasis_
+                ? anchoredImmersiveMenuBasis_
                 : currentScreenBasis();
         const float curvature = gScreenCurvature.load();
         std::vector<float> videoVertices;
@@ -2211,7 +2228,11 @@ private:
             const bool isBitmapSubtitle =
                 !isMenuOverlay && gSubtitleBitmapMode.load();
             const ScreenBasis subtitleBasis =
-                projectionMode != 0 ? headRelativeMenuBasis_ : basis;
+                projectionMode == 0
+                    ? basis
+                    : isMenuOverlay
+                        ? anchoredImmersiveMenuBasis_
+                        : headRelativeMenuBasis_;
             float displayLeft = gSubtitleLeft.load();
             float displayTop = gSubtitleTop.load();
             float displayRight = gSubtitleRight.load();
@@ -2429,7 +2450,7 @@ private:
         glUniform4f(glGetUniformLocation(pointerProgram_, "uColor"), 0.10f, 0.78f, 1.0f, 1.0f);
         const ScreenBasis basis =
             gMenuInteractive.load() && gVideoProjection.load() != 0
-                ? headRelativeMenuBasis_
+                ? anchoredImmersiveMenuBasis_
                 : currentScreenBasis();
         const Vec3 lineEnd = pointerHit_ + basis.normal * 0.01f;
         const float line[] = {
@@ -2606,6 +2627,9 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetVideoProjection(
     JNIEnv*, jclass, jint projection) {
     if (projection >= 0 && projection <= 2) {
         gVideoProjection.store(projection);
+        if (projection != 0) {
+            gImmersiveMenuAnchorGeneration.fetch_add(1);
+        }
     }
 }
 
@@ -2784,7 +2808,12 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAvailable(JNIEnv*, jclass, jbo
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetMenuInteractive(JNIEnv*, jclass, jboolean interactive) {
-    gMenuInteractive.store(interactive == JNI_TRUE);
+    const bool nextInteractive = interactive == JNI_TRUE;
+    const bool previousInteractive =
+        gMenuInteractive.exchange(nextInteractive);
+    if (!previousInteractive && nextInteractive) {
+        gImmersiveMenuAnchorGeneration.fetch_add(1);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
