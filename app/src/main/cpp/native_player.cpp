@@ -2087,6 +2087,16 @@ private:
                             (selectedLeft - sourceStart) * 2.0f;
                         displayRight =
                             (selectedRight - sourceStart) * 2.0f;
+                        // Remapping source-half coordinates preserves the
+                        // baked left/right disparity, but it also doubles the
+                        // cropped bitmap's width. Restore the native aspect
+                        // around that remapped center.
+                        const float center =
+                            (displayLeft + displayRight) * 0.5f;
+                        const float halfDisplayWidth =
+                            (displayRight - displayLeft) * 0.25f;
+                        displayLeft = center - halfDisplayWidth;
+                        displayRight = center + halfDisplayWidth;
                     }
                 } else {
                     const float originalTop = displayTop;
@@ -2109,6 +2119,12 @@ private:
                             (selectedTop - sourceStart) * 2.0f;
                         displayBottom =
                             (selectedBottom - sourceStart) * 2.0f;
+                        const float center =
+                            (displayTop + displayBottom) * 0.5f;
+                        const float halfDisplayHeight =
+                            (displayBottom - displayTop) * 0.25f;
+                        displayTop = center - halfDisplayHeight;
+                        displayBottom = center + halfDisplayHeight;
                     }
                 }
             }
