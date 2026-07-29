@@ -64,6 +64,9 @@ class PlayerActivity : Activity(), Player.Listener {
     private var resumePlaybackOnForeground = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentStereoMode = StereoMode.MONO
+    private var currentProjection = VideoProjection.FLAT
+    private var immersiveYawDegrees = 0f
+    private var immersivePitchDegrees = 0f
     private var pictureMode = PictureMode.AUTO
     private var pictureBrightness = DEFAULT_PICTURE_BRIGHTNESS
     private var pictureExposure = DEFAULT_PICTURE_EXPOSURE
@@ -1387,14 +1390,19 @@ class PlayerActivity : Activity(), Player.Listener {
         pendingAudioFingerprint = savedPlaybackState?.audioTrackFingerprint
         val savedProjection = mediaStateStore.loadProjection(newSpec)
             ?.takeIf { it.manuallySelected }
-            ?.mode
         val detectedProjection = FilenameProjectionDetector.detect(newSpec.title)
-        currentStereoMode = savedProjection
+        currentStereoMode = savedProjection?.mode
             ?: if (newSpec.projectionExplicit) newSpec.stereoMode
             else detectedProjection ?: StereoMode.MONO
+        currentProjection =
+            savedProjection?.projection ?: VideoProjection.FLAT
+        immersiveYawDegrees =
+            savedProjection?.immersiveYawDegrees?.coerceIn(-180f, 180f) ?: 0f
+        immersivePitchDegrees =
+            savedProjection?.immersivePitchDegrees?.coerceIn(-80f, 80f) ?: 0f
         spec = newSpec.copy(stereoMode = currentStereoMode)
         if (newSpec.projectionExplicit && savedProjection == null) {
-            mediaStateStore.saveProjection(spec, currentStereoMode)
+            persistProjectionSettings()
         }
         Log.i(
             "DreamPlayerState",
@@ -1407,6 +1415,11 @@ class PlayerActivity : Activity(), Player.Listener {
                 }}, mediaId=${MediaIdentity.from(spec).id.take(12)})",
         )
         nativeSetStereoMode(currentStereoMode.wireValue)
+        nativeSetVideoProjection(currentProjection.wireValue)
+        nativeSetImmersiveOrientation(
+            immersiveYawDegrees,
+            immersivePitchDegrees,
+        )
         val savedSubtitleDepth = savedPlaybackState?.subtitleDepthMeters
             ?.takeIf(Float::isFinite)
         subtitleDepthIsCustom = savedSubtitleDepth != null
@@ -2595,7 +2608,7 @@ class PlayerActivity : Activity(), Player.Listener {
         }
         nativeSetStereoMode(currentStereoMode.wireValue)
         applyDefaultSubtitleDepthForProjection()
-        mediaStateStore.saveProjection(spec, currentStereoMode)
+        persistProjectionSettings()
         updateVideoAspect()
         showControls(0L)
     }
@@ -2698,6 +2711,23 @@ class PlayerActivity : Activity(), Player.Listener {
         StereoMode.HALF_SBS -> "Half SBS"
         StereoMode.OVER_UNDER -> "Full OU"
         StereoMode.HALF_OVER_UNDER -> "Half OU"
+    }
+
+    private fun projectionLabel(): String =
+        if (currentProjection == VideoProjection.FLAT) {
+            stereoLabel()
+        } else {
+            "${currentProjection.label} • ${stereoLabel()}"
+        }
+
+    private fun persistProjectionSettings() {
+        mediaStateStore.saveProjection(
+            spec,
+            currentStereoMode,
+            currentProjection,
+            immersiveYawDegrees,
+            immersivePitchDegrees,
+        )
     }
 
     private fun showControls(durationMs: Long) {
@@ -3375,8 +3405,56 @@ class PlayerActivity : Activity(), Player.Listener {
                 }
                 nativeSetStereoMode(currentStereoMode.wireValue)
                 applyDefaultSubtitleDepthForProjection()
-                mediaStateStore.saveProjection(spec, currentStereoMode)
+                persistProjectionSettings()
                 updateVideoAspect()
+                renderVrMenu()
+            }
+            id.startsWith("projection_view_") -> {
+                currentProjection = when (id) {
+                    "projection_view_180" ->
+                        VideoProjection.EQUIRECTANGULAR_180
+                    "projection_view_360" ->
+                        VideoProjection.EQUIRECTANGULAR_360
+                    else -> VideoProjection.FLAT
+                }
+                nativeSetVideoProjection(currentProjection.wireValue)
+                if (currentProjection != VideoProjection.FLAT) {
+                    nativeRecenterImmersive()
+                    immersiveYawDegrees = nativeGetImmersiveYaw()
+                    immersivePitchDegrees = nativeGetImmersivePitch()
+                }
+                persistProjectionSettings()
+                renderVrMenu()
+            }
+            id == "immersive_recenter" -> {
+                nativeRecenterImmersive()
+                immersiveYawDegrees = nativeGetImmersiveYaw()
+                immersivePitchDegrees = nativeGetImmersivePitch()
+                persistProjectionSettings()
+                renderVrMenu()
+            }
+            id.startsWith("immersive_yaw_") -> {
+                immersiveYawDegrees = (
+                    immersiveYawDegrees +
+                        if (id.endsWith("left")) -15f else 15f
+                    ).coerceIn(-180f, 180f)
+                nativeSetImmersiveOrientation(
+                    immersiveYawDegrees,
+                    immersivePitchDegrees,
+                )
+                persistProjectionSettings()
+                renderVrMenu()
+            }
+            id.startsWith("immersive_pitch_") -> {
+                immersivePitchDegrees = (
+                    immersivePitchDegrees +
+                        if (id.endsWith("down")) -10f else 10f
+                    ).coerceIn(-80f, 80f)
+                nativeSetImmersiveOrientation(
+                    immersiveYawDegrees,
+                    immersivePitchDegrees,
+                )
+                persistProjectionSettings()
                 renderVrMenu()
             }
             id == "swap_eyes" -> {
@@ -5522,7 +5600,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
                 // Right: presentation and player configuration.
                 iconButton(
-                    "projection", stereoLabel(), standardBounds(1616f),
+                    "projection", projectionLabel(), standardBounds(1616f),
                     playbackPopover == PlaybackPopover.PROJECTION ||
                         currentStereoMode != StereoMode.MONO ||
                         swapEyes ||
@@ -5661,44 +5739,128 @@ class PlayerActivity : Activity(), Player.Listener {
                     PlaybackPopover.PROJECTION -> {
                         val bounds = PLAYBACK_PROJECTION_POPOVER_BOUNDS
                         popoverPanel(bounds, "Projection", 1674f)
-                        projectionGridButton(
+                        text(
+                            "View",
+                            1212f,
+                            180f,
+                            23f,
+                            Paint.Align.LEFT,
+                            colorTextMuted,
+                        )
+                        button(
+                            "projection_view_flat", "Flat",
+                            RectF(1210f, 195f, 1418f, 260f),
+                            currentProjection == VideoProjection.FLAT,
+                            fontSize = 23f,
+                        )
+                        button(
+                            "projection_view_180", "VR180",
+                            RectF(1430f, 195f, 1638f, 260f),
+                            currentProjection ==
+                                VideoProjection.EQUIRECTANGULAR_180,
+                            fontSize = 23f,
+                        )
+                        button(
+                            "projection_view_360", "VR360",
+                            RectF(1650f, 195f, 1870f, 260f),
+                            currentProjection ==
+                                VideoProjection.EQUIRECTANGULAR_360,
+                            fontSize = 23f,
+                        )
+                        text(
+                            "Stereo layout",
+                            1212f,
+                            300f,
+                            23f,
+                            Paint.Align.LEFT,
+                            colorTextMuted,
+                        )
+                        button(
                             "mode_2d", "2D",
-                            RectF(1218f, 290f, 1420f, 425f),
-                            StereoMode.MONO,
+                            RectF(1210f, 315f, 1418f, 380f),
                             currentStereoMode == StereoMode.MONO,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_full_sbs", "Full SBS",
-                            RectF(1438f, 290f, 1640f, 425f),
-                            StereoMode.SBS,
+                            RectF(1430f, 315f, 1638f, 380f),
                             currentStereoMode == StereoMode.SBS,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_half_sbs", "Half SBS",
-                            RectF(1658f, 290f, 1860f, 425f),
-                            StereoMode.HALF_SBS,
+                            RectF(1650f, 315f, 1870f, 380f),
                             currentStereoMode == StereoMode.HALF_SBS,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_full_ou", "Full OU",
-                            RectF(1218f, 443f, 1420f, 578f),
-                            StereoMode.OVER_UNDER,
+                            RectF(1210f, 392f, 1418f, 457f),
                             currentStereoMode == StereoMode.OVER_UNDER,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_half_ou", "Half OU",
-                            RectF(1438f, 443f, 1640f, 578f),
-                            StereoMode.HALF_OVER_UNDER,
-                            currentStereoMode == StereoMode.HALF_OVER_UNDER,
+                            RectF(1430f, 392f, 1638f, 457f),
+                            currentStereoMode ==
+                                StereoMode.HALF_OVER_UNDER,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "swap_eyes",
                             if (swapEyes) "Eyes swapped" else "Swap eyes",
-                            RectF(1658f, 443f, 1860f, 578f),
-                            selected = swapEyes,
-                            swapControl = true,
+                            RectF(1650f, 392f, 1870f, 457f),
+                            swapEyes,
+                            fontSize = 22f,
                         )
-                        projectionCurvatureSlider(625f)
+                        if (currentProjection == VideoProjection.FLAT) {
+                            projectionCurvatureSlider(535f)
+                        } else {
+                            text(
+                                "Orientation",
+                                1212f,
+                                505f,
+                                23f,
+                                Paint.Align.LEFT,
+                                colorTextMuted,
+                            )
+                            button(
+                                "immersive_yaw_left", "Yaw −15°",
+                                RectF(1210f, 522f, 1418f, 580f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_recenter", "Recenter",
+                                RectF(1430f, 522f, 1638f, 580f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_yaw_right", "Yaw +15°",
+                                RectF(1650f, 522f, 1870f, 580f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_pitch_down", "Pitch −10°",
+                                RectF(1320f, 594f, 1530f, 652f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_pitch_up", "Pitch +10°",
+                                RectF(1550f, 594f, 1760f, 652f),
+                                fontSize = 21f,
+                            )
+                            text(
+                                "Yaw %.0f°  •  Pitch %.0f°".format(
+                                    Locale.US,
+                                    immersiveYawDegrees,
+                                    immersivePitchDegrees,
+                                ),
+                                1540f,
+                                690f,
+                                21f,
+                                color = colorTextMuted,
+                            )
+                        }
                     }
                     PlaybackPopover.SETTINGS -> {
                         val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
@@ -6902,7 +7064,8 @@ class PlayerActivity : Activity(), Player.Listener {
             RectF(BROWSER_LIST_LEFT, BROWSER_LIST_TOP, BROWSER_LIST_RIGHT, BROWSER_LIST_BOTTOM)
         private val PLAYBACK_TOOLBAR_BOUNDS = RectF(120f, 700f, 1928f, 970f)
         private val PLAYBACK_LEFT_POPOVER_BOUNDS = RectF(150f, 105f, 860f, 720f)
-        private val PLAYBACK_PROJECTION_POPOVER_BOUNDS = RectF(1185f, 205f, 1898f, 675f)
+        private val PLAYBACK_PROJECTION_POPOVER_BOUNDS =
+            RectF(1185f, 105f, 1898f, 720f)
         private val PLAYBACK_SETTINGS_POPOVER_BOUNDS = RectF(930f, 45f, 1898f, 675f)
         init { System.loadLibrary("dreamplayer") }
 
@@ -6917,6 +7080,14 @@ class PlayerActivity : Activity(), Player.Listener {
         @JvmStatic private external fun nativeSetScreenTransform(x: Float, y: Float, z: Float, halfHeight: Float)
         @JvmStatic private external fun nativeGetScreenTransform(): FloatArray
         @JvmStatic private external fun nativeSetStereoMode(stereoMode: Int)
+        @JvmStatic private external fun nativeSetVideoProjection(projection: Int)
+        @JvmStatic private external fun nativeSetImmersiveOrientation(
+            yawDegrees: Float,
+            pitchDegrees: Float,
+        )
+        @JvmStatic private external fun nativeRecenterImmersive()
+        @JvmStatic private external fun nativeGetImmersiveYaw(): Float
+        @JvmStatic private external fun nativeGetImmersivePitch(): Float
         @JvmStatic private external fun nativeSetPictureSettings(
             pictureMode: Int,
             brightness: Float,
