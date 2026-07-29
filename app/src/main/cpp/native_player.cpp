@@ -129,6 +129,12 @@ Vec3 normalized(const Vec3& value, const Vec3& fallback = {0, 0, -1}) {
     return magnitude > 0.00001f ? value * (1.0f / magnitude) : fallback;
 }
 
+float normalizedAngleRadians(float angle) {
+    angle = std::fmod(angle + kPi, 2.0f * kPi);
+    if (angle < 0.0f) angle += 2.0f * kPi;
+    return angle - kPi;
+}
+
 struct ScreenBasis {
     Vec3 center;
     Vec3 right;
@@ -591,6 +597,10 @@ public:
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
         seekCallback_ = env_->GetMethodID(cls, "onNativeSeekGesture", "(IFF)V");
+        immersiveOrientationCallback_ = env_->GetMethodID(
+            cls,
+            "onNativeImmersiveOrientationChanged",
+            "(FF)V");
         env_->DeleteLocalRef(cls);
     }
 
@@ -609,6 +619,7 @@ private:
     jobject activity_;
     jmethodID frameCallback_ = nullptr;
     jmethodID seekCallback_ = nullptr;
+    jmethodID immersiveOrientationCallback_ = nullptr;
     float renderResolutionScale_ = 1.0f;
     EglState egl_;
     JavaVideoSurface videoSurface_;
@@ -674,6 +685,9 @@ private:
     float dragRadius_ = 2.4f;
     Vec3 dragStartCenter_{};
     bool dragMoved_ = false;
+    bool draggingImmersive_ = false;
+    float immersiveDragStartPointerYaw_ = 0.0f;
+    float immersiveDragStartVideoYaw_ = 0.0f;
     bool shutdownComplete_ = false;
     int64_t lastAnalyzedVideoTimestampNanos_ = 0;
     uint32_t adaptiveResetGeneration_ = 0;
@@ -1367,6 +1381,16 @@ private:
         }
     }
 
+    void notifyImmersiveOrientation(float yawDegrees, float pitchDegrees) {
+        if (immersiveOrientationCallback_) {
+            env_->CallVoidMethod(
+                activity_,
+                immersiveOrientationCallback_,
+                static_cast<jfloat>(yawDegrees),
+                static_cast<jfloat>(pitchDegrees));
+        }
+    }
+
     void resetHorizontalSeek() {
         horizontalSeekDirection_ = 0;
         horizontalSeekStarted_ = 0;
@@ -1472,8 +1496,17 @@ private:
             }
 
             if (!gMenuInteractive.load() && released && draggingHand_ == hand) {
+                const bool wasImmersiveDrag = draggingImmersive_;
+                const bool moved = dragMoved_;
                 draggingHand_ = -1;
-                if (!dragMoved_) notifyPointer(-1.0f, -1.0f, 1);
+                draggingImmersive_ = false;
+                if (wasImmersiveDrag && moved) {
+                    notifyImmersiveOrientation(
+                        gImmersiveYawDegrees.load(),
+                        gImmersivePitchDegrees.load());
+                } else if (!moved) {
+                    notifyPointer(-1.0f, -1.0f, 1);
+                }
                 return;
             }
 
@@ -1491,6 +1524,22 @@ private:
 
             if (!gMenuInteractive.load() && draggingHand_ == hand && isDown) {
                 resetHorizontalSeek();
+                if (draggingImmersive_) {
+                    const float targetYaw =
+                        std::atan2(direction.x, -direction.z);
+                    const float yawDelta = normalizedAngleRadians(
+                        targetYaw - immersiveDragStartPointerYaw_);
+                    const float yaw = normalizedAngleRadians(
+                        immersiveDragStartVideoYaw_ + yawDelta);
+                    gImmersiveYawDegrees.store(yaw * 180.0f / kPi);
+                    if (std::abs(yawDelta) > 1.0f * kPi / 180.0f) {
+                        dragMoved_ = true;
+                    }
+                    pointerVisible_ = true;
+                    pointerOrigin_ = origin;
+                    pointerHit_ = origin + direction * 2.0f;
+                    return;
+                }
                 Vec3 target{};
                 if (!intersectRayWithSphere(origin, direction, dragRadius_, &target)) continue;
                 const float targetYaw = std::atan2(target.x, -target.z);
@@ -1634,7 +1683,15 @@ private:
             }
 
             if (immersiveProjection) {
-                if (pressed) notifyPointer(-1.0f, -1.0f, 1);
+                if (pressed) {
+                    draggingHand_ = hand;
+                    draggingImmersive_ = true;
+                    immersiveDragStartPointerYaw_ =
+                        std::atan2(direction.x, -direction.z);
+                    immersiveDragStartVideoYaw_ =
+                        gImmersiveYawDegrees.load() * kPi / 180.0f;
+                    dragMoved_ = false;
+                }
                 if (inside) {
                     pointerVisible_ = true;
                     pointerOrigin_ = origin;
@@ -1935,11 +1992,14 @@ private:
         const XrQuaternionf orientation = views_[0].pose.orientation;
         const Vec3 forward = normalized(
             rotateVector(orientation, {0.0f, 0.0f, -1.0f}));
+        // Keep the panel facing the user's gaze, but derive its axes from world-up.
+        // Head pitch is preserved while head roll can never leave a recalled
+        // playback bar crooked.
         const Vec3 right = normalized(
-            rotateVector(orientation, {1.0f, 0.0f, 0.0f}),
+            cross(forward, {0.0f, 1.0f, 0.0f}),
             {1.0f, 0.0f, 0.0f});
         const Vec3 up = normalized(
-            rotateVector(orientation, {0.0f, 1.0f, 0.0f}),
+            cross(right, forward),
             {0.0f, 1.0f, 0.0f});
         headRelativeMenuBasis_ = {
             headCenter_ + forward * 2.0f,

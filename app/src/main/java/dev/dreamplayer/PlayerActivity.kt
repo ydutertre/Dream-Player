@@ -42,9 +42,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlaybackException
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMilliseconds
 import java.nio.ByteBuffer
@@ -191,6 +193,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var playbackBrowserReturn: BrowserReturnState? = null
     private var decoderMode = DecoderMode.AUTO
     private var effectiveDecoderMode = DecoderMode.HARDWARE
+    private var activeVideoDecoderName: String? = null
     private var healthLastElapsedMs = 0L
     private var healthLastPositionMs = 0L
     private var healthAnchorElapsedMs = 0L
@@ -811,6 +814,22 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
+    @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativeImmersiveOrientationChanged(yawDegrees: Float, pitchDegrees: Float) {
+        runOnUiThread {
+            if (
+                !yawDegrees.isFinite() ||
+                !pitchDegrees.isFinite() ||
+                currentProjection == VideoProjection.FLAT
+            ) {
+                return@runOnUiThread
+            }
+            immersiveYawDegrees = (yawDegrees + 180f).mod(360f) - 180f
+            immersivePitchDegrees = pitchDegrees.coerceIn(-80f, 80f)
+            persistProjectionSettings()
+        }
+    }
+
     @Suppress("unused") // Called once per OpenXR display frame from the render thread.
     fun onNativeFrame(frameTimeNanos: Long) {
         latestBrowserFrameNanos = frameTimeNanos
@@ -1243,6 +1262,7 @@ class PlayerActivity : Activity(), Player.Listener {
         browserReturn: BrowserReturnState? = null,
         resumeOverrideMs: Long? = null,
         autoSoftwareFallback: Boolean = false,
+        decoderModeOverride: DecoderMode? = null,
     ) {
         if (spec.uri != newSpec.uri) {
             remoteRecoveryAttempts = 0
@@ -1256,6 +1276,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 resumeOverrideMs,
                 autoSoftwareFallback,
                 externalSubtitles,
+                decoderModeOverride,
             )
             return
         }
@@ -1278,6 +1299,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     resumeOverrideMs,
                     autoSoftwareFallback,
                     discovered,
+                    decoderModeOverride,
                 )
             }
         }
@@ -1289,6 +1311,7 @@ class PlayerActivity : Activity(), Player.Listener {
         resumeOverrideMs: Long?,
         autoSoftwareFallback: Boolean,
         discoveredExternalSubtitles: List<ExternalSubtitle>,
+        decoderModeOverride: DecoderMode? = null,
     ) {
         mediaLoadGeneration++
         decoderFallbackPending = false
@@ -1317,9 +1340,10 @@ class PlayerActivity : Activity(), Player.Listener {
         audioTrackScrollOffset = 0f
         nativeSetSubtitle(renderSubtitle(emptyList()))
         val savedPlaybackState = mediaStateStore.loadPlaybackState(newSpec)
-        decoderMode = DecoderMode.fromWire(
+        decoderMode = decoderModeOverride ?: DecoderMode.fromWire(
             savedPlaybackState?.decoderMode ?: DecoderMode.AUTO.wireValue
         )
+        activeVideoDecoderName = null
         effectiveDecoderMode = when {
             decoderMode == DecoderMode.SOFTWARE -> DecoderMode.SOFTWARE
             decoderMode == DecoderMode.AUTO &&
@@ -1502,11 +1526,48 @@ class PlayerActivity : Activity(), Player.Listener {
         } else {
             DefaultLoadControl()
         }
+        val trackSelector = DefaultTrackSelector(this).apply {
+            parameters = buildUponParameters()
+                // Experimental 8K mode deliberately asks MediaCodec to try a stream just
+                // beyond the decoder's advertised performance envelope.
+                .setExceedRendererCapabilitiesIfNecessary(true)
+                .build()
+        }
         player = ExoPlayer.Builder(this, renderersFactory)
             .setLoadControl(loadControl)
+            .setTrackSelector(trackSelector)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
-            .also { it.addListener(this) }
+            .also {
+                it.addListener(this)
+                it.addAnalyticsListener(
+                    object : AnalyticsListener {
+                        override fun onVideoDecoderInitialized(
+                            eventTime: AnalyticsListener.EventTime,
+                            decoderName: String,
+                            initializedTimestampMs: Long,
+                            initializationDurationMs: Long,
+                        ) {
+                            activeVideoDecoderName = decoderName
+                            Log.i(
+                                "DreamPlayerDecoder",
+                                "Active video decoder: $decoderName " +
+                                    "(mode=${decoderMode.label}, " +
+                                    "init=${initializationDurationMs}ms)",
+                            )
+                            if (
+                                decoderMode ==
+                                DecoderMode.EXPERIMENTAL_8K_HARDWARE
+                            ) {
+                                showOsd(
+                                    "8K hardware active\n$decoderName",
+                                    6_000L,
+                                )
+                            }
+                        }
+                    },
+                )
+            }
         player.subtitleDelayMilliseconds = subtitleSyncMs.toLong()
         videoSurface?.let(player::setVideoSurface)
         val subtitleConfigurations = buildList {
@@ -2353,6 +2414,22 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     override fun onPlayerError(error: PlaybackException) {
+        if (decoderMode == DecoderMode.EXPERIMENTAL_8K_HARDWARE) {
+            Log.e(
+                "DreamPlayerDecoder",
+                "Experimental 8K hardware playback failed",
+                error,
+            )
+            message.text =
+                "8K hardware decoder failed\n${error.errorCodeName}\n" +
+                    error.message.orEmpty()
+            message.visibility = View.VISIBLE
+            showOsd(
+                "8K hardware decoder failed\n${error.errorCodeName}",
+                12_000L,
+            )
+            return
+        }
         if (
             decoderMode == DecoderMode.AUTO &&
             effectiveDecoderMode == DecoderMode.HARDWARE &&
@@ -3816,6 +3893,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     playbackBrowserReturn,
                     resumeOverrideMs = position,
                     autoSoftwareFallback = false,
+                    decoderModeOverride = selectedMode,
                 )
                 showOsd(
                     if (
@@ -6481,9 +6559,10 @@ class PlayerActivity : Activity(), Player.Listener {
                         decoderMode ==
                         DecoderMode.EXPERIMENTAL_8K_HARDWARE
                     ) {
-                        "Forces MediaCodec beyond its advertised 8K frame-rate limit."
+                        "Forces MediaCodec beyond its advertised 8K frame-rate limit.\n" +
+                            "Active: ${activeVideoDecoderName ?: "initializing\u2026"}"
                     } else {
-                        "Active now: ${effectiveDecoderMode.label}"
+                        "Active now: ${activeVideoDecoderName ?: effectiveDecoderMode.label}"
                     },
                     1024f, 700f, 27f, color = colorTextMuted,
                 )

@@ -103,7 +103,12 @@ open class NextRenderersFactory(context: Context) : DefaultRenderersFactory(cont
         if (
             extensionRendererMode == EXTENSION_RENDERER_MODE_OFF ||
             !ffmpegVideoEnabled
-        ) return
+        ) {
+            if (!ffmpegVideoEnabled) {
+                Log.i(TAG, "FfmpegVideoRenderer disabled; hardware-only video path.")
+            }
+            return
+        }
 
         var extensionRendererIndex = out.size
         if (extensionRendererMode == EXTENSION_RENDERER_MODE_PREFER) {
