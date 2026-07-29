@@ -39,6 +39,7 @@ import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlaybackException
 import androidx.media3.exoplayer.audio.AudioSink
@@ -167,11 +168,20 @@ class PlayerActivity : Activity(), Player.Listener {
     private var smbPath = ""
     private var smbShareListScrollOffset = 0f
     private val smbNavigationStack = ArrayDeque<SmbNavigationState>()
+    private var sftpProfiles: List<SftpProfile> = emptyList()
+    private var sftpProfile = SftpProfile()
+    private var sftpPortDraft = SftpProfile.DEFAULT_PORT.toString()
+    private var sftpEntries: List<SftpEntry> = emptyList()
+    private var sftpPath = "."
+    private var sftpProfileListScrollOffset = 0f
+    private val sftpNavigationStack = ArrayDeque<SftpNavigationState>()
+    private var pendingSftpHostKey: SftpHostKeyException? = null
     private var menuBitmap: Bitmap? = null
     private var keyboardField = KeyboardField.HOST
     private var keyboardSymbols = false
     private var keyboardUppercase = false
     private lateinit var smbCredentialStore: SmbCredentialStore
+    private lateinit var sftpProfileStore: SftpProfileStore
     private lateinit var mediaStateStore: MediaStateStore
     private var rememberSmbCredentials = false
     private var playbackBrowserReturn: BrowserReturnState? = null
@@ -183,6 +193,9 @@ class PlayerActivity : Activity(), Player.Listener {
     private var healthAnchorPositionMs = 0L
     private var abnormalClockSamples = 0
     private var decoderFallbackPending = false
+    private var remoteRecoveryAttempts = 0
+    private var remotePlaybackStableAtMs = 0L
+    private var networkStatusMessage: String? = null
     private var mediaLoadGeneration = 0
     private val stateSaver = object : Runnable {
         override fun run() {
@@ -278,6 +291,9 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class UiScreen {
         LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
         SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
+        SFTP_PROFILES, SFTP_LOGIN, SFTP_TRUST, FTP_WARNING,
+        SFTP_FILES, SFTP_KEYBOARD,
+        SFTP_DELETE_CONFIRM,
         FILE_SEARCH_KEYBOARD,
         PLAYBACK, PROJECTION, PICTURE, DECODER, AUDIO_SYNC, AUDIO_TRACKS, SUBTITLES,
     }
@@ -370,7 +386,11 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
-    private enum class KeyboardField { HOST, USERNAME, PASSWORD, DOMAIN, SEARCH }
+    private enum class KeyboardField {
+        HOST, USERNAME, PASSWORD, DOMAIN, SEARCH,
+        SFTP_NAME, SFTP_HOST, SFTP_PORT, SFTP_USERNAME, SFTP_PASSWORD,
+        SFTP_PATH,
+    }
 
     private enum class BrowserSortField(val label: String) {
         NAME("Name"),
@@ -392,6 +412,13 @@ class PlayerActivity : Activity(), Player.Listener {
             val entries: List<SmbEntry>,
             val scrollOffset: Float,
             val searchQuery: String,
+        ) : BrowserReturnState
+
+        data class Remote(
+            val profile: SftpProfile,
+            val path: String,
+            val entries: List<SftpEntry>,
+            val scrollOffset: Float,
         ) : BrowserReturnState
     }
 
@@ -438,6 +465,8 @@ class PlayerActivity : Activity(), Player.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         smbCredentialStore = SmbCredentialStore(this)
+        sftpProfileStore = SftpProfileStore(this)
+        sftpProfiles = sftpProfileStore.load()
         mediaStateStore = MediaStateStore(this)
         sceneBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
@@ -799,7 +828,9 @@ class PlayerActivity : Activity(), Player.Listener {
         UiScreen.LOCAL_FILES,
         UiScreen.SMB_SERVERS,
         UiScreen.SMB_SHARES,
-        UiScreen.SMB_FILES -> true
+        UiScreen.SMB_FILES,
+        UiScreen.SFTP_PROFILES,
+        UiScreen.SFTP_FILES -> true
         else -> false
     }
 
@@ -821,6 +852,21 @@ class PlayerActivity : Activity(), Player.Listener {
             .build()
             .toString()
         return PlaybackSpec(uri, entry.name, StereoMode.MONO, smb = smbCredentials)
+    }
+
+    private fun remotePlaybackSpec(entry: SftpEntry): PlaybackSpec {
+        val uri = Uri.Builder()
+            .scheme(sftpProfile.protocol.name.lowercase(Locale.ROOT))
+            .encodedAuthority("${sftpProfile.host}:${sftpProfile.port}")
+            .path(entry.path)
+            .build()
+            .toString()
+        return PlaybackSpec(
+            uri,
+            entry.name,
+            StereoMode.MONO,
+            remote = sftpProfile,
+        )
     }
 
     private fun directedComparison(comparison: Int): Int =
@@ -924,6 +970,8 @@ class PlayerActivity : Activity(), Player.Listener {
         UiScreen.SMB_SERVERS -> smbServers.size
         UiScreen.SMB_SHARES -> smbShares.size
         UiScreen.SMB_FILES -> smbBrowserItems.size
+        UiScreen.SFTP_PROFILES -> sftpProfiles.size
+        UiScreen.SFTP_FILES -> sftpEntries.size
         else -> 0
     }
 
@@ -1191,6 +1239,11 @@ class PlayerActivity : Activity(), Player.Listener {
         resumeOverrideMs: Long? = null,
         autoSoftwareFallback: Boolean = false,
     ) {
+        if (spec.uri != newSpec.uri) {
+            remoteRecoveryAttempts = 0
+            remotePlaybackStableAtMs = 0L
+            networkStatusMessage = null
+        }
         if (mediaLoaded && spec.uri == newSpec.uri) {
             loadMediaResolved(
                 newSpec,
@@ -1385,10 +1438,13 @@ class PlayerActivity : Activity(), Player.Listener {
             ?.coerceIn(-AudioSyncAudioProcessor.MAX_DELAY_MS, AudioSyncAudioProcessor.MAX_DELAY_MS)
             ?: 0
         audioSyncProcessor = AudioSyncAudioProcessor(audioSyncMs)
-        val dataSourceFactory = if (newSpec.uri.startsWith("smb://")) {
-            SmbDataSource.Factory(requireNotNull(newSpec.smb))
-        } else {
-            DefaultDataSource.Factory(this)
+        val isRemoteNetworkMedia = newSpec.remote != null
+        val dataSourceFactory = when {
+            newSpec.uri.startsWith("smb://") ->
+                SmbDataSource.Factory(requireNotNull(newSpec.smb))
+            isRemoteNetworkMedia ->
+                RemoteMediaDataSource.Factory(requireNotNull(newSpec.remote))
+            else -> DefaultDataSource.Factory(this)
         }
         val renderersFactory = object : NextRenderersFactory(this@PlayerActivity) {
             override fun buildAudioSink(
@@ -1413,7 +1469,21 @@ class PlayerActivity : Activity(), Player.Listener {
                 }
             )
         }
+        val loadControl = if (isRemoteNetworkMedia) {
+            DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    REMOTE_MIN_BUFFER_MS,
+                    REMOTE_MAX_BUFFER_MS,
+                    REMOTE_PLAYBACK_BUFFER_MS,
+                    REMOTE_REBUFFER_MS,
+                )
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .build()
+        } else {
+            DefaultLoadControl()
+        }
         player = ExoPlayer.Builder(this, renderersFactory)
+            .setLoadControl(loadControl)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
             .also { it.addListener(this) }
@@ -1457,6 +1527,12 @@ class PlayerActivity : Activity(), Player.Listener {
         player.playWhenReady = activityResumed
         resumePlaybackOnForeground = !activityResumed
         mediaLoaded = true
+        if (isRemoteNetworkMedia) {
+            val status =
+                "Buffering ${newSpec.remote?.protocol?.label.orEmpty()} media…"
+            networkStatusMessage = status
+            transientMessage = status
+        }
         if (resumeOverrideMs != null) {
             saveCurrentMediaState(positionOverrideMs = resumeOverrideMs)
         }
@@ -1498,6 +1574,37 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun playRecent(index: Int) {
         val recent = recentMedia.getOrNull(index) ?: return
         val parsed = Uri.parse(recent.uri)
+        val remoteProtocol = when (parsed.scheme?.lowercase(Locale.ROOT)) {
+            "sftp" -> RemoteProtocol.SFTP
+            "ftps" -> RemoteProtocol.FTPS
+            "ftp" -> RemoteProtocol.FTP
+            else -> null
+        }
+        if (remoteProtocol != null) {
+            val defaultPort = remoteProtocol.defaultPort
+            val port = parsed.port.takeIf { it > 0 } ?: defaultPort
+            val remoteProfile = sftpProfiles.firstOrNull {
+                it.protocol == remoteProtocol &&
+                    it.port == port &&
+                    it.host.equals(parsed.host, ignoreCase = true)
+            }
+            if (remoteProfile == null) {
+                transientMessage =
+                    "Cannot reopen remote file: its saved server profile is unavailable"
+                renderVrMenu()
+                return
+            }
+            transientMessage = null
+            loadMedia(
+                PlaybackSpec(
+                    recent.uri,
+                    recent.title,
+                    StereoMode.MONO,
+                    remote = remoteProfile,
+                )
+            )
+            return
+        }
         if (!parsed.scheme.equals("smb", ignoreCase = true)) {
             transientMessage = null
             loadMedia(PlaybackSpec(recent.uri, recent.title, StereoMode.MONO))
@@ -1580,6 +1687,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 rebuildBrowserItems()
                 browserScrollOffset = destination.scrollOffset
                 uiScreen = UiScreen.SMB_FILES
+                renderVrMenu()
+            }
+            is BrowserReturnState.Remote -> {
+                sftpProfile = destination.profile
+                sftpPortDraft = destination.profile.port.toString()
+                sftpPath = destination.path
+                sftpEntries = destination.entries
+                browserScrollOffset = destination.scrollOffset
+                uiScreen = UiScreen.SFTP_FILES
                 renderVrMenu()
             }
             null -> showLibrary()
@@ -1804,6 +1920,218 @@ class PlayerActivity : Activity(), Player.Listener {
         }.take(100)
     }
 
+    private fun showSftpProfiles() {
+        sftpProfiles = sftpProfileStore.load()
+        uiScreen = UiScreen.SFTP_PROFILES
+        browserScrollOffset = sftpProfileListScrollOffset
+        transientMessage = null
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun showSftpLogin(
+        profile: SftpProfile = SftpProfile(),
+        errorMessage: String? = null,
+    ) {
+        sftpProfile = profile
+        sftpPortDraft = profile.port.toString()
+        pendingSftpHostKey = null
+        uiScreen = UiScreen.SFTP_LOGIN
+        transientMessage = errorMessage
+        hoveredButton = null
+        renderVrMenu()
+    }
+
+    private fun persistSftpProfile(profile: SftpProfile) {
+        val normalized = profile.normalized()
+        sftpProfiles = (
+            sftpProfiles.filterNot { it.id == normalized.id } + normalized
+        ).sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.displayName })
+        sftpProfileStore.save(sftpProfiles)
+    }
+
+    private fun connectSftp() {
+        val profile = sftpProfile.normalized()
+        when {
+            profile.host.isBlank() -> {
+                transientMessage =
+                    "Enter a ${profile.protocol.label} hostname or IP address"
+                renderVrMenu()
+                return
+            }
+            profile.username.isBlank() -> {
+                transientMessage = "Enter a ${profile.protocol.label} username"
+                renderVrMenu()
+                return
+            }
+            profile.password.isBlank() -> {
+                transientMessage = "Enter the ${profile.protocol.label} password"
+                renderVrMenu()
+                return
+            }
+        }
+        // Save the selected protocol and credentials before connecting so a
+        // failed attempt or an in-place app update does not make the user
+        // re-enter the profile. Password persistence still follows the
+        // profile's explicit "remember password" choice.
+        persistSftpProfile(profile)
+        if (
+            profile.protocol == RemoteProtocol.FTP &&
+            !profile.allowInsecureFtp
+        ) {
+            sftpProfile = profile
+            transientMessage = null
+            uiScreen = UiScreen.FTP_WARNING
+            hoveredButton = null
+            renderVrMenu()
+            return
+        }
+        sftpProfile = profile
+        transientMessage = "Connecting to ${profile.host}..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                when (profile.protocol) {
+                    RemoteProtocol.SFTP ->
+                        SftpRepository(profile).use { repository ->
+                            val root =
+                                repository.canonicalize(profile.startPath)
+                            root to repository.list(root)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
+                    RemoteProtocol.FTPS,
+                    RemoteProtocol.FTP ->
+                        FtpRepository(profile).use { repository ->
+                            val root =
+                                repository.canonicalize(profile.startPath)
+                            root to repository.list(root)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
+                }
+            }.onSuccess { (root, entries) -> runOnUiThread {
+                sftpPath = root
+                sftpEntries = entries
+                sftpNavigationStack.clear()
+                browserScrollOffset = 0f
+                pendingSftpHostKey = null
+                persistSftpProfile(profile)
+                transientMessage = null
+                uiScreen = UiScreen.SFTP_FILES
+                hoveredButton = null
+                renderVrMenu()
+            } }.onFailure { error -> runOnUiThread {
+                Log.e(
+                    "DreamPlayerRemote",
+                    "${profile.protocol.label} connection or initial listing failed",
+                    error,
+                )
+                val hostKeyError = generateSequence(error) { it.cause }
+                    .filterIsInstance<SftpHostKeyException>()
+                    .firstOrNull()
+                if (hostKeyError != null) {
+                    pendingSftpHostKey = hostKeyError
+                    transientMessage = null
+                    uiScreen = UiScreen.SFTP_TRUST
+                    hoveredButton = null
+                    renderVrMenu()
+                } else {
+                    transientMessage =
+                        "${profile.protocol.label} connection failed: " +
+                            friendlySftpError(error)
+                    uiScreen = UiScreen.SFTP_LOGIN
+                    renderVrMenu()
+                }
+            } }
+        }
+    }
+
+    private fun browseSftp(
+        path: String,
+        restoreScrollOffset: Float = 0f,
+        rollbackNavigationOnFailure: Boolean = false,
+    ) {
+        val profile = sftpProfile
+        transientMessage = "Loading $path..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                when (profile.protocol) {
+                    RemoteProtocol.SFTP ->
+                        SftpRepository(profile).use { repository ->
+                            repository.list(path)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
+                    RemoteProtocol.FTPS,
+                    RemoteProtocol.FTP ->
+                        FtpRepository(profile).use { repository ->
+                            repository.list(path)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
+                }
+            }.onSuccess { entries -> runOnUiThread {
+                sftpPath = path
+                sftpEntries = entries
+                browserScrollOffset = restoreScrollOffset
+                transientMessage = null
+                uiScreen = UiScreen.SFTP_FILES
+                hoveredButton = null
+                renderVrMenu()
+            } }.onFailure { error -> runOnUiThread {
+                Log.e(
+                    "DreamPlayerRemote",
+                    "${profile.protocol.label} folder listing failed",
+                    error,
+                )
+                if (
+                    rollbackNavigationOnFailure &&
+                    sftpNavigationStack.isNotEmpty()
+                ) {
+                    sftpNavigationStack.removeLast()
+                }
+                transientMessage =
+                    "${profile.protocol.label} folder error: " +
+                        friendlySftpError(error)
+                renderVrMenu()
+            } }
+        }
+    }
+
+    private fun friendlySftpError(error: Throwable): String {
+        val chain = generateSequence(error) { it.cause }.toList()
+        val messages = chain.mapNotNull { it.message }
+            .filter { it.isNotBlank() }
+        val message = messages.firstOrNull().orEmpty()
+        val combined = messages.joinToString(" | ")
+        return when {
+            combined.contains("identification", true) ||
+                combined.contains("protocol version", true) ->
+                "this port is not SFTP; select FTP or FTPS"
+            combined.contains("certificate", true) ||
+                combined.contains("certpath", true) ->
+                "the FTPS certificate or hostname could not be verified"
+            combined.contains("SSL", true) ||
+                combined.contains("TLS", true) ->
+                "the server does not appear to support explicit FTPS"
+            combined.contains("auth", true) ||
+                combined.contains("permission", true) ->
+                "check username and password"
+            combined.contains("timed out", true) -> "server timed out"
+            combined.contains("refused", true) -> "connection was refused"
+            combined.contains("no such file", true) ||
+                combined.contains("not found", true) ->
+                "start folder was not found"
+            else -> message.ifBlank { error.javaClass.simpleName }
+        }.replace('\n', ' ').take(120)
+    }
+
     private fun isVideoFile(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in setOf(
         "mkv", "mp4", "m4v", "mov", "avi", "webm", "ts", "m2ts", "mts", "mpg", "mpeg", "wmv",
     )
@@ -1981,6 +2309,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     override fun onPlaybackStateChanged(playbackState: Int) {
+        updateNetworkPlaybackStatus(playbackState)
         if (
             playbackState == Player.STATE_READY &&
             mediaLoaded &&
@@ -1998,6 +2327,9 @@ class PlayerActivity : Activity(), Player.Listener {
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
         if (isPlaying) playbackCompleted = false
+        if (isPlaying && spec.remote != null && remotePlaybackStableAtMs == 0L) {
+            remotePlaybackStableAtMs = SystemClock.elapsedRealtime()
+        }
     }
 
     override fun onPlayerError(error: PlaybackException) {
@@ -2017,9 +2349,118 @@ class PlayerActivity : Activity(), Player.Listener {
             )
             return
         }
+        if (scheduleRemotePlaybackRecovery(error)) return
+        if (spec.remote != null) {
+            val friendly = friendlyRemotePlaybackError(error)
+            message.text = "Remote playback stopped\n$friendly"
+            message.visibility = View.VISIBLE
+            showOsd("Remote playback stopped\n$friendly", 12_000L)
+            return
+        }
         message.text = "Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}"
         message.visibility = View.VISIBLE
         showOsd("Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}", 10_000L)
+    }
+
+    private fun updateNetworkPlaybackStatus(playbackState: Int) {
+        if (spec.remote == null || !mediaLoaded) return
+        when (playbackState) {
+            Player.STATE_BUFFERING -> {
+                val status = if (player.currentPosition > 0L) {
+                    "Network slowed down • buffering…"
+                } else {
+                    "Buffering ${spec.remote?.protocol?.label.orEmpty()} media…"
+                }
+                networkStatusMessage = status
+                transientMessage = status
+                showControls(0L)
+            }
+            Player.STATE_READY -> {
+                networkStatusMessage?.let { status ->
+                    if (transientMessage == status) transientMessage = null
+                }
+                networkStatusMessage = null
+                if (
+                    remotePlaybackStableAtMs > 0L &&
+                    SystemClock.elapsedRealtime() - remotePlaybackStableAtMs >
+                        REMOTE_STABLE_RESET_MS
+                ) {
+                    remoteRecoveryAttempts = 0
+                    remotePlaybackStableAtMs = SystemClock.elapsedRealtime()
+                }
+                if (uiVisible) renderVrMenu()
+            }
+        }
+    }
+
+    private fun scheduleRemotePlaybackRecovery(
+        error: PlaybackException,
+    ): Boolean {
+        spec.remote ?: return false
+        if (
+            remotePlaybackStableAtMs > 0L &&
+            SystemClock.elapsedRealtime() - remotePlaybackStableAtMs >
+                REMOTE_STABLE_RESET_MS
+        ) {
+            remoteRecoveryAttempts = 0
+        }
+        if (remoteRecoveryAttempts >= REMOTE_PLAYER_RETRY_COUNT) return false
+        val networkFailure = generateSequence<Throwable>(error) { it.cause }
+            .any {
+                it is java.io.IOException ||
+                    it is java.net.SocketException ||
+                    it is java.net.SocketTimeoutException
+            }
+        if (!networkFailure) return false
+        remoteRecoveryAttempts++
+        val attempt = remoteRecoveryAttempts
+        val position = player.currentPosition.coerceAtLeast(0L)
+        val failedSpec = spec
+        val returnState = playbackBrowserReturn
+        val status =
+            "Connection interrupted • reconnecting $attempt/$REMOTE_PLAYER_RETRY_COUNT…"
+        networkStatusMessage = status
+        transientMessage = status
+        showControls(0L)
+        Log.w(
+            "DreamPlayerRemote",
+            "Playback connection failed; retry $attempt at $position ms",
+            error,
+        )
+        mainHandler.postDelayed({
+            if (!mediaLoaded || spec != failedSpec) return@postDelayed
+            loadMedia(
+                failedSpec,
+                returnState,
+                resumeOverrideMs = position,
+            )
+        }, REMOTE_PLAYER_RETRY_DELAY_MS * attempt)
+        return true
+    }
+
+    private fun friendlyRemotePlaybackError(
+        error: PlaybackException,
+    ): String {
+        val details = generateSequence<Throwable>(error) { it.cause }
+            .mapNotNull { it.message }
+            .joinToString(" ")
+            .lowercase(Locale.ROOT)
+        return when {
+            "authentication" in details || "login" in details ->
+                "The saved username or password was rejected."
+            "timed out" in details || "timeout" in details ->
+                "The server stopped responding. Check the connection and try again."
+            "unknownhost" in details || "unable to resolve" in details ->
+                "The server name could not be resolved."
+            "refused" in details ->
+                "The server refused the connection on the configured port."
+            "not found" in details || "no such file" in details ->
+                "The remote file is no longer available."
+            "certificate" in details || "handshake" in details ->
+                "The FTPS certificate or secure connection could not be verified."
+            else ->
+                "Playback stopped after $REMOTE_PLAYER_RETRY_COUNT reconnection attempts."
+        }
     }
 
     private fun isVideoDecoderFailure(error: PlaybackException): Boolean {
@@ -2375,6 +2816,173 @@ class PlayerActivity : Activity(), Player.Listener {
                 playRecent(id.removePrefix("recent_").toInt())
             id == "open_local" -> openLocalBrowser()
             id == "open_smb" -> discoverSmbServers()
+            id == "open_sftp" -> showSftpProfiles()
+            id == "sftp_profiles_back" -> {
+                sftpProfileListScrollOffset = browserScrollOffset
+                showLibrary()
+            }
+            id == "sftp_add_profile" -> showSftpLogin()
+            id.startsWith("sftp_profile_") -> {
+                sftpProfileListScrollOffset = browserScrollOffset
+                val profile =
+                    sftpProfiles[id.removePrefix("sftp_profile_").toInt()]
+                if (profile.password.isBlank()) {
+                    showSftpLogin(
+                        profile,
+                        "Enter the password to connect",
+                    )
+                } else {
+                    sftpProfile = profile
+                    connectSftp()
+                }
+            }
+            id.startsWith("sftp_edit_") -> {
+                sftpProfileListScrollOffset = browserScrollOffset
+                showSftpLogin(
+                    sftpProfiles[id.removePrefix("sftp_edit_").toInt()]
+                )
+            }
+            id.startsWith("sftp_field_") -> {
+                keyboardField = when (id.removePrefix("sftp_field_")) {
+                    "name" -> KeyboardField.SFTP_NAME
+                    "port" -> KeyboardField.SFTP_PORT
+                    "user" -> KeyboardField.SFTP_USERNAME
+                    "password" -> KeyboardField.SFTP_PASSWORD
+                    "path" -> KeyboardField.SFTP_PATH
+                    else -> KeyboardField.SFTP_HOST
+                }
+                keyboardSymbols = false
+                keyboardUppercase = false
+                uiScreen = UiScreen.SFTP_KEYBOARD
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id.startsWith("remote_protocol_") -> {
+                val newProtocol = when (
+                    id.removePrefix("remote_protocol_")
+                ) {
+                    "ftps" -> RemoteProtocol.FTPS
+                    "ftp" -> RemoteProtocol.FTP
+                    else -> RemoteProtocol.SFTP
+                }
+                val oldProtocol = sftpProfile.protocol
+                val port = if (
+                    sftpProfile.port == oldProtocol.defaultPort
+                ) {
+                    newProtocol.defaultPort
+                } else {
+                    sftpProfile.port
+                }
+                sftpProfile = sftpProfile.copy(
+                    protocol = newProtocol,
+                    port = port,
+                    hostKeyFingerprint = if (
+                        newProtocol == RemoteProtocol.SFTP &&
+                        oldProtocol == RemoteProtocol.SFTP
+                    ) {
+                        sftpProfile.hostKeyFingerprint
+                    } else {
+                        ""
+                    },
+                    allowInsecureFtp = false,
+                )
+                sftpPortDraft = port.toString()
+                transientMessage = null
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_remember_password" -> {
+                sftpProfile = sftpProfile.copy(
+                    rememberPassword = !sftpProfile.rememberPassword,
+                )
+                renderVrMenu()
+            }
+            id == "sftp_connect" -> connectSftp()
+            id == "ftp_warning_cancel" -> {
+                uiScreen = UiScreen.SFTP_LOGIN
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "ftp_warning_continue" -> {
+                sftpProfile = sftpProfile.copy(allowInsecureFtp = true)
+                connectSftp()
+            }
+            id == "sftp_login_back" -> showSftpProfiles()
+            id == "sftp_delete" -> {
+                uiScreen = UiScreen.SFTP_DELETE_CONFIRM
+                transientMessage = null
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_delete_cancel" -> {
+                uiScreen = UiScreen.SFTP_LOGIN
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_delete_confirm" -> {
+                sftpProfiles =
+                    sftpProfiles.filterNot { it.id == sftpProfile.id }
+                sftpProfileStore.save(sftpProfiles)
+                showSftpProfiles()
+            }
+            id == "sftp_trust_cancel" -> {
+                pendingSftpHostKey = null
+                uiScreen = UiScreen.SFTP_LOGIN
+                transientMessage = "Server identity was not trusted"
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "sftp_trust_accept" -> {
+                val pending = pendingSftpHostKey
+                if (pending != null) {
+                    sftpProfile = sftpProfile.copy(
+                        hostKeyFingerprint = pending.actualFingerprint,
+                    )
+                    pendingSftpHostKey = null
+                    connectSftp()
+                }
+            }
+            id == "sftp_files_back" -> {
+                val parent = if (sftpNavigationStack.isEmpty()) null
+                else sftpNavigationStack.removeLast()
+                if (parent != null) {
+                    sftpPath = parent.path
+                    sftpEntries = parent.entries
+                    browserScrollOffset = parent.scrollOffset
+                    transientMessage = null
+                    hoveredButton = null
+                    renderVrMenu()
+                } else {
+                    showSftpProfiles()
+                }
+            }
+            id.startsWith("sftp_entry_") -> {
+                val entry =
+                    sftpEntries[id.removePrefix("sftp_entry_").toInt()]
+                if (entry.isDirectory) {
+                    sftpNavigationStack.addLast(
+                        SftpNavigationState(
+                            sftpPath,
+                            sftpEntries.toList(),
+                            browserScrollOffset,
+                        )
+                    )
+                    browseSftp(
+                        entry.path,
+                        rollbackNavigationOnFailure = true,
+                    )
+                } else {
+                    loadMedia(
+                        remotePlaybackSpec(entry),
+                        BrowserReturnState.Remote(
+                            profile = sftpProfile,
+                            path = sftpPath,
+                            entries = sftpEntries.toList(),
+                            scrollOffset = browserScrollOffset,
+                        ),
+                    )
+                }
+            }
             id == "smb_add_server" -> showSmbLogin("", "")
             id == "smb_discover_again" -> discoverSmbServers()
             id == "smb_servers_back" -> showLibrary()
@@ -2497,6 +3105,8 @@ class PlayerActivity : Activity(), Player.Listener {
                     rebuildBrowserItems()
                     browserScrollOffset = 0f
                     uiScreen = browserSearchReturnScreen
+                } else if (uiScreen == UiScreen.SFTP_KEYBOARD) {
+                    uiScreen = UiScreen.SFTP_LOGIN
                 } else {
                     uiScreen = UiScreen.SMB_LOGIN
                 }
@@ -2506,6 +3116,8 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "key_cancel" -> {
                 uiScreen = if (uiScreen == UiScreen.FILE_SEARCH_KEYBOARD) {
                     browserSearchReturnScreen
+                } else if (uiScreen == UiScreen.SFTP_KEYBOARD) {
+                    UiScreen.SFTP_LOGIN
                 } else {
                     UiScreen.SMB_LOGIN
                 }
@@ -2514,7 +3126,14 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             id.startsWith("key_char_") -> {
                 val character = id.removePrefix("key_char_").toInt().toChar()
-                if (keyboardValue().length < 64) setKeyboardValue(keyboardValue() + character)
+                val maximumLength = when (keyboardField) {
+                    KeyboardField.SFTP_PATH,
+                    KeyboardField.SFTP_PASSWORD -> 256
+                    else -> 64
+                }
+                if (keyboardValue().length < maximumLength) {
+                    setKeyboardValue(keyboardValue() + character)
+                }
                 renderVrMenu()
             }
             id == "exit" -> finish()
@@ -3168,6 +3787,12 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.PASSWORD -> smbCredentials.password
         KeyboardField.DOMAIN -> smbCredentials.domain
         KeyboardField.SEARCH -> browserSearchDraft
+        KeyboardField.SFTP_NAME -> sftpProfile.name
+        KeyboardField.SFTP_HOST -> sftpProfile.host
+        KeyboardField.SFTP_PORT -> sftpPortDraft
+        KeyboardField.SFTP_USERNAME -> sftpProfile.username
+        KeyboardField.SFTP_PASSWORD -> sftpProfile.password
+        KeyboardField.SFTP_PATH -> sftpProfile.startPath
     }
 
     private fun setKeyboardValue(value: String) {
@@ -3180,6 +3805,45 @@ class PlayerActivity : Activity(), Player.Listener {
                 browserSearchDraft = value
                 smbCredentials
             }
+            else -> smbCredentials
+        }
+        sftpProfile = when (keyboardField) {
+            KeyboardField.SFTP_NAME -> sftpProfile.copy(name = value)
+            KeyboardField.SFTP_HOST -> sftpProfile.copy(
+                host = value,
+                hostKeyFingerprint = if (
+                    value.trim().equals(
+                        sftpProfile.host.trim(),
+                        ignoreCase = true,
+                    )
+                ) {
+                    sftpProfile.hostKeyFingerprint
+                } else {
+                    ""
+                },
+            )
+            KeyboardField.SFTP_PORT -> {
+                sftpPortDraft = value.filter(Char::isDigit).take(5)
+                val adjustedPort = sftpPortDraft.toIntOrNull()
+                    ?.coerceIn(1, 65_535)
+                    ?: sftpProfile.port
+                sftpProfile.copy(
+                    port = adjustedPort,
+                    hostKeyFingerprint = if (
+                        adjustedPort == sftpProfile.port
+                    ) {
+                        sftpProfile.hostKeyFingerprint
+                    } else {
+                        ""
+                    },
+                )
+            }
+            KeyboardField.SFTP_USERNAME ->
+                sftpProfile.copy(username = value)
+            KeyboardField.SFTP_PASSWORD ->
+                sftpProfile.copy(password = value)
+            KeyboardField.SFTP_PATH -> sftpProfile.copy(startPath = value)
+            else -> sftpProfile
         }
     }
 
@@ -3189,6 +3853,15 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.PASSWORD -> "Password"
         KeyboardField.DOMAIN -> "Domain (usually blank)"
         KeyboardField.SEARCH -> "Search file names"
+        KeyboardField.SFTP_NAME -> "Profile name"
+        KeyboardField.SFTP_HOST ->
+            "${sftpProfile.protocol.label} hostname or IP"
+        KeyboardField.SFTP_PORT -> "${sftpProfile.protocol.label} port"
+        KeyboardField.SFTP_USERNAME ->
+            "${sftpProfile.protocol.label} username"
+        KeyboardField.SFTP_PASSWORD ->
+            "${sftpProfile.protocol.label} password"
+        KeyboardField.SFTP_PATH -> "Starting folder"
     }
 
     private fun renderSubtitle(lines: List<String>): Bitmap {
@@ -4357,16 +5030,17 @@ class PlayerActivity : Activity(), Player.Listener {
                 canvas.drawRoundRect(885f, 60f, 1958f, 955f, 42f, 42f, panelPaint)
                 text("Dream Player", 468f, 190f, 76f)
                 text("Choose a source", 468f, 252f, 36f, color = colorTextMuted)
-                button("open_local", "Local video library", RectF(155f, 330f, 780f, 465f), fontSize = 42f)
-                button("open_smb", "Network shares (SMB)", RectF(155f, 505f, 780f, 640f), fontSize = 42f)
+                button("open_local", "Local video library", RectF(155f, 295f, 780f, 405f), fontSize = 38f)
+                button("open_smb", "Network shares (SMB)", RectF(155f, 435f, 780f, 545f), fontSize = 38f)
+                button("open_sftp", "Internet server (FTP/SFTP)", RectF(155f, 575f, 780f, 685f), fontSize = 38f)
                 text(
                     "Browse without leaving VR.",
                     468f,
-                    715f,
+                    750f,
                     29f,
                     color = colorTextMuted,
                 )
-                button("exit", "Exit", RectF(265f, 795f, 670f, 895f), fontSize = 38f)
+                button("exit", "Exit", RectF(265f, 825f, 670f, 910f), fontSize = 36f)
 
                 text("Recently played", 1422f, 145f, 50f)
                 if (recentMedia.isEmpty()) {
@@ -4510,12 +5184,249 @@ class PlayerActivity : Activity(), Player.Listener {
                 button("smb_files_back", "Up", RectF(250f, 885f, 570f, 950f), fontSize = 36f)
                 text("${smbBrowserItems.size} items  •  Joystick ↑/↓ to scroll", 1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted)
             }
+            UiScreen.SFTP_PROFILES -> {
+                canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
+                text("Internet servers", 1024f, 135f, 64f)
+                scrollableList(sftpProfiles.size, 90f, 72f) { index, bounds ->
+                    val profile = sftpProfiles[index]
+                    browserEntryButton(
+                        "sftp_profile_$index",
+                        profile.displayName,
+                        "${profile.protocol.label}  •  ${profile.username}@${profile.host}:${profile.port}",
+                        RectF(250f, bounds.top, 1580f, bounds.bottom),
+                        true,
+                    )
+                    button(
+                        "sftp_edit_$index", "Edit",
+                        RectF(1600f, bounds.top, 1810f, bounds.bottom),
+                        fontSize = 28f,
+                    )
+                }
+                if (sftpProfiles.isEmpty()) {
+                    text("No Internet servers saved yet.", 1024f, 440f, 44f)
+                    text(
+                        "Add an SFTP, FTPS, or FTP server.",
+                        1024f, 500f, 27f, color = colorTextMuted,
+                    )
+                }
+                button(
+                    "sftp_profiles_back", "Back",
+                    RectF(250f, 885f, 570f, 950f), fontSize = 36f,
+                )
+                button(
+                    "sftp_add_profile", "Add server",
+                    RectF(620f, 885f, 1010f, 950f), fontSize = 36f,
+                )
+                text(
+                    "${sftpProfiles.size} servers  •  Joystick ↑/↓ to scroll",
+                    1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted,
+                )
+            }
+            UiScreen.SFTP_LOGIN -> {
+                canvas.drawRoundRect(170f, 35f, 1878f, 990f, 42f, 42f, panelPaint)
+                text("Internet server profile", 1024f, 92f, 50f)
+                button(
+                    "remote_protocol_sftp", "SFTP",
+                    RectF(665f, 110f, 985f, 172f),
+                    sftpProfile.protocol == RemoteProtocol.SFTP,
+                    fontSize = 27f,
+                )
+                button(
+                    "remote_protocol_ftps", "FTPS",
+                    RectF(1000f, 110f, 1320f, 172f),
+                    sftpProfile.protocol == RemoteProtocol.FTPS,
+                    fontSize = 27f,
+                )
+                button(
+                    "remote_protocol_ftp", "FTP",
+                    RectF(1335f, 110f, 1655f, 172f),
+                    sftpProfile.protocol == RemoteProtocol.FTP,
+                    fontSize = 27f,
+                )
+                fun field(
+                    id: String,
+                    label: String,
+                    value: String,
+                    top: Float,
+                    secret: Boolean = false,
+                ) {
+                    text(label, 310f, top + 51f, 30f, Paint.Align.LEFT)
+                    val shown = if (secret && value.isNotEmpty()) {
+                        "•".repeat(value.length.coerceAtMost(24))
+                    } else {
+                        value.ifBlank { "Select to enter" }
+                    }
+                    button(
+                        "sftp_field_$id", shown.take(42),
+                        RectF(665f, top, 1710f, top + 70f),
+                        fontSize = 31f,
+                    )
+                }
+                field("name", "Profile name", sftpProfile.name, 190f)
+                field("host", "Host", sftpProfile.host, 275f)
+                field("port", "Port", sftpPortDraft, 360f)
+                field("user", "Username", sftpProfile.username, 445f)
+                field("password", "Password", sftpProfile.password, 530f, true)
+                field("path", "Start folder", sftpProfile.startPath, 615f)
+                checkbox(
+                    "sftp_remember_password",
+                    "Remember password securely",
+                    RectF(560f, 700f, 1488f, 762f),
+                    sftpProfile.rememberPassword,
+                )
+                if (sftpProfiles.any { it.id == sftpProfile.id }) {
+                    button(
+                        "sftp_delete", "Delete",
+                        RectF(260f, 805f, 540f, 895f), fontSize = 32f,
+                    )
+                }
+                button(
+                    "sftp_login_back", "Back",
+                    RectF(600f, 805f, 940f, 895f), fontSize = 34f,
+                )
+                button(
+                    "sftp_connect", "Save & browse",
+                    RectF(980f, 805f, 1690f, 895f), fontSize = 34f,
+                )
+                text(
+                    when (sftpProfile.protocol) {
+                        RemoteProtocol.SFTP ->
+                            "The SSH fingerprint is verified before authentication."
+                        RemoteProtocol.FTPS ->
+                            "Explicit TLS with certificate and hostname validation."
+                        RemoteProtocol.FTP ->
+                            "Plain FTP is unencrypted and requires explicit confirmation."
+                    },
+                    1024f, 945f, 22f, color = colorTextMuted,
+                )
+            }
+            UiScreen.SFTP_TRUST -> {
+                val pending = pendingSftpHostKey
+                val changed = pending is SftpHostKeyException.Changed
+                canvas.drawRoundRect(240f, 90f, 1808f, 930f, 42f, 42f, panelPaint)
+                text(
+                    if (changed) "Warning: server identity changed" else "Verify SFTP server",
+                    1024f, 190f, 55f,
+                    color = if (changed) Color.rgb(255, 150, 150) else colorText,
+                )
+                text(
+                    if (changed) {
+                        "Continue only if you intentionally changed the server key."
+                    } else {
+                        "Confirm this fingerprint matches the one shown by your server."
+                    },
+                    1024f, 270f, 27f, color = colorTextMuted,
+                )
+                text(
+                    "${sftpProfile.host}:${sftpProfile.port}",
+                    1024f, 350f, 34f,
+                )
+                text(
+                    pending?.algorithm.orEmpty(),
+                    1024f, 405f, 24f, color = colorTextMuted,
+                )
+                val fingerprint = pending?.actualFingerprint.orEmpty()
+                text(fingerprint.take(36), 1024f, 495f, 32f)
+                text(fingerprint.drop(36), 1024f, 545f, 32f)
+                button(
+                    "sftp_trust_cancel", "Cancel",
+                    RectF(390f, 700f, 900f, 815f), fontSize = 36f,
+                )
+                button(
+                    "sftp_trust_accept",
+                    if (changed) "Trust new key" else "Trust & connect",
+                    RectF(950f, 700f, 1658f, 815f), fontSize = 36f,
+                )
+            }
+            UiScreen.FTP_WARNING -> {
+                canvas.drawRoundRect(260f, 115f, 1788f, 900f, 42f, 42f, panelPaint)
+                text(
+                    "Plain FTP is not secure",
+                    1024f, 235f, 60f,
+                    color = Color.rgb(255, 180, 120),
+                )
+                text(
+                    "Your username, password, file names, and video data",
+                    1024f, 345f, 30f,
+                )
+                text(
+                    "will travel over the Internet without encryption.",
+                    1024f, 395f, 30f,
+                )
+                text(
+                    "Use SFTP or FTPS whenever the server supports it.",
+                    1024f, 490f, 27f, color = colorTextMuted,
+                )
+                button(
+                    "ftp_warning_cancel", "Go back",
+                    RectF(390f, 665f, 910f, 785f), fontSize = 37f,
+                )
+                button(
+                    "ftp_warning_continue", "Use plain FTP",
+                    RectF(960f, 665f, 1658f, 785f), fontSize = 37f,
+                )
+            }
+            UiScreen.SFTP_DELETE_CONFIRM -> {
+                canvas.drawRoundRect(310f, 160f, 1738f, 850f, 42f, 42f, panelPaint)
+                text("Delete server profile?", 1024f, 285f, 62f)
+                text(sftpProfile.displayName, 1024f, 385f, 40f)
+                text(
+                    "This removes the saved server details and credentials.",
+                    1024f, 465f, 27f, color = colorTextMuted,
+                )
+                button(
+                    "sftp_delete_cancel", "Cancel",
+                    RectF(430f, 625f, 920f, 745f), fontSize = 38f,
+                )
+                button(
+                    "sftp_delete_confirm", "Delete",
+                    RectF(970f, 625f, 1618f, 745f), fontSize = 38f,
+                )
+            }
+            UiScreen.SFTP_FILES -> {
+                canvas.drawRoundRect(120f, 55f, 1928f, 975f, 42f, 42f, panelPaint)
+                text(
+                    "${sftpProfile.displayName}  /  ${sftpPath.takeLast(42)}",
+                    170f, 128f, 38f, Paint.Align.LEFT,
+                )
+                scrollableList(sftpEntries.size, 92f, 75f) { index, bounds ->
+                    val entry = sftpEntries[index]
+                    browserEntryButton(
+                        "sftp_entry_$index", entry.name,
+                        if (entry.isDirectory) "" else formatBytes(entry.size),
+                        RectF(210f, bounds.top, 1838f, bounds.bottom),
+                        entry.isDirectory,
+                    )
+                }
+                if (sftpEntries.isEmpty()) {
+                    text(
+                        "No video files or folders found.",
+                        1024f, 450f, 42f,
+                    )
+                }
+                button(
+                    "sftp_files_back", "Up",
+                    RectF(250f, 885f, 570f, 950f), fontSize = 36f,
+                )
+                text(
+                    "${sftpEntries.size} items  •  Joystick ↑/↓ to scroll",
+                    1780f, 930f, 30f, Paint.Align.RIGHT, colorTextMuted,
+                )
+            }
             UiScreen.SMB_KEYBOARD,
+            UiScreen.SFTP_KEYBOARD,
             UiScreen.FILE_SEARCH_KEYBOARD -> {
                 canvas.drawRoundRect(95f, 35f, 1953f, 995f, 42f, 42f, panelPaint)
                 text(keyboardTitle(), 1024f, 105f, 50f)
                 val raw = keyboardValue()
-                val shown = if (keyboardField == KeyboardField.PASSWORD) "•".repeat(raw.length) else raw
+                val shown = if (
+                    keyboardField == KeyboardField.PASSWORD ||
+                    keyboardField == KeyboardField.SFTP_PASSWORD
+                ) {
+                    "•".repeat(raw.length)
+                } else {
+                    raw
+                }
                 canvas.drawRoundRect(
                     230f, 135f, 1818f, 225f, 20f, 20f,
                     Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorSurfaceRaised },
@@ -5805,6 +6716,13 @@ class PlayerActivity : Activity(), Player.Listener {
     companion object {
         private const val REQUEST_VIDEO = 4001
         private const val JOYSTICK_SEEK_STEP_MS = 10_000L
+        private const val REMOTE_MIN_BUFFER_MS = 30_000
+        private const val REMOTE_MAX_BUFFER_MS = 120_000
+        private const val REMOTE_PLAYBACK_BUFFER_MS = 3_000
+        private const val REMOTE_REBUFFER_MS = 8_000
+        private const val REMOTE_PLAYER_RETRY_COUNT = 3
+        private const val REMOTE_PLAYER_RETRY_DELAY_MS = 1_000L
+        private const val REMOTE_STABLE_RESET_MS = 15_000L
         private const val REQUEST_MEDIA_PERMISSION = 4002
         private const val RECENT_MEDIA_LIMIT = 6
         private const val BROWSER_VISIBLE_ROWS = 7
