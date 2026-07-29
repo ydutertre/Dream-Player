@@ -4,6 +4,8 @@ import net.schmizz.sshj.AndroidConfig
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.SecurityUtils
 import net.schmizz.sshj.sftp.SFTPClient
+import net.schmizz.sshj.sftp.OpenMode
+import net.schmizz.sshj.sftp.RemoteFile
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import java.io.Closeable
 import java.security.PublicKey
@@ -56,6 +58,7 @@ class SftpRepository(private val profile: SftpProfile) : Closeable {
         })
     }
     private lateinit var sftp: SFTPClient
+    private var mediaFile: RemoteFile? = null
 
     init {
         try {
@@ -91,6 +94,20 @@ class SftpRepository(private val profile: SftpProfile) : Closeable {
 
     fun canonicalize(path: String): String = sftp.canonicalize(path)
 
+    fun openMedia(path: String): Long {
+        runCatching { mediaFile?.close() }
+        mediaFile = sftp.open(path, setOf(OpenMode.READ))
+        return sftp.stat(path).size
+    }
+
+    fun readMedia(
+        position: Long,
+        buffer: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Int = requireNotNull(mediaFile) { "No SFTP media file is open" }
+        .read(position, buffer, offset, length)
+
     fun list(path: String): List<SftpEntry> = sftp.ls(path).asSequence()
         .filterNot { it.name == "." || it.name == ".." }
         .map { item ->
@@ -110,6 +127,8 @@ class SftpRepository(private val profile: SftpProfile) : Closeable {
         .toList()
 
     override fun close() {
+        runCatching { mediaFile?.close() }
+        mediaFile = null
         if (::sftp.isInitialized) runCatching { sftp.close() }
         runCatching { ssh.disconnect() }
         runCatching { ssh.close() }

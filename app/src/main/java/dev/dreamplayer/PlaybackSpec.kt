@@ -20,6 +20,7 @@ data class PlaybackSpec(
     val stereoMode: StereoMode,
     val subtitleUri: String? = null,
     val smb: SmbCredentials? = null,
+    val remote: SftpProfile? = null,
     val projectionExplicit: Boolean = false,
 ) {
     fun writeTo(intent: Intent) {

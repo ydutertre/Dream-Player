@@ -39,6 +39,7 @@ import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlaybackException
 import androidx.media3.exoplayer.audio.AudioSink
@@ -192,6 +193,9 @@ class PlayerActivity : Activity(), Player.Listener {
     private var healthAnchorPositionMs = 0L
     private var abnormalClockSamples = 0
     private var decoderFallbackPending = false
+    private var remoteRecoveryAttempts = 0
+    private var remotePlaybackStableAtMs = 0L
+    private var networkStatusMessage: String? = null
     private var mediaLoadGeneration = 0
     private val stateSaver = object : Runnable {
         override fun run() {
@@ -408,6 +412,13 @@ class PlayerActivity : Activity(), Player.Listener {
             val entries: List<SmbEntry>,
             val scrollOffset: Float,
             val searchQuery: String,
+        ) : BrowserReturnState
+
+        data class Remote(
+            val profile: SftpProfile,
+            val path: String,
+            val entries: List<SftpEntry>,
+            val scrollOffset: Float,
         ) : BrowserReturnState
     }
 
@@ -843,6 +854,21 @@ class PlayerActivity : Activity(), Player.Listener {
         return PlaybackSpec(uri, entry.name, StereoMode.MONO, smb = smbCredentials)
     }
 
+    private fun remotePlaybackSpec(entry: SftpEntry): PlaybackSpec {
+        val uri = Uri.Builder()
+            .scheme(sftpProfile.protocol.name.lowercase(Locale.ROOT))
+            .encodedAuthority("${sftpProfile.host}:${sftpProfile.port}")
+            .path(entry.path)
+            .build()
+            .toString()
+        return PlaybackSpec(
+            uri,
+            entry.name,
+            StereoMode.MONO,
+            remote = sftpProfile,
+        )
+    }
+
     private fun directedComparison(comparison: Int): Int =
         if (browserSortAscending) comparison else -comparison
 
@@ -1213,6 +1239,11 @@ class PlayerActivity : Activity(), Player.Listener {
         resumeOverrideMs: Long? = null,
         autoSoftwareFallback: Boolean = false,
     ) {
+        if (spec.uri != newSpec.uri) {
+            remoteRecoveryAttempts = 0
+            remotePlaybackStableAtMs = 0L
+            networkStatusMessage = null
+        }
         if (mediaLoaded && spec.uri == newSpec.uri) {
             loadMediaResolved(
                 newSpec,
@@ -1407,10 +1438,13 @@ class PlayerActivity : Activity(), Player.Listener {
             ?.coerceIn(-AudioSyncAudioProcessor.MAX_DELAY_MS, AudioSyncAudioProcessor.MAX_DELAY_MS)
             ?: 0
         audioSyncProcessor = AudioSyncAudioProcessor(audioSyncMs)
-        val dataSourceFactory = if (newSpec.uri.startsWith("smb://")) {
-            SmbDataSource.Factory(requireNotNull(newSpec.smb))
-        } else {
-            DefaultDataSource.Factory(this)
+        val isRemoteNetworkMedia = newSpec.remote != null
+        val dataSourceFactory = when {
+            newSpec.uri.startsWith("smb://") ->
+                SmbDataSource.Factory(requireNotNull(newSpec.smb))
+            isRemoteNetworkMedia ->
+                RemoteMediaDataSource.Factory(requireNotNull(newSpec.remote))
+            else -> DefaultDataSource.Factory(this)
         }
         val renderersFactory = object : NextRenderersFactory(this@PlayerActivity) {
             override fun buildAudioSink(
@@ -1435,7 +1469,21 @@ class PlayerActivity : Activity(), Player.Listener {
                 }
             )
         }
+        val loadControl = if (isRemoteNetworkMedia) {
+            DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    REMOTE_MIN_BUFFER_MS,
+                    REMOTE_MAX_BUFFER_MS,
+                    REMOTE_PLAYBACK_BUFFER_MS,
+                    REMOTE_REBUFFER_MS,
+                )
+                .setPrioritizeTimeOverSizeThresholds(true)
+                .build()
+        } else {
+            DefaultLoadControl()
+        }
         player = ExoPlayer.Builder(this, renderersFactory)
+            .setLoadControl(loadControl)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
             .also { it.addListener(this) }
@@ -1479,6 +1527,12 @@ class PlayerActivity : Activity(), Player.Listener {
         player.playWhenReady = activityResumed
         resumePlaybackOnForeground = !activityResumed
         mediaLoaded = true
+        if (isRemoteNetworkMedia) {
+            val status =
+                "Buffering ${newSpec.remote?.protocol?.label.orEmpty()} media…"
+            networkStatusMessage = status
+            transientMessage = status
+        }
         if (resumeOverrideMs != null) {
             saveCurrentMediaState(positionOverrideMs = resumeOverrideMs)
         }
@@ -1520,6 +1574,37 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun playRecent(index: Int) {
         val recent = recentMedia.getOrNull(index) ?: return
         val parsed = Uri.parse(recent.uri)
+        val remoteProtocol = when (parsed.scheme?.lowercase(Locale.ROOT)) {
+            "sftp" -> RemoteProtocol.SFTP
+            "ftps" -> RemoteProtocol.FTPS
+            "ftp" -> RemoteProtocol.FTP
+            else -> null
+        }
+        if (remoteProtocol != null) {
+            val defaultPort = remoteProtocol.defaultPort
+            val port = parsed.port.takeIf { it > 0 } ?: defaultPort
+            val remoteProfile = sftpProfiles.firstOrNull {
+                it.protocol == remoteProtocol &&
+                    it.port == port &&
+                    it.host.equals(parsed.host, ignoreCase = true)
+            }
+            if (remoteProfile == null) {
+                transientMessage =
+                    "Cannot reopen remote file: its saved server profile is unavailable"
+                renderVrMenu()
+                return
+            }
+            transientMessage = null
+            loadMedia(
+                PlaybackSpec(
+                    recent.uri,
+                    recent.title,
+                    StereoMode.MONO,
+                    remote = remoteProfile,
+                )
+            )
+            return
+        }
         if (!parsed.scheme.equals("smb", ignoreCase = true)) {
             transientMessage = null
             loadMedia(PlaybackSpec(recent.uri, recent.title, StereoMode.MONO))
@@ -1602,6 +1687,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 rebuildBrowserItems()
                 browserScrollOffset = destination.scrollOffset
                 uiScreen = UiScreen.SMB_FILES
+                renderVrMenu()
+            }
+            is BrowserReturnState.Remote -> {
+                sftpProfile = destination.profile
+                sftpPortDraft = destination.profile.port.toString()
+                sftpPath = destination.path
+                sftpEntries = destination.entries
+                browserScrollOffset = destination.scrollOffset
+                uiScreen = UiScreen.SFTP_FILES
                 renderVrMenu()
             }
             null -> showLibrary()
@@ -1876,6 +1970,11 @@ class PlayerActivity : Activity(), Player.Listener {
                 return
             }
         }
+        // Save the selected protocol and credentials before connecting so a
+        // failed attempt or an in-place app update does not make the user
+        // re-enter the profile. Password persistence still follows the
+        // profile's explicit "remember password" choice.
+        persistSftpProfile(profile)
         if (
             profile.protocol == RemoteProtocol.FTP &&
             !profile.allowInsecureFtp
@@ -1925,6 +2024,11 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             } }.onFailure { error -> runOnUiThread {
+                Log.e(
+                    "DreamPlayerRemote",
+                    "${profile.protocol.label} connection or initial listing failed",
+                    error,
+                )
                 val hostKeyError = generateSequence(error) { it.cause }
                     .filterIsInstance<SftpHostKeyException>()
                     .firstOrNull()
@@ -1981,6 +2085,11 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             } }.onFailure { error -> runOnUiThread {
+                Log.e(
+                    "DreamPlayerRemote",
+                    "${profile.protocol.label} folder listing failed",
+                    error,
+                )
                 if (
                     rollbackNavigationOnFailure &&
                     sftpNavigationStack.isNotEmpty()
@@ -1997,25 +2106,28 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun friendlySftpError(error: Throwable): String {
         val chain = generateSequence(error) { it.cause }.toList()
-        val message = chain.mapNotNull { it.message }
-            .firstOrNull { it.isNotBlank() }
-            .orEmpty()
+        val messages = chain.mapNotNull { it.message }
+            .filter { it.isNotBlank() }
+        val message = messages.firstOrNull().orEmpty()
+        val combined = messages.joinToString(" | ")
         return when {
-            message.contains("identification", true) ||
-                message.contains("protocol version", true) ->
+            combined.contains("identification", true) ||
+                combined.contains("protocol version", true) ->
                 "this port is not SFTP; select FTP or FTPS"
-            message.contains("certificate", true) ||
-                message.contains("certpath", true) ->
+            combined.contains("certificate", true) ||
+                combined.contains("certpath", true) ->
                 "the FTPS certificate or hostname could not be verified"
-            message.contains("SSL", true) ||
-                message.contains("TLS", true) ->
+            combined.contains("SSL", true) ||
+                combined.contains("TLS", true) ->
                 "the server does not appear to support explicit FTPS"
-            message.contains("auth", true) ||
-                message.contains("permission", true) -> "check username and password"
-            message.contains("timed out", true) ||
-                message.contains("connect", true) -> "server did not respond"
-            message.contains("refused", true) -> "connection was refused"
-            message.contains("no such file", true) -> "start folder was not found"
+            combined.contains("auth", true) ||
+                combined.contains("permission", true) ->
+                "check username and password"
+            combined.contains("timed out", true) -> "server timed out"
+            combined.contains("refused", true) -> "connection was refused"
+            combined.contains("no such file", true) ||
+                combined.contains("not found", true) ->
+                "start folder was not found"
             else -> message.ifBlank { error.javaClass.simpleName }
         }.replace('\n', ' ').take(120)
     }
@@ -2197,6 +2309,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     override fun onPlaybackStateChanged(playbackState: Int) {
+        updateNetworkPlaybackStatus(playbackState)
         if (
             playbackState == Player.STATE_READY &&
             mediaLoaded &&
@@ -2214,6 +2327,9 @@ class PlayerActivity : Activity(), Player.Listener {
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
         if (isPlaying) playbackCompleted = false
+        if (isPlaying && spec.remote != null && remotePlaybackStableAtMs == 0L) {
+            remotePlaybackStableAtMs = SystemClock.elapsedRealtime()
+        }
     }
 
     override fun onPlayerError(error: PlaybackException) {
@@ -2233,9 +2349,118 @@ class PlayerActivity : Activity(), Player.Listener {
             )
             return
         }
+        if (scheduleRemotePlaybackRecovery(error)) return
+        if (spec.remote != null) {
+            val friendly = friendlyRemotePlaybackError(error)
+            message.text = "Remote playback stopped\n$friendly"
+            message.visibility = View.VISIBLE
+            showOsd("Remote playback stopped\n$friendly", 12_000L)
+            return
+        }
         message.text = "Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}"
         message.visibility = View.VISIBLE
         showOsd("Playback error\n${error.errorCodeName}\n${error.message.orEmpty()}", 10_000L)
+    }
+
+    private fun updateNetworkPlaybackStatus(playbackState: Int) {
+        if (spec.remote == null || !mediaLoaded) return
+        when (playbackState) {
+            Player.STATE_BUFFERING -> {
+                val status = if (player.currentPosition > 0L) {
+                    "Network slowed down • buffering…"
+                } else {
+                    "Buffering ${spec.remote?.protocol?.label.orEmpty()} media…"
+                }
+                networkStatusMessage = status
+                transientMessage = status
+                showControls(0L)
+            }
+            Player.STATE_READY -> {
+                networkStatusMessage?.let { status ->
+                    if (transientMessage == status) transientMessage = null
+                }
+                networkStatusMessage = null
+                if (
+                    remotePlaybackStableAtMs > 0L &&
+                    SystemClock.elapsedRealtime() - remotePlaybackStableAtMs >
+                        REMOTE_STABLE_RESET_MS
+                ) {
+                    remoteRecoveryAttempts = 0
+                    remotePlaybackStableAtMs = SystemClock.elapsedRealtime()
+                }
+                if (uiVisible) renderVrMenu()
+            }
+        }
+    }
+
+    private fun scheduleRemotePlaybackRecovery(
+        error: PlaybackException,
+    ): Boolean {
+        spec.remote ?: return false
+        if (
+            remotePlaybackStableAtMs > 0L &&
+            SystemClock.elapsedRealtime() - remotePlaybackStableAtMs >
+                REMOTE_STABLE_RESET_MS
+        ) {
+            remoteRecoveryAttempts = 0
+        }
+        if (remoteRecoveryAttempts >= REMOTE_PLAYER_RETRY_COUNT) return false
+        val networkFailure = generateSequence<Throwable>(error) { it.cause }
+            .any {
+                it is java.io.IOException ||
+                    it is java.net.SocketException ||
+                    it is java.net.SocketTimeoutException
+            }
+        if (!networkFailure) return false
+        remoteRecoveryAttempts++
+        val attempt = remoteRecoveryAttempts
+        val position = player.currentPosition.coerceAtLeast(0L)
+        val failedSpec = spec
+        val returnState = playbackBrowserReturn
+        val status =
+            "Connection interrupted • reconnecting $attempt/$REMOTE_PLAYER_RETRY_COUNT…"
+        networkStatusMessage = status
+        transientMessage = status
+        showControls(0L)
+        Log.w(
+            "DreamPlayerRemote",
+            "Playback connection failed; retry $attempt at $position ms",
+            error,
+        )
+        mainHandler.postDelayed({
+            if (!mediaLoaded || spec != failedSpec) return@postDelayed
+            loadMedia(
+                failedSpec,
+                returnState,
+                resumeOverrideMs = position,
+            )
+        }, REMOTE_PLAYER_RETRY_DELAY_MS * attempt)
+        return true
+    }
+
+    private fun friendlyRemotePlaybackError(
+        error: PlaybackException,
+    ): String {
+        val details = generateSequence<Throwable>(error) { it.cause }
+            .mapNotNull { it.message }
+            .joinToString(" ")
+            .lowercase(Locale.ROOT)
+        return when {
+            "authentication" in details || "login" in details ->
+                "The saved username or password was rejected."
+            "timed out" in details || "timeout" in details ->
+                "The server stopped responding. Check the connection and try again."
+            "unknownhost" in details || "unable to resolve" in details ->
+                "The server name could not be resolved."
+            "refused" in details ->
+                "The server refused the connection on the configured port."
+            "not found" in details || "no such file" in details ->
+                "The remote file is no longer available."
+            "certificate" in details || "handshake" in details ->
+                "The FTPS certificate or secure connection could not be verified."
+            else ->
+                "Playback stopped after $REMOTE_PLAYER_RETRY_COUNT reconnection attempts."
+        }
     }
 
     private fun isVideoDecoderFailure(error: PlaybackException): Boolean {
@@ -2747,9 +2972,15 @@ class PlayerActivity : Activity(), Player.Listener {
                         rollbackNavigationOnFailure = true,
                     )
                 } else {
-                    transientMessage =
-                        "${sftpProfile.protocol.label} playback is coming in the next milestone"
-                    renderVrMenu()
+                    loadMedia(
+                        remotePlaybackSpec(entry),
+                        BrowserReturnState.Remote(
+                            profile = sftpProfile,
+                            path = sftpPath,
+                            entries = sftpEntries.toList(),
+                            scrollOffset = browserScrollOffset,
+                        ),
+                    )
                 }
             }
             id == "smb_add_server" -> showSmbLogin("", "")
@@ -6485,6 +6716,13 @@ class PlayerActivity : Activity(), Player.Listener {
     companion object {
         private const val REQUEST_VIDEO = 4001
         private const val JOYSTICK_SEEK_STEP_MS = 10_000L
+        private const val REMOTE_MIN_BUFFER_MS = 30_000
+        private const val REMOTE_MAX_BUFFER_MS = 120_000
+        private const val REMOTE_PLAYBACK_BUFFER_MS = 3_000
+        private const val REMOTE_REBUFFER_MS = 8_000
+        private const val REMOTE_PLAYER_RETRY_COUNT = 3
+        private const val REMOTE_PLAYER_RETRY_DELAY_MS = 1_000L
+        private const val REMOTE_STABLE_RESET_MS = 15_000L
         private const val REQUEST_MEDIA_PERMISSION = 4002
         private const val RECENT_MEDIA_LIMIT = 6
         private const val BROWSER_VISIBLE_ROWS = 7
