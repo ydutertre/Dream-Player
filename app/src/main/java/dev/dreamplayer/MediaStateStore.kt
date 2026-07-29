@@ -29,6 +29,7 @@ class MediaStateStore(context: Context) :
         val subtitleFingerprint: String?,
         val subtitleSyncMs: Int?,
         val subtitleDepthMeters: Float?,
+        val subtitle3dEnabled: Boolean,
         val audioSyncMs: Int?,
         val audioTrackFingerprint: String?,
         val pictureSettings: PictureSettings?,
@@ -85,6 +86,7 @@ class MediaStateStore(context: Context) :
                 subtitle_fingerprint TEXT,
                 subtitle_sync_ms INTEGER,
                 subtitle_depth_meters REAL,
+                subtitle_3d_enabled INTEGER NOT NULL DEFAULT 0,
                 picture_mode INTEGER,
                 brightness REAL,
                 exposure REAL,
@@ -160,6 +162,12 @@ class MediaStateStore(context: Context) :
         if (oldVersion < 13) {
             db.execSQL("ALTER TABLE media_state ADD COLUMN hdr_metadata_mode INTEGER")
             db.execSQL("ALTER TABLE media_state ADD COLUMN hdr_manual_peak_nits REAL")
+        }
+        if (oldVersion < 14) {
+            db.execSQL(
+                "ALTER TABLE media_state ADD COLUMN " +
+                    "subtitle_3d_enabled INTEGER NOT NULL DEFAULT 0"
+            )
         }
     }
 
@@ -286,6 +294,7 @@ class MediaStateStore(context: Context) :
                 "position_ms", "duration_ms",
                 "screen_x", "screen_y", "screen_z", "screen_half_height",
                 "subtitle_fingerprint", "subtitle_sync_ms", "subtitle_depth_meters",
+                "subtitle_3d_enabled",
                 "audio_sync_ms", "audio_track_fingerprint",
                 "picture_mode", "brightness", "exposure", "contrast", "saturation",
                 "vibrance",
@@ -318,23 +327,24 @@ class MediaStateStore(context: Context) :
                 subtitleFingerprint = if (cursor.isNull(6)) null else cursor.getString(6),
                 subtitleSyncMs = if (cursor.isNull(7)) null else cursor.getInt(7),
                 subtitleDepthMeters = if (cursor.isNull(8)) null else cursor.getFloat(8),
-                audioSyncMs = if (cursor.isNull(9)) null else cursor.getInt(9),
-                audioTrackFingerprint = if (cursor.isNull(10)) null else cursor.getString(10),
-                pictureSettings = if ((11..14).all { !cursor.isNull(it) }) {
+                subtitle3dEnabled = !cursor.isNull(9) && cursor.getInt(9) != 0,
+                audioSyncMs = if (cursor.isNull(10)) null else cursor.getInt(10),
+                audioTrackFingerprint = if (cursor.isNull(11)) null else cursor.getString(11),
+                pictureSettings = if ((12..15).all { !cursor.isNull(it) }) {
                     PictureSettings(
-                        mode = cursor.getInt(11),
-                        brightness = cursor.getFloat(12),
-                        exposure = cursor.getFloat(13),
-                        contrast = cursor.getFloat(14),
-                        saturation = if (cursor.isNull(15)) 1f else cursor.getFloat(15),
-                        vibrance = if (cursor.isNull(16)) 0f else cursor.getFloat(16),
+                        mode = cursor.getInt(12),
+                        brightness = cursor.getFloat(13),
+                        exposure = cursor.getFloat(14),
+                        contrast = cursor.getFloat(15),
+                        saturation = if (cursor.isNull(16)) 1f else cursor.getFloat(16),
+                        vibrance = if (cursor.isNull(17)) 0f else cursor.getFloat(17),
                     )
                 } else null,
-                decoderMode = if (cursor.isNull(17)) null else cursor.getInt(17),
-                decoderAutoSoftware = !cursor.isNull(18) && cursor.getInt(18) != 0,
-                screenCurvature = if (cursor.isNull(19)) null else cursor.getFloat(19),
-                hdrMetadataMode = if (cursor.isNull(20)) null else cursor.getInt(20),
-                hdrManualPeakNits = if (cursor.isNull(21)) null else cursor.getFloat(21),
+                decoderMode = if (cursor.isNull(18)) null else cursor.getInt(18),
+                decoderAutoSoftware = !cursor.isNull(19) && cursor.getInt(19) != 0,
+                screenCurvature = if (cursor.isNull(20)) null else cursor.getFloat(20),
+                hdrMetadataMode = if (cursor.isNull(21)) null else cursor.getInt(21),
+                hdrManualPeakNits = if (cursor.isNull(22)) null else cursor.getFloat(22),
             )
         }
     }
@@ -379,6 +389,15 @@ class MediaStateStore(context: Context) :
 
     fun saveSubtitleDepth(spec: PlaybackSpec, depthMeters: Float) {
         upsert(spec, ContentValues().apply { put("subtitle_depth_meters", depthMeters) })
+    }
+
+    fun saveSubtitle3dEnabled(spec: PlaybackSpec, enabled: Boolean) {
+        upsert(
+            spec,
+            ContentValues().apply {
+                put("subtitle_3d_enabled", if (enabled) 1 else 0)
+            },
+        )
     }
 
     fun saveScreenCurvature(spec: PlaybackSpec, curvature: Float) {
@@ -436,7 +455,7 @@ class MediaStateStore(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "media-state.db"
-        private const val DATABASE_VERSION = 13
+        private const val DATABASE_VERSION = 14
     }
 }
 

@@ -108,6 +108,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var subtitleSyncMs = 0
     private var subtitleDepthMeters = DEFAULT_2D_SUBTITLE_DEPTH_METERS
     private var subtitleDepthIsCustom = false
+    private var subtitle3dEnabled = false
     private var audioChoices: List<AudioChoice> = listOf(
         AudioChoice("Auto", null, -1, AUDIO_AUTO),
     )
@@ -1417,6 +1418,8 @@ class PlayerActivity : Activity(), Player.Listener {
             )
             ?: defaultSubtitleDepth(currentStereoMode)
         nativeSetSubtitleDepth(subtitleDepthMeters)
+        subtitle3dEnabled = savedPlaybackState?.subtitle3dEnabled ?: false
+        nativeSetSubtitle3dEnabled(subtitle3dEnabled)
         screenCurvature = savedPlaybackState?.screenCurvature
             ?.sanitized(
                 SCREEN_CURVATURE_MIN,
@@ -3321,6 +3324,13 @@ class PlayerActivity : Activity(), Player.Listener {
                     ),
                     persist,
                 )
+                renderVrMenu()
+            }
+            id == "subtitle_3d_enabled" -> {
+                subtitle3dEnabled = !subtitle3dEnabled
+                nativeSetSubtitle3dEnabled(subtitle3dEnabled)
+                mediaStateStore.saveSubtitle3dEnabled(spec, subtitle3dEnabled)
+                if (!uiVisible) applySubtitleCues(latestCues)
                 renderVrMenu()
             }
             id.startsWith("subtitle_sync_") -> {
@@ -5602,6 +5612,12 @@ class PlayerActivity : Activity(), Player.Listener {
                             "subtitle_sync_later_500", "+500",
                             RectF(710f, 585f, 820f, 640f), fontSize = 21f,
                         )
+                        checkbox(
+                            "subtitle_3d_enabled",
+                            "3D subtitle",
+                            RectF(190f, 646f, 820f, 708f),
+                            subtitle3dEnabled,
+                        )
                     }
                     PlaybackPopover.AUDIO -> {
                         val bounds = PLAYBACK_LEFT_POPOVER_BOUNDS
@@ -6885,7 +6901,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private val BROWSER_LIST_HIT_BOUNDS =
             RectF(BROWSER_LIST_LEFT, BROWSER_LIST_TOP, BROWSER_LIST_RIGHT, BROWSER_LIST_BOTTOM)
         private val PLAYBACK_TOOLBAR_BOUNDS = RectF(120f, 700f, 1928f, 970f)
-        private val PLAYBACK_LEFT_POPOVER_BOUNDS = RectF(150f, 105f, 860f, 675f)
+        private val PLAYBACK_LEFT_POPOVER_BOUNDS = RectF(150f, 105f, 860f, 720f)
         private val PLAYBACK_PROJECTION_POPOVER_BOUNDS = RectF(1185f, 205f, 1898f, 675f)
         private val PLAYBACK_SETTINGS_POPOVER_BOUNDS = RectF(930f, 45f, 1898f, 675f)
         init { System.loadLibrary("dreamplayer") }
@@ -6943,6 +6959,7 @@ class PlayerActivity : Activity(), Player.Listener {
             bottom: Float,
         )
         @JvmStatic private external fun nativeSetSubtitleDepth(depthMeters: Float)
+        @JvmStatic private external fun nativeSetSubtitle3dEnabled(enabled: Boolean)
         @JvmStatic private external fun nativeSetScreenCurvature(curvature: Float)
     }
 }
