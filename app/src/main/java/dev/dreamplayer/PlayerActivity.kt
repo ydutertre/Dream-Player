@@ -323,7 +323,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class DecoderMode(val wireValue: Int, val label: String) {
         AUTO(0, "Auto"),
         HARDWARE(1, "Hardware"),
-        SOFTWARE(2, "Software");
+        SOFTWARE(2, "Software"),
+        EXPERIMENTAL_8K_HARDWARE(3, "Experimental 8K HW");
 
         companion object {
             fun fromWire(value: Int): DecoderMode =
@@ -1477,6 +1478,9 @@ class PlayerActivity : Activity(), Player.Listener {
             // valid DTS-HD access units in some Blu-ray remuxes. Prefer FFmpeg for DTS audio only;
             // video and every other audio codec retain their existing renderer order.
             setPreferFfmpegForDts(true)
+            setFfmpegVideoEnabled(
+                decoderMode != DecoderMode.EXPERIMENTAL_8K_HARDWARE,
+            )
             setExtensionRendererMode(
                 if (effectiveDecoderMode == DecoderMode.SOFTWARE) {
                     DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
@@ -3778,21 +3782,31 @@ class PlayerActivity : Activity(), Player.Listener {
                 val selectedMode = when (id) {
                     "decoder_hardware" -> DecoderMode.HARDWARE
                     "decoder_software" -> DecoderMode.SOFTWARE
+                    "decoder_experimental_8k" ->
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE
                     else -> DecoderMode.AUTO
                 }
                 val requestedEffectiveMode = when (selectedMode) {
                     DecoderMode.SOFTWARE -> DecoderMode.SOFTWARE
                     DecoderMode.AUTO,
-                    DecoderMode.HARDWARE -> DecoderMode.HARDWARE
+                    DecoderMode.HARDWARE,
+                    DecoderMode.EXPERIMENTAL_8K_HARDWARE ->
+                        DecoderMode.HARDWARE
                 }
                 val position = player.currentPosition
+                val rendererConfigurationChanged =
+                    selectedMode == DecoderMode.EXPERIMENTAL_8K_HARDWARE ||
+                        decoderMode == DecoderMode.EXPERIMENTAL_8K_HARDWARE
                 decoderMode = selectedMode
                 mediaStateStore.saveDecoderMode(spec, selectedMode.wireValue)
                 if (selectedMode == DecoderMode.AUTO) {
                     // Explicitly choosing Auto asks it to probe hardware again.
                     mediaStateStore.saveDecoderAutoSoftware(spec, false)
                 }
-                if (effectiveDecoderMode == requestedEffectiveMode) {
+                if (
+                    effectiveDecoderMode == requestedEffectiveMode &&
+                    !rendererConfigurationChanged
+                ) {
                     renderVrMenu()
                     showOsd("Decoder: ${selectedMode.label}", 3_000L)
                     return
@@ -3803,7 +3817,18 @@ class PlayerActivity : Activity(), Player.Listener {
                     resumeOverrideMs = position,
                     autoSoftwareFallback = false,
                 )
-                showOsd("Decoder: ${selectedMode.label}", 3_000L)
+                showOsd(
+                    if (
+                        selectedMode ==
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE
+                    ) {
+                        "Experimental 8K hardware decoder\n" +
+                            "Playback may fail on unsupported files"
+                    } else {
+                        "Decoder: ${selectedMode.label}"
+                    },
+                    5_000L,
+                )
             }
             id.startsWith("sync_") -> {
                 val delta = when (id) {
@@ -4566,7 +4591,18 @@ class PlayerActivity : Activity(), Player.Listener {
                             cx + offset, cy + scale * 1.02f, stroke,
                         )
                     }
-                    text(if (effectiveDecoderMode == DecoderMode.SOFTWARE) "SW" else "HW", cx, cy + 10f, 24f)
+                    text(
+                        when {
+                            decoderMode ==
+                                DecoderMode.EXPERIMENTAL_8K_HARDWARE -> "8K"
+                            effectiveDecoderMode ==
+                                DecoderMode.SOFTWARE -> "SW"
+                            else -> "HW"
+                        },
+                        cx,
+                        cy + 10f,
+                        24f,
+                    )
                 }
                 "audio_sync" -> {
                     val speaker = Path().apply {
@@ -5935,18 +5971,27 @@ class PlayerActivity : Activity(), Player.Listener {
                         text("Decoder", 975f, 174f, 24f, Paint.Align.LEFT)
                         button(
                             "decoder_auto", "Auto",
-                            RectF(1200f, 140f, 1410f, 192f),
+                            RectF(1200f, 140f, 1350f, 192f),
                             decoderMode == DecoderMode.AUTO, fontSize = 22f,
                         )
                         button(
                             "decoder_hardware", "Hardware",
-                            RectF(1420f, 140f, 1630f, 192f),
-                            decoderMode == DecoderMode.HARDWARE, fontSize = 22f,
+                            RectF(1360f, 140f, 1515f, 192f),
+                            decoderMode == DecoderMode.HARDWARE,
+                            fontSize = 20f,
                         )
                         button(
                             "decoder_software", "Software",
-                            RectF(1640f, 140f, 1860f, 192f),
-                            decoderMode == DecoderMode.SOFTWARE, fontSize = 22f,
+                            RectF(1525f, 140f, 1680f, 192f),
+                            decoderMode == DecoderMode.SOFTWARE,
+                            fontSize = 20f,
+                        )
+                        button(
+                            "decoder_experimental_8k", "8K HW",
+                            RectF(1690f, 140f, 1860f, 192f),
+                            decoderMode ==
+                                DecoderMode.EXPERIMENTAL_8K_HARDWARE,
+                            fontSize = 20f,
                         )
                         text("Color mode", 975f, 239f, 24f, Paint.Align.LEFT)
                         val compactModes = listOf(
@@ -6411,24 +6456,38 @@ class PlayerActivity : Activity(), Player.Listener {
                 )
                 button(
                     "decoder_auto", "Auto",
-                    RectF(350f, 330f, 860f, 475f),
+                    RectF(350f, 300f, 860f, 430f),
                     decoderMode == DecoderMode.AUTO,
                 )
                 button(
                     "decoder_hardware", "Hardware",
-                    RectF(910f, 330f, 1698f, 475f),
+                    RectF(910f, 300f, 1698f, 430f),
                     decoderMode == DecoderMode.HARDWARE,
                 )
                 button(
                     "decoder_software", "Software",
-                    RectF(350f, 535f, 1698f, 680f),
+                    RectF(350f, 480f, 860f, 610f),
                     decoderMode == DecoderMode.SOFTWARE,
                 )
-                text(
-                    "Active now: ${effectiveDecoderMode.label}",
-                    1024f, 755f, 31f, color = colorTextMuted,
+                button(
+                    "decoder_experimental_8k", "Experimental 8K HW",
+                    RectF(910f, 480f, 1698f, 610f),
+                    decoderMode ==
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE,
+                    fontSize = 31f,
                 )
-                button("modal_back", "Back", RectF(800f, 835f, 1248f, 920f), fontSize = 34f)
+                text(
+                    if (
+                        decoderMode ==
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE
+                    ) {
+                        "Forces MediaCodec beyond its advertised 8K frame-rate limit."
+                    } else {
+                        "Active now: ${effectiveDecoderMode.label}"
+                    },
+                    1024f, 700f, 27f, color = colorTextMuted,
+                )
+                button("modal_back", "Back", RectF(800f, 815f, 1248f, 900f), fontSize = 34f)
             }
             UiScreen.AUDIO_SYNC -> {
                 canvas.drawRoundRect(330f, 120f, 1718f, 920f, 42f, 42f, panelPaint)
