@@ -74,6 +74,7 @@ std::atomic<int> gSubtitleWidth{0};
 std::atomic<int> gSubtitleHeight{0};
 std::atomic<float> gSubtitleDepthMeters{0.0f};
 std::atomic<bool> gSubtitleBitmapMode{false};
+std::atomic<bool> gSubtitle3dEnabled{false};
 std::atomic<float> gSubtitleLeft{0.0f};
 std::atomic<float> gSubtitleTop{0.0f};
 std::atomic<float> gSubtitleRight{1.0f};
@@ -2041,13 +2042,105 @@ private:
             const bool isMenuOverlay = gMenuInteractive.load();
             const bool isBitmapSubtitle =
                 !isMenuOverlay && gSubtitleBitmapMode.load();
+            float displayLeft = gSubtitleLeft.load();
+            float displayTop = gSubtitleTop.load();
+            float displayRight = gSubtitleRight.load();
+            float displayBottom = gSubtitleBottom.load();
+            float textureLeft = 0.0f;
+            float textureTop = 0.0f;
+            float textureRight = 1.0f;
+            float textureBottom = 1.0f;
+            bool hasStereoSubtitleRegion = true;
+            const int stereoMode = gStereoMode.load();
+            const bool horizontalStereo =
+                stereoMode == 1 || stereoMode == 3;
+            const bool verticalStereo =
+                stereoMode == 2 || stereoMode == 4;
+            const bool splitStereoSubtitle =
+                isBitmapSubtitle &&
+                gSubtitle3dEnabled.load() &&
+                (horizontalStereo || verticalStereo);
+            if (splitStereoSubtitle) {
+                // Baked stereo subtitle disparity is often authored for a
+                // different physical screen size and can be uncomfortable in
+                // VR. Extract one correctly shaped view and present it to both
+                // eyes; the existing 3D subtitle quad and depth control then
+                // provide predictable binocular positioning. Swap Eyes picks
+                // the alternate baked view when requested.
+                const uint32_t sourceEye =
+                    gSwapEyes.load() ? 1u : 0u;
+                const float sourceStart =
+                    sourceEye == 0u ? 0.0f : 0.5f;
+                const float sourceEnd = sourceStart + 0.5f;
+                if (horizontalStereo) {
+                    const float originalLeft = displayLeft;
+                    const float originalRight = displayRight;
+                    const float selectedLeft =
+                        std::max(originalLeft, sourceStart);
+                    const float selectedRight =
+                        std::min(originalRight, sourceEnd);
+                    hasStereoSubtitleRegion =
+                        selectedRight > selectedLeft &&
+                        originalRight > originalLeft;
+                    if (hasStereoSubtitleRegion) {
+                        textureLeft =
+                            (selectedLeft - originalLeft) /
+                            (originalRight - originalLeft);
+                        textureRight =
+                            (selectedRight - originalLeft) /
+                            (originalRight - originalLeft);
+                        displayLeft =
+                            (selectedLeft - sourceStart) * 2.0f;
+                        displayRight =
+                            (selectedRight - sourceStart) * 2.0f;
+                        // Remapping source-half coordinates preserves the
+                        // baked left/right disparity, but it also doubles the
+                        // cropped bitmap's width. Restore the native aspect
+                        // around that remapped center.
+                        const float center =
+                            (displayLeft + displayRight) * 0.5f;
+                        const float halfDisplayWidth =
+                            (displayRight - displayLeft) * 0.25f;
+                        displayLeft = center - halfDisplayWidth;
+                        displayRight = center + halfDisplayWidth;
+                    }
+                } else {
+                    const float originalTop = displayTop;
+                    const float originalBottom = displayBottom;
+                    const float selectedTop =
+                        std::max(originalTop, sourceStart);
+                    const float selectedBottom =
+                        std::min(originalBottom, sourceEnd);
+                    hasStereoSubtitleRegion =
+                        selectedBottom > selectedTop &&
+                        originalBottom > originalTop;
+                    if (hasStereoSubtitleRegion) {
+                        textureTop =
+                            (selectedTop - originalTop) /
+                            (originalBottom - originalTop);
+                        textureBottom =
+                            (selectedBottom - originalTop) /
+                            (originalBottom - originalTop);
+                        displayTop =
+                            (selectedTop - sourceStart) * 2.0f;
+                        displayBottom =
+                            (selectedBottom - sourceStart) * 2.0f;
+                        const float center =
+                            (displayTop + displayBottom) * 0.5f;
+                        const float halfDisplayHeight =
+                            (displayBottom - displayTop) * 0.25f;
+                        displayTop = center - halfDisplayHeight;
+                        displayBottom = center + halfDisplayHeight;
+                    }
+                }
+            }
             const float subtitleTop =
                 isBitmapSubtitle
-                    ? halfHeight * (1.0f - 2.0f * gSubtitleTop.load())
+                    ? halfHeight * (1.0f - 2.0f * displayTop)
                     : (isMenuOverlay ? halfHeight : -halfHeight + 0.31f);
             const float subtitleBottom =
                 isBitmapSubtitle
-                    ? halfHeight * (1.0f - 2.0f * gSubtitleBottom.load())
+                    ? halfHeight * (1.0f - 2.0f * displayBottom)
                     : (isMenuOverlay ? -halfHeight : -halfHeight + 0.01f);
             const float subtitleTextureAspect =
                 static_cast<float>(gSubtitleWidth.load()) /
@@ -2082,14 +2175,14 @@ private:
                     static_cast<float>(kScreenSegments);
                 const float normalized0 =
                     isBitmapSubtitle
-                        ? ((gSubtitleLeft.load() +
-                            (gSubtitleRight.load() - gSubtitleLeft.load()) * u0) *
+                        ? ((displayLeft +
+                            (displayRight - displayLeft) * u0) *
                             2.0f - 1.0f)
                         : u0 * 2.0f - 1.0f;
                 const float normalized1 =
                     isBitmapSubtitle
-                        ? ((gSubtitleLeft.load() +
-                            (gSubtitleRight.load() - gSubtitleLeft.load()) * u1) *
+                        ? ((displayLeft +
+                            (displayRight - displayLeft) * u1) *
                             2.0f - 1.0f)
                         : u1 * 2.0f - 1.0f;
                 const auto subtitlePoint =
@@ -2115,27 +2208,41 @@ private:
                 const Vec3 bottomLeft = subtitlePoint(normalized0, subtitleBottom);
                 const Vec3 bottomRight = subtitlePoint(normalized1, subtitleBottom);
                 const Vec3 topRight = subtitlePoint(normalized1, subtitleTop);
-                appendSubtitleVertex(topLeft, u0, 1.0f);
-                appendSubtitleVertex(bottomLeft, u0, 0.0f);
-                appendSubtitleVertex(bottomRight, u1, 0.0f);
-                appendSubtitleVertex(topLeft, u0, 1.0f);
-                appendSubtitleVertex(bottomRight, u1, 0.0f);
-                appendSubtitleVertex(topRight, u1, 1.0f);
+                const float textureU0 =
+                    textureLeft + (textureRight - textureLeft) * u0;
+                const float textureU1 =
+                    textureLeft + (textureRight - textureLeft) * u1;
+                const float textureTopV = 1.0f - textureTop;
+                const float textureBottomV = 1.0f - textureBottom;
+                appendSubtitleVertex(topLeft, textureU0, textureTopV);
+                appendSubtitleVertex(bottomLeft, textureU0, textureBottomV);
+                appendSubtitleVertex(bottomRight, textureU1, textureBottomV);
+                appendSubtitleVertex(topLeft, textureU0, textureTopV);
+                appendSubtitleVertex(bottomRight, textureU1, textureBottomV);
+                appendSubtitleVertex(topRight, textureU1, textureTopV);
             }
-            glBufferSubData(
-                GL_ARRAY_BUFFER,
-                0,
-                subtitleVertices.size() * sizeof(float),
-                subtitleVertices.data());
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glUseProgram(subtitleProgram_);
-            glUniformMatrix4fv(glGetUniformLocation(subtitleProgram_, "uMvp"), 1, GL_FALSE, mvp.m);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, subtitleTexture_);
-            glUniform1i(glGetUniformLocation(subtitleProgram_, "uSubtitle"), 0);
-            glDrawArrays(GL_TRIANGLES, 0, kScreenSegments * 6);
-            glDisable(GL_BLEND);
+            if (hasStereoSubtitleRegion) {
+                glBufferSubData(
+                    GL_ARRAY_BUFFER,
+                    0,
+                    subtitleVertices.size() * sizeof(float),
+                    subtitleVertices.data());
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glUseProgram(subtitleProgram_);
+                glUniformMatrix4fv(
+                    glGetUniformLocation(subtitleProgram_, "uMvp"),
+                    1,
+                    GL_FALSE,
+                    mvp.m);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, subtitleTexture_);
+                glUniform1i(
+                    glGetUniformLocation(subtitleProgram_, "uSubtitle"),
+                    0);
+                glDrawArrays(GL_TRIANGLES, 0, kScreenSegments * 6);
+                glDisable(GL_BLEND);
+            }
         }
 
         if (pointerVisible_) drawPointer(mvp);
@@ -2470,6 +2577,14 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetSubtitleDepth(
     if (std::isfinite(depthMeters)) {
         gSubtitleDepthMeters.store(std::clamp(depthMeters, 0.0f, 0.50f));
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetSubtitle3dEnabled(
+    JNIEnv*,
+    jclass,
+    jboolean enabled) {
+    gSubtitle3dEnabled.store(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL
