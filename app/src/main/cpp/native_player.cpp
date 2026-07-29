@@ -29,6 +29,13 @@ std::atomic<bool> gResumed{false};
 std::atomic<bool> gStop{false};
 std::atomic<float> gAspect{16.0f / 9.0f};
 std::atomic<int> gStereoMode{0};
+// 0 = flat screen, 1 = equirectangular VR180, 2 = equirectangular VR360.
+std::atomic<int> gVideoProjection{0};
+std::atomic<float> gImmersiveYawDegrees{0.0f};
+std::atomic<float> gImmersivePitchDegrees{0.0f};
+std::atomic<float> gLatestHeadYawDegrees{0.0f};
+std::atomic<float> gLatestHeadPitchDegrees{0.0f};
+std::atomic<uint64_t> gImmersiveMenuAnchorGeneration{1};
 // 0 = original samples, 1 = metadata-driven managed color.
 std::atomic<int> gPictureMode{1};
 // 0 = SDR transfer, 1 = ST 2084/PQ, 2 = HLG.
@@ -68,6 +75,7 @@ std::atomic<float> gScreenHalfHeight{1.0f};
 std::atomic<float> gScreenCurvature{0.0f};
 std::atomic<bool> gHasVideo{false};
 std::atomic<bool> gMenuInteractive{true};
+std::atomic<bool> gImmersivePlaybackUi{false};
 std::mutex gSubtitleMutex;
 std::vector<uint8_t> gSubtitlePixels;
 std::atomic<int> gSubtitleWidth{0};
@@ -82,6 +90,10 @@ std::atomic<float> gSubtitleBottom{1.0f};
 bool gSubtitleDirty = false;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr int kScreenSegments = 40;
+constexpr int kImmersiveHorizontalSegments = 96;
+constexpr int kImmersiveVerticalSegments = 48;
+constexpr int kMaximumSurfaceVertices =
+    kImmersiveHorizontalSegments * kImmersiveVerticalSegments * 6;
 constexpr float kMaximumScreenEdgeAngle = 38.0f * kPi / 180.0f;
 constexpr float kMaximumOverlayEdgeAngle = 50.0f * kPi / 180.0f;
 constexpr int kAdaptiveAnalysisWidth = 32;
@@ -115,6 +127,12 @@ float length(const Vec3& value) { return std::sqrt(dot(value, value)); }
 Vec3 normalized(const Vec3& value, const Vec3& fallback = {0, 0, -1}) {
     const float magnitude = length(value);
     return magnitude > 0.00001f ? value * (1.0f / magnitude) : fallback;
+}
+
+float normalizedAngleRadians(float angle) {
+    angle = std::fmod(angle + kPi, 2.0f * kPi);
+    if (angle < 0.0f) angle += 2.0f * kPi;
+    return angle - kPi;
 }
 
 struct ScreenBasis {
@@ -579,6 +597,10 @@ public:
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
         seekCallback_ = env_->GetMethodID(cls, "onNativeSeekGesture", "(IFF)V");
+        immersiveOrientationCallback_ = env_->GetMethodID(
+            cls,
+            "onNativeImmersiveOrientationChanged",
+            "(FF)V");
         env_->DeleteLocalRef(cls);
     }
 
@@ -597,6 +619,7 @@ private:
     jobject activity_;
     jmethodID frameCallback_ = nullptr;
     jmethodID seekCallback_ = nullptr;
+    jmethodID immersiveOrientationCallback_ = nullptr;
     float renderResolutionScale_ = 1.0f;
     EglState egl_;
     JavaVideoSurface videoSurface_;
@@ -636,6 +659,20 @@ private:
     bool pointerVisible_ = false;
     Vec3 pointerOrigin_{};
     Vec3 pointerHit_{};
+    Vec3 headCenter_{};
+    ScreenBasis headRelativeMenuBasis_{
+        {0.0f, 0.0f, -2.0f},
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+    };
+    ScreenBasis anchoredImmersiveMenuBasis_{
+        {0.0f, 0.0f, -2.0f},
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+    };
+    uint64_t immersiveMenuAnchorGeneration_ = 0;
     XrTime lastPointerCallback_ = 0;
     XrTime lastScrollCallback_ = 0;
     float lastScrollValue_ = 0.0f;
@@ -648,6 +685,9 @@ private:
     float dragRadius_ = 2.4f;
     Vec3 dragStartCenter_{};
     bool dragMoved_ = false;
+    bool draggingImmersive_ = false;
+    float immersiveDragStartPointerYaw_ = 0.0f;
+    float immersiveDragStartVideoYaw_ = 0.0f;
     bool shutdownComplete_ = false;
     int64_t lastAnalyzedVideoTimestampNanos_ = 0;
     uint32_t adaptiveResetGeneration_ = 0;
@@ -1256,7 +1296,7 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
         glBufferData(
             GL_ARRAY_BUFFER,
-            sizeof(float) * kScreenSegments * 6 * 5,
+            sizeof(float) * kMaximumSurfaceVertices * 5,
             nullptr,
             GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(0);
@@ -1338,6 +1378,16 @@ private:
                 static_cast<jint>(direction),
                 static_cast<jfloat>(u),
                 static_cast<jfloat>(v));
+        }
+    }
+
+    void notifyImmersiveOrientation(float yawDegrees, float pitchDegrees) {
+        if (immersiveOrientationCallback_) {
+            env_->CallVoidMethod(
+                activity_,
+                immersiveOrientationCallback_,
+                static_cast<jfloat>(yawDegrees),
+                static_cast<jfloat>(pitchDegrees));
         }
     }
 
@@ -1446,8 +1496,17 @@ private:
             }
 
             if (!gMenuInteractive.load() && released && draggingHand_ == hand) {
+                const bool wasImmersiveDrag = draggingImmersive_;
+                const bool moved = dragMoved_;
                 draggingHand_ = -1;
-                if (!dragMoved_) notifyPointer(-1.0f, -1.0f, 1);
+                draggingImmersive_ = false;
+                if (wasImmersiveDrag && moved) {
+                    notifyImmersiveOrientation(
+                        gImmersiveYawDegrees.load(),
+                        gImmersivePitchDegrees.load());
+                } else if (!moved) {
+                    notifyPointer(-1.0f, -1.0f, 1);
+                }
                 return;
             }
 
@@ -1465,6 +1524,22 @@ private:
 
             if (!gMenuInteractive.load() && draggingHand_ == hand && isDown) {
                 resetHorizontalSeek();
+                if (draggingImmersive_) {
+                    const float targetYaw =
+                        std::atan2(direction.x, -direction.z);
+                    const float yawDelta = normalizedAngleRadians(
+                        targetYaw - immersiveDragStartPointerYaw_);
+                    const float yaw = normalizedAngleRadians(
+                        immersiveDragStartVideoYaw_ + yawDelta);
+                    gImmersiveYawDegrees.store(yaw * 180.0f / kPi);
+                    if (std::abs(yawDelta) > 1.0f * kPi / 180.0f) {
+                        dragMoved_ = true;
+                    }
+                    pointerVisible_ = true;
+                    pointerOrigin_ = origin;
+                    pointerHit_ = origin + direction * 2.0f;
+                    return;
+                }
                 Vec3 target{};
                 if (!intersectRayWithSphere(origin, direction, dragRadius_, &target)) continue;
                 const float targetYaw = std::atan2(target.x, -target.z);
@@ -1492,7 +1567,13 @@ private:
                 return;
             }
 
-            const ScreenBasis basis = currentScreenBasis();
+            const bool immersiveProjection = gVideoProjection.load() != 0;
+            const bool immersivePlaybackUi =
+                gImmersivePlaybackUi.load();
+            const ScreenBasis basis =
+                gMenuInteractive.load() && immersivePlaybackUi
+                    ? anchoredImmersiveMenuBasis_
+                    : currentScreenBasis();
             const float halfHeight = gScreenHalfHeight.load();
             const float videoHalfWidth =
                 halfHeight * std::clamp(gAspect.load(), 0.8f, 2.4f);
@@ -1535,6 +1616,11 @@ private:
                         &v);
                     if (inside) u = videoU < 0.5f ? -0.01f : 1.01f;
                 }
+            } else if (immersiveProjection) {
+                inside = true;
+                hit = origin + direction * 2.0f;
+                u = 0.5f;
+                v = 0.5f;
             } else {
                 inside = intersectRayWithCurvedScreen(
                     origin,
@@ -1592,6 +1678,24 @@ private:
                            displayTime - lastPointerCallback_ > 16'000'000) {
                     notifyPointer(u, v, 0);
                     lastPointerCallback_ = displayTime;
+                }
+                return;
+            }
+
+            if (immersiveProjection) {
+                if (pressed) {
+                    draggingHand_ = hand;
+                    draggingImmersive_ = true;
+                    immersiveDragStartPointerYaw_ =
+                        std::atan2(direction.x, -direction.z);
+                    immersiveDragStartVideoYaw_ =
+                        gImmersiveYawDegrees.load() * kPi / 180.0f;
+                    dragMoved_ = false;
+                }
+                if (inside) {
+                    pointerVisible_ = true;
+                    pointerOrigin_ = origin;
+                    pointerHit_ = hit;
                 }
                 return;
             }
@@ -1874,6 +1978,51 @@ private:
         lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
     }
 
+    void updateHeadRelativeState(uint32_t viewCount) {
+        if (viewCount == 0) return;
+        Vec3 position{};
+        for (uint32_t index = 0; index < viewCount; ++index) {
+            position = position + Vec3{
+                views_[index].pose.position.x,
+                views_[index].pose.position.y,
+                views_[index].pose.position.z,
+            };
+        }
+        headCenter_ = position * (1.0f / static_cast<float>(viewCount));
+        const XrQuaternionf orientation = views_[0].pose.orientation;
+        const Vec3 forward = normalized(
+            rotateVector(orientation, {0.0f, 0.0f, -1.0f}));
+        // Keep the panel facing the user's gaze, but derive its axes from world-up.
+        // Head pitch is preserved while head roll can never leave a recalled
+        // playback bar crooked.
+        const Vec3 right = normalized(
+            cross(forward, {0.0f, 1.0f, 0.0f}),
+            {1.0f, 0.0f, 0.0f});
+        const Vec3 up = normalized(
+            cross(right, forward),
+            {0.0f, 1.0f, 0.0f});
+        headRelativeMenuBasis_ = {
+            headCenter_ + forward * 2.0f,
+            right,
+            up,
+            forward * -1.0f,
+        };
+        const uint64_t requestedAnchorGeneration =
+            gImmersiveMenuAnchorGeneration.load();
+        if (
+            requestedAnchorGeneration !=
+            immersiveMenuAnchorGeneration_
+        ) {
+            anchoredImmersiveMenuBasis_ = headRelativeMenuBasis_;
+            immersiveMenuAnchorGeneration_ = requestedAnchorGeneration;
+        }
+        gLatestHeadYawDegrees.store(
+            std::atan2(forward.x, -forward.z) * 180.0f / kPi);
+        gLatestHeadPitchDegrees.store(
+            std::asin(std::clamp(forward.y, -1.0f, 1.0f)) *
+            180.0f / kPi);
+    }
+
     void renderFrame() {
         XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState state{XR_TYPE_FRAME_STATE};
@@ -1885,8 +2034,6 @@ private:
         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         const XrCompositionLayerBaseHeader* layers[1]{};
         if (state.shouldRender && gResumed.load()) {
-            updatePointer(state.predictedDisplayTime);
-            if (gMenuInteractive.load()) notifyFrame(state.predictedDisplayTime);
             XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
             locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             locate.displayTime = state.predictedDisplayTime;
@@ -1895,6 +2042,9 @@ private:
             uint32_t count = 0;
             checkXr(xrLocateViews(session_, &locate, &viewState,
                 static_cast<uint32_t>(views_.size()), &count, views_.data()), "xrLocateViews");
+            updateHeadRelativeState(count);
+            updatePointer(state.predictedDisplayTime);
+            if (gMenuInteractive.load()) notifyFrame(state.predictedDisplayTime);
             int64_t videoTimestampNanos = 0;
             videoSurface_.update(env_, textureTransform_, &videoTimestampNanos);
             analyzeAdaptiveToneMapping(videoTimestampNanos);
@@ -1949,39 +2099,135 @@ private:
         const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
         const float halfHeight = gScreenHalfHeight.load();
         const float halfWidth = halfHeight * aspect;
-        const ScreenBasis basis = currentScreenBasis();
+        const ScreenBasis basis =
+            gMenuInteractive.load() && gImmersivePlaybackUi.load()
+                ? anchoredImmersiveMenuBasis_
+                : currentScreenBasis();
         const float curvature = gScreenCurvature.load();
-        std::array<float, kScreenSegments * 6 * 5> videoVertices{};
-        size_t videoVertexCursor = 0;
-        const auto appendVertex = [&videoVertices, &videoVertexCursor](
+        std::vector<float> videoVertices;
+        videoVertices.reserve(kMaximumSurfaceVertices * 5);
+        const auto appendVertex = [&videoVertices](
                                       const Vec3& point, float u, float v) {
-            videoVertices[videoVertexCursor++] = point.x;
-            videoVertices[videoVertexCursor++] = point.y;
-            videoVertices[videoVertexCursor++] = point.z;
-            videoVertices[videoVertexCursor++] = u;
-            videoVertices[videoVertexCursor++] = v;
+            videoVertices.push_back(point.x);
+            videoVertices.push_back(point.y);
+            videoVertices.push_back(point.z);
+            videoVertices.push_back(u);
+            videoVertices.push_back(v);
         };
-        for (int segment = 0; segment < kScreenSegments; ++segment) {
-            const float u0 =
-                static_cast<float>(segment) / static_cast<float>(kScreenSegments);
-            const float u1 =
-                static_cast<float>(segment + 1) / static_cast<float>(kScreenSegments);
-            const float normalized0 = u0 * 2.0f - 1.0f;
-            const float normalized1 = u1 * 2.0f - 1.0f;
-            const Vec3 topLeft = curvedScreenPoint(
-                basis, halfWidth, normalized0, halfHeight, curvature);
-            const Vec3 bottomLeft = curvedScreenPoint(
-                basis, halfWidth, normalized0, -halfHeight, curvature);
-            const Vec3 bottomRight = curvedScreenPoint(
-                basis, halfWidth, normalized1, -halfHeight, curvature);
-            const Vec3 topRight = curvedScreenPoint(
-                basis, halfWidth, normalized1, halfHeight, curvature);
-            appendVertex(topLeft, u0, 1.0f);
-            appendVertex(bottomLeft, u0, 0.0f);
-            appendVertex(bottomRight, u1, 0.0f);
-            appendVertex(topLeft, u0, 1.0f);
-            appendVertex(bottomRight, u1, 0.0f);
-            appendVertex(topRight, u1, 1.0f);
+        const int projectionMode = gVideoProjection.load();
+        if (projectionMode == 0) {
+            for (int segment = 0; segment < kScreenSegments; ++segment) {
+                const float u0 =
+                    static_cast<float>(segment) /
+                    static_cast<float>(kScreenSegments);
+                const float u1 =
+                    static_cast<float>(segment + 1) /
+                    static_cast<float>(kScreenSegments);
+                const float normalized0 = u0 * 2.0f - 1.0f;
+                const float normalized1 = u1 * 2.0f - 1.0f;
+                const Vec3 topLeft = curvedScreenPoint(
+                    basis, halfWidth, normalized0, halfHeight, curvature);
+                const Vec3 bottomLeft = curvedScreenPoint(
+                    basis, halfWidth, normalized0, -halfHeight, curvature);
+                const Vec3 bottomRight = curvedScreenPoint(
+                    basis, halfWidth, normalized1, -halfHeight, curvature);
+                const Vec3 topRight = curvedScreenPoint(
+                    basis, halfWidth, normalized1, halfHeight, curvature);
+                appendVertex(topLeft, u0, 1.0f);
+                appendVertex(bottomLeft, u0, 0.0f);
+                appendVertex(bottomRight, u1, 0.0f);
+                appendVertex(topLeft, u0, 1.0f);
+                appendVertex(bottomRight, u1, 0.0f);
+                appendVertex(topRight, u1, 1.0f);
+            }
+        } else {
+            const float horizontalFov =
+                projectionMode == 1 ? kPi : 2.0f * kPi;
+            const float yawOffset =
+                gImmersiveYawDegrees.load() * kPi / 180.0f;
+            const float pitchOffset =
+                gImmersivePitchDegrees.load() * kPi / 180.0f;
+            constexpr float radius = 10.0f;
+            const auto immersivePoint =
+                [&](float u, float v) {
+                    const float yaw =
+                        (u - 0.5f) * horizontalFov + yawOffset;
+                    const float pitch = std::clamp(
+                        (0.5f - v) * kPi + pitchOffset,
+                        -0.5f * kPi,
+                        0.5f * kPi);
+                    const float horizontalRadius = std::cos(pitch);
+                    const Vec3 direction{
+                        std::sin(yaw) * horizontalRadius,
+                        std::sin(pitch),
+                        -std::cos(yaw) * horizontalRadius,
+                    };
+                    return headCenter_ + direction * radius;
+                };
+            std::vector<Vec3> immersivePoints(
+                (kImmersiveHorizontalSegments + 1) *
+                (kImmersiveVerticalSegments + 1));
+            const auto immersivePointIndex = [](int column, int row) {
+                return
+                    row * (kImmersiveHorizontalSegments + 1) +
+                    column;
+            };
+            for (int row = 0; row <= kImmersiveVerticalSegments; ++row) {
+                const float v =
+                    static_cast<float>(row) /
+                    static_cast<float>(kImmersiveVerticalSegments);
+                for (
+                    int column = 0;
+                    column <= kImmersiveHorizontalSegments;
+                    ++column
+                ) {
+                    const float u =
+                        static_cast<float>(column) /
+                        static_cast<float>(kImmersiveHorizontalSegments);
+                    immersivePoints[immersivePointIndex(column, row)] =
+                        immersivePoint(u, v);
+                }
+            }
+            for (
+                int row = 0;
+                row < kImmersiveVerticalSegments;
+                ++row
+            ) {
+                const float v0 =
+                    static_cast<float>(row) /
+                    static_cast<float>(kImmersiveVerticalSegments);
+                const float v1 =
+                    static_cast<float>(row + 1) /
+                    static_cast<float>(kImmersiveVerticalSegments);
+                for (
+                    int column = 0;
+                    column < kImmersiveHorizontalSegments;
+                    ++column
+                ) {
+                    const float u0 =
+                        static_cast<float>(column) /
+                        static_cast<float>(kImmersiveHorizontalSegments);
+                    const float u1 =
+                        static_cast<float>(column + 1) /
+                        static_cast<float>(kImmersiveHorizontalSegments);
+                    const Vec3 topLeft =
+                        immersivePoints[immersivePointIndex(column, row)];
+                    const Vec3 bottomLeft =
+                        immersivePoints[immersivePointIndex(column, row + 1)];
+                    const Vec3 bottomRight =
+                        immersivePoints[
+                            immersivePointIndex(column + 1, row + 1)];
+                    const Vec3 topRight =
+                        immersivePoints[
+                            immersivePointIndex(column + 1, row)];
+                    appendVertex(topLeft, u0, 1.0f - v0);
+                    appendVertex(bottomLeft, u0, 1.0f - v1);
+                    appendVertex(bottomRight, u1, 1.0f - v1);
+                    appendVertex(topLeft, u0, 1.0f - v0);
+                    appendVertex(bottomRight, u1, 1.0f - v1);
+                    appendVertex(topRight, u1, 1.0f - v0);
+                }
+            }
         }
         glBindVertexArray(vertexArray_);
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
@@ -1990,6 +2236,8 @@ private:
             0,
             videoVertices.size() * sizeof(float),
             videoVertices.data());
+        const GLsizei videoVertexCount =
+            static_cast<GLsizei>(videoVertices.size() / 5);
         if (gHasVideo.load()) {
             glUseProgram(videoProgram_);
             glUniformMatrix4fv(glGetUniformLocation(videoProgram_, "uMvp"), 1, GL_FALSE, mvp.m);
@@ -2035,13 +2283,21 @@ private:
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
             glUniform1i(glGetUniformLocation(videoProgram_, "uVideo"), 0);
-            glDrawArrays(GL_TRIANGLES, 0, kScreenSegments * 6);
+            glDrawArrays(GL_TRIANGLES, 0, videoVertexCount);
         }
 
         if (gSubtitleWidth.load() > 0 && gSubtitleHeight.load() > 0) {
             const bool isMenuOverlay = gMenuInteractive.load();
             const bool isBitmapSubtitle =
                 !isMenuOverlay && gSubtitleBitmapMode.load();
+            const ScreenBasis subtitleBasis =
+                projectionMode == 0
+                    ? basis
+                    : isMenuOverlay && gImmersivePlaybackUi.load()
+                        ? anchoredImmersiveMenuBasis_
+                        : isMenuOverlay
+                            ? basis
+                            : headRelativeMenuBasis_;
             float displayLeft = gSubtitleLeft.load();
             float displayTop = gSubtitleTop.load();
             float displayRight = gSubtitleRight.load();
@@ -2189,14 +2445,14 @@ private:
                     [&](float normalizedHorizontal, float vertical) {
                         return isBitmapSubtitle
                             ? curvedScreenPoint(
-                                basis,
+                                subtitleBasis,
                                 halfWidth,
                                 normalizedHorizontal,
                                 vertical,
                                 curvature,
                                 subtitleForward)
                             : sharedCurvedScreenPoint(
-                                basis,
+                                subtitleBasis,
                                 subtitleReferenceHalfWidth,
                                 subtitleHalfWidth,
                                 normalizedHorizontal,
@@ -2257,7 +2513,10 @@ private:
         glUseProgram(pointerProgram_);
         glUniformMatrix4fv(glGetUniformLocation(pointerProgram_, "uMvp"), 1, GL_FALSE, mvp.m);
         glUniform4f(glGetUniformLocation(pointerProgram_, "uColor"), 0.10f, 0.78f, 1.0f, 1.0f);
-        const ScreenBasis basis = currentScreenBasis();
+        const ScreenBasis basis =
+            gMenuInteractive.load() && gImmersivePlaybackUi.load()
+                ? anchoredImmersiveMenuBasis_
+                : currentScreenBasis();
         const Vec3 lineEnd = pointerHit_ + basis.normal * 0.01f;
         const float line[] = {
             pointerOrigin_.x, pointerOrigin_.y, pointerOrigin_.z, 0, 0,
@@ -2429,6 +2688,52 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetStereoMode(JNIEnv*, jclass, jint st
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetVideoProjection(
+    JNIEnv*, jclass, jint projection) {
+    if (projection >= 0 && projection <= 2) {
+        gVideoProjection.store(projection);
+        if (projection != 0) {
+            gImmersiveMenuAnchorGeneration.fetch_add(1);
+        }
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetImmersiveOrientation(
+    JNIEnv*, jclass, jfloat yawDegrees, jfloat pitchDegrees) {
+    if (std::isfinite(yawDegrees)) {
+        float normalizedYaw = std::fmod(static_cast<float>(yawDegrees), 360.0f);
+        if (normalizedYaw > 180.0f) normalizedYaw -= 360.0f;
+        if (normalizedYaw < -180.0f) normalizedYaw += 360.0f;
+        gImmersiveYawDegrees.store(normalizedYaw);
+    }
+    if (std::isfinite(pitchDegrees)) {
+        gImmersivePitchDegrees.store(
+            std::clamp(static_cast<float>(pitchDegrees), -80.0f, 80.0f));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeRecenterImmersive(
+    JNIEnv*, jclass) {
+    gImmersiveYawDegrees.store(gLatestHeadYawDegrees.load());
+    gImmersivePitchDegrees.store(
+        std::clamp(gLatestHeadPitchDegrees.load(), -80.0f, 80.0f));
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeGetImmersiveYaw(
+    JNIEnv*, jclass) {
+    return gImmersiveYawDegrees.load();
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeGetImmersivePitch(
+    JNIEnv*, jclass) {
+    return gImmersivePitchDegrees.load();
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetPictureSettings(
     JNIEnv*, jclass, jint pictureMode, jfloat brightness, jfloat exposure,
     jfloat contrast, jfloat saturation, jfloat vibrance,
@@ -2567,8 +2872,24 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAvailable(JNIEnv*, jclass, jbo
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetImmersivePlaybackUi(
+    JNIEnv*, jclass, jboolean enabled) {
+    const bool nextEnabled = enabled == JNI_TRUE;
+    const bool previousEnabled =
+        gImmersivePlaybackUi.exchange(nextEnabled);
+    if (!previousEnabled && nextEnabled) {
+        gImmersiveMenuAnchorGeneration.fetch_add(1);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetMenuInteractive(JNIEnv*, jclass, jboolean interactive) {
-    gMenuInteractive.store(interactive == JNI_TRUE);
+    const bool nextInteractive = interactive == JNI_TRUE;
+    const bool previousInteractive =
+        gMenuInteractive.exchange(nextInteractive);
+    if (!previousInteractive && nextInteractive) {
+        gImmersiveMenuAnchorGeneration.fetch_add(1);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL

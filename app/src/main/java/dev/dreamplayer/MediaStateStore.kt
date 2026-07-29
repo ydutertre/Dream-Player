@@ -51,6 +51,9 @@ class MediaStateStore(context: Context) :
 
     data class ProjectionPreference(
         val mode: StereoMode,
+        val projection: VideoProjection,
+        val immersiveYawDegrees: Float,
+        val immersivePitchDegrees: Float,
         val manuallySelected: Boolean,
     )
 
@@ -77,6 +80,9 @@ class MediaStateStore(context: Context) :
                 title TEXT,
                 stereo_mode INTEGER,
                 stereo_manual INTEGER NOT NULL DEFAULT 0,
+                projection_mode INTEGER NOT NULL DEFAULT 0,
+                immersive_yaw REAL NOT NULL DEFAULT 0,
+                immersive_pitch REAL NOT NULL DEFAULT 0,
                 position_ms INTEGER,
                 duration_ms INTEGER,
                 screen_x REAL,
@@ -167,6 +173,20 @@ class MediaStateStore(context: Context) :
             db.execSQL(
                 "ALTER TABLE media_state ADD COLUMN " +
                     "subtitle_3d_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        }
+        if (oldVersion < 15) {
+            db.execSQL(
+                "ALTER TABLE media_state ADD COLUMN " +
+                    "projection_mode INTEGER NOT NULL DEFAULT 0"
+            )
+            db.execSQL(
+                "ALTER TABLE media_state ADD COLUMN " +
+                    "immersive_yaw REAL NOT NULL DEFAULT 0"
+            )
+            db.execSQL(
+                "ALTER TABLE media_state ADD COLUMN " +
+                    "immersive_pitch REAL NOT NULL DEFAULT 0"
             )
         }
     }
@@ -270,7 +290,13 @@ class MediaStateStore(context: Context) :
         val identity = MediaIdentity.from(spec)
         readableDatabase.query(
             "media_state",
-            arrayOf("stereo_mode", "stereo_manual"),
+            arrayOf(
+                "stereo_mode",
+                "stereo_manual",
+                "projection_mode",
+                "immersive_yaw",
+                "immersive_pitch",
+            ),
             "media_id = ?",
             arrayOf(identity.id),
             null,
@@ -281,6 +307,11 @@ class MediaStateStore(context: Context) :
             if (!cursor.moveToFirst() || cursor.isNull(0)) return null
             return ProjectionPreference(
                 mode = StereoMode.fromWire(cursor.getInt(0)),
+                projection = VideoProjection.fromWire(cursor.getInt(2)),
+                immersiveYawDegrees =
+                    if (cursor.isNull(3)) 0f else cursor.getFloat(3),
+                immersivePitchDegrees =
+                    if (cursor.isNull(4)) 0f else cursor.getFloat(4),
                 manuallySelected = cursor.getInt(1) != 0,
             )
         }
@@ -349,13 +380,23 @@ class MediaStateStore(context: Context) :
         }
     }
 
-    fun saveProjection(spec: PlaybackSpec, mode: StereoMode, manuallySelected: Boolean = true) {
+    fun saveProjection(
+        spec: PlaybackSpec,
+        mode: StereoMode,
+        projection: VideoProjection = VideoProjection.FLAT,
+        immersiveYawDegrees: Float = 0f,
+        immersivePitchDegrees: Float = 0f,
+        manuallySelected: Boolean = true,
+    ) {
         val identity = MediaIdentity.from(spec)
         val values = ContentValues().apply {
             put("media_id", identity.id)
             put("canonical_location", identity.canonicalLocation)
             put("title", spec.title)
             put("stereo_mode", mode.wireValue)
+            put("projection_mode", projection.wireValue)
+            put("immersive_yaw", immersiveYawDegrees)
+            put("immersive_pitch", immersivePitchDegrees)
             put("stereo_manual", if (manuallySelected) 1 else 0)
             put("updated_at", System.currentTimeMillis())
         }
@@ -455,7 +496,7 @@ class MediaStateStore(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "media-state.db"
-        private const val DATABASE_VERSION = 14
+        private const val DATABASE_VERSION = 15
     }
 }
 

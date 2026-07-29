@@ -18,9 +18,14 @@ import io.github.anilbeesetti.nextlib.media3ext.renderer.NextTextRenderer
 @UnstableApi
 open class NextRenderersFactory(context: Context) : DefaultRenderersFactory(context) {
     private var preferFfmpegForDts = false
+    private var ffmpegVideoEnabled = true
 
     fun setPreferFfmpegForDts(prefer: Boolean): NextRenderersFactory = apply {
         preferFfmpegForDts = prefer
+    }
+
+    fun setFfmpegVideoEnabled(enabled: Boolean): NextRenderersFactory = apply {
+        ffmpegVideoEnabled = enabled
     }
 
     override fun buildAudioRenderers(
@@ -95,7 +100,15 @@ open class NextRenderersFactory(context: Context) : DefaultRenderersFactory(cont
             out
         )
 
-        if (extensionRendererMode == EXTENSION_RENDERER_MODE_OFF) return
+        if (
+            extensionRendererMode == EXTENSION_RENDERER_MODE_OFF ||
+            !ffmpegVideoEnabled
+        ) {
+            if (!ffmpegVideoEnabled) {
+                Log.i(TAG, "FfmpegVideoRenderer disabled; hardware-only video path.")
+            }
+            return
+        }
 
         var extensionRendererIndex = out.size
         if (extensionRendererMode == EXTENSION_RENDERER_MODE_PREFER) {

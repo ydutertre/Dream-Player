@@ -42,9 +42,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlaybackException
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import io.github.anilbeesetti.nextlib.media3ext.renderer.subtitleDelayMilliseconds
 import java.nio.ByteBuffer
@@ -64,6 +66,9 @@ class PlayerActivity : Activity(), Player.Listener {
     private var resumePlaybackOnForeground = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentStereoMode = StereoMode.MONO
+    private var currentProjection = VideoProjection.FLAT
+    private var immersiveYawDegrees = 0f
+    private var immersivePitchDegrees = 0f
     private var pictureMode = PictureMode.AUTO
     private var pictureBrightness = DEFAULT_PICTURE_BRIGHTNESS
     private var pictureExposure = DEFAULT_PICTURE_EXPOSURE
@@ -188,6 +193,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var playbackBrowserReturn: BrowserReturnState? = null
     private var decoderMode = DecoderMode.AUTO
     private var effectiveDecoderMode = DecoderMode.HARDWARE
+    private var activeVideoDecoderName: String? = null
     private var healthLastElapsedMs = 0L
     private var healthLastPositionMs = 0L
     private var healthAnchorElapsedMs = 0L
@@ -320,7 +326,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class DecoderMode(val wireValue: Int, val label: String) {
         AUTO(0, "Auto"),
         HARDWARE(1, "Hardware"),
-        SOFTWARE(2, "Software");
+        SOFTWARE(2, "Software"),
+        EXPERIMENTAL_8K_HARDWARE(3, "Experimental 8K HW");
 
         companion object {
             fun fromWire(value: Int): DecoderMode =
@@ -702,7 +709,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             armControlsAutoHide()
                             renderVrMenu()
                         }
-                    } else if (!PLAYBACK_TOOLBAR_BOUNDS.contains(px, py)) {
+                    } else if (!playbackToolbarBounds().contains(px, py)) {
                         hideControls()
                     }
                 }
@@ -783,7 +790,7 @@ class PlayerActivity : Activity(), Player.Listener {
             val px = u * UI_WIDTH
             val py = v * UI_HEIGHT
             if (uiVisible) {
-                val overToolbar = PLAYBACK_TOOLBAR_BOUNDS.contains(px, py)
+                val overToolbar = playbackToolbarBounds().contains(px, py)
                 val overPopover = playbackPopoverBounds(playbackPopover)?.contains(px, py) == true
                 val overControl = uiButtons.any { it.bounds.contains(px, py) }
                 if (overToolbar || overPopover || overControl) return@runOnUiThread
@@ -804,6 +811,22 @@ class PlayerActivity : Activity(), Player.Listener {
                     formatTime(newPosition),
                 1_500L,
             )
+        }
+    }
+
+    @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativeImmersiveOrientationChanged(yawDegrees: Float, pitchDegrees: Float) {
+        runOnUiThread {
+            if (
+                !yawDegrees.isFinite() ||
+                !pitchDegrees.isFinite() ||
+                currentProjection == VideoProjection.FLAT
+            ) {
+                return@runOnUiThread
+            }
+            immersiveYawDegrees = (yawDegrees + 180f).mod(360f) - 180f
+            immersivePitchDegrees = pitchDegrees.coerceIn(-80f, 80f)
+            persistProjectionSettings()
         }
     }
 
@@ -1239,6 +1262,7 @@ class PlayerActivity : Activity(), Player.Listener {
         browserReturn: BrowserReturnState? = null,
         resumeOverrideMs: Long? = null,
         autoSoftwareFallback: Boolean = false,
+        decoderModeOverride: DecoderMode? = null,
     ) {
         if (spec.uri != newSpec.uri) {
             remoteRecoveryAttempts = 0
@@ -1252,6 +1276,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 resumeOverrideMs,
                 autoSoftwareFallback,
                 externalSubtitles,
+                decoderModeOverride,
             )
             return
         }
@@ -1274,6 +1299,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     resumeOverrideMs,
                     autoSoftwareFallback,
                     discovered,
+                    decoderModeOverride,
                 )
             }
         }
@@ -1285,6 +1311,7 @@ class PlayerActivity : Activity(), Player.Listener {
         resumeOverrideMs: Long?,
         autoSoftwareFallback: Boolean,
         discoveredExternalSubtitles: List<ExternalSubtitle>,
+        decoderModeOverride: DecoderMode? = null,
     ) {
         mediaLoadGeneration++
         decoderFallbackPending = false
@@ -1313,9 +1340,10 @@ class PlayerActivity : Activity(), Player.Listener {
         audioTrackScrollOffset = 0f
         nativeSetSubtitle(renderSubtitle(emptyList()))
         val savedPlaybackState = mediaStateStore.loadPlaybackState(newSpec)
-        decoderMode = DecoderMode.fromWire(
+        decoderMode = decoderModeOverride ?: DecoderMode.fromWire(
             savedPlaybackState?.decoderMode ?: DecoderMode.AUTO.wireValue
         )
+        activeVideoDecoderName = null
         effectiveDecoderMode = when {
             decoderMode == DecoderMode.SOFTWARE -> DecoderMode.SOFTWARE
             decoderMode == DecoderMode.AUTO &&
@@ -1387,14 +1415,19 @@ class PlayerActivity : Activity(), Player.Listener {
         pendingAudioFingerprint = savedPlaybackState?.audioTrackFingerprint
         val savedProjection = mediaStateStore.loadProjection(newSpec)
             ?.takeIf { it.manuallySelected }
-            ?.mode
         val detectedProjection = FilenameProjectionDetector.detect(newSpec.title)
-        currentStereoMode = savedProjection
+        currentStereoMode = savedProjection?.mode
             ?: if (newSpec.projectionExplicit) newSpec.stereoMode
             else detectedProjection ?: StereoMode.MONO
+        currentProjection =
+            savedProjection?.projection ?: VideoProjection.FLAT
+        immersiveYawDegrees =
+            savedProjection?.immersiveYawDegrees?.coerceIn(-180f, 180f) ?: 0f
+        immersivePitchDegrees =
+            savedProjection?.immersivePitchDegrees?.coerceIn(-80f, 80f) ?: 0f
         spec = newSpec.copy(stereoMode = currentStereoMode)
         if (newSpec.projectionExplicit && savedProjection == null) {
-            mediaStateStore.saveProjection(spec, currentStereoMode)
+            persistProjectionSettings()
         }
         Log.i(
             "DreamPlayerState",
@@ -1407,6 +1440,11 @@ class PlayerActivity : Activity(), Player.Listener {
                 }}, mediaId=${MediaIdentity.from(spec).id.take(12)})",
         )
         nativeSetStereoMode(currentStereoMode.wireValue)
+        nativeSetVideoProjection(currentProjection.wireValue)
+        nativeSetImmersiveOrientation(
+            immersiveYawDegrees,
+            immersivePitchDegrees,
+        )
         val savedSubtitleDepth = savedPlaybackState?.subtitleDepthMeters
             ?.takeIf(Float::isFinite)
         subtitleDepthIsCustom = savedSubtitleDepth != null
@@ -1464,6 +1502,9 @@ class PlayerActivity : Activity(), Player.Listener {
             // valid DTS-HD access units in some Blu-ray remuxes. Prefer FFmpeg for DTS audio only;
             // video and every other audio codec retain their existing renderer order.
             setPreferFfmpegForDts(true)
+            setFfmpegVideoEnabled(
+                decoderMode != DecoderMode.EXPERIMENTAL_8K_HARDWARE,
+            )
             setExtensionRendererMode(
                 if (effectiveDecoderMode == DecoderMode.SOFTWARE) {
                     DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
@@ -1485,11 +1526,48 @@ class PlayerActivity : Activity(), Player.Listener {
         } else {
             DefaultLoadControl()
         }
+        val trackSelector = DefaultTrackSelector(this).apply {
+            parameters = buildUponParameters()
+                // Experimental 8K mode deliberately asks MediaCodec to try a stream just
+                // beyond the decoder's advertised performance envelope.
+                .setExceedRendererCapabilitiesIfNecessary(true)
+                .build()
+        }
         player = ExoPlayer.Builder(this, renderersFactory)
             .setLoadControl(loadControl)
+            .setTrackSelector(trackSelector)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
             .build()
-            .also { it.addListener(this) }
+            .also {
+                it.addListener(this)
+                it.addAnalyticsListener(
+                    object : AnalyticsListener {
+                        override fun onVideoDecoderInitialized(
+                            eventTime: AnalyticsListener.EventTime,
+                            decoderName: String,
+                            initializedTimestampMs: Long,
+                            initializationDurationMs: Long,
+                        ) {
+                            activeVideoDecoderName = decoderName
+                            Log.i(
+                                "DreamPlayerDecoder",
+                                "Active video decoder: $decoderName " +
+                                    "(mode=${decoderMode.label}, " +
+                                    "init=${initializationDurationMs}ms)",
+                            )
+                            if (
+                                decoderMode ==
+                                DecoderMode.EXPERIMENTAL_8K_HARDWARE
+                            ) {
+                                showOsd(
+                                    "8K hardware active\n$decoderName",
+                                    6_000L,
+                                )
+                            }
+                        }
+                    },
+                )
+            }
         player.subtitleDelayMilliseconds = subtitleSyncMs.toLong()
         videoSurface?.let(player::setVideoSurface)
         val subtitleConfigurations = buildList {
@@ -2336,6 +2414,22 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     override fun onPlayerError(error: PlaybackException) {
+        if (decoderMode == DecoderMode.EXPERIMENTAL_8K_HARDWARE) {
+            Log.e(
+                "DreamPlayerDecoder",
+                "Experimental 8K hardware playback failed",
+                error,
+            )
+            message.text =
+                "8K hardware decoder failed\n${error.errorCodeName}\n" +
+                    error.message.orEmpty()
+            message.visibility = View.VISIBLE
+            showOsd(
+                "8K hardware decoder failed\n${error.errorCodeName}",
+                12_000L,
+            )
+            return
+        }
         if (
             decoderMode == DecoderMode.AUTO &&
             effectiveDecoderMode == DecoderMode.HARDWARE &&
@@ -2595,7 +2689,7 @@ class PlayerActivity : Activity(), Player.Listener {
         }
         nativeSetStereoMode(currentStereoMode.wireValue)
         applyDefaultSubtitleDepthForProjection()
-        mediaStateStore.saveProjection(spec, currentStereoMode)
+        persistProjectionSettings()
         updateVideoAspect()
         showControls(0L)
     }
@@ -2698,6 +2792,44 @@ class PlayerActivity : Activity(), Player.Listener {
         StereoMode.HALF_SBS -> "Half SBS"
         StereoMode.OVER_UNDER -> "Full OU"
         StereoMode.HALF_OVER_UNDER -> "Half OU"
+    }
+
+    private fun projectionLabel(): String =
+        if (currentProjection == VideoProjection.FLAT) {
+            stereoLabel()
+        } else {
+            "${currentProjection.label} • ${stereoLabel()}"
+        }
+
+    private fun playbackToolbarBounds(): RectF =
+        if (currentProjection == VideoProjection.EQUIRECTANGULAR_360) {
+            PLAYBACK_TOOLBAR_360_BOUNDS
+        } else {
+            PLAYBACK_TOOLBAR_BOUNDS
+        }
+
+    private fun playbackSeekLeft(): Float =
+        if (currentProjection == VideoProjection.EQUIRECTANGULAR_360) {
+            PLAYBACK_SEEK_360_LEFT
+        } else {
+            PLAYBACK_SEEK_LEFT
+        }
+
+    private fun playbackSeekRight(): Float =
+        if (currentProjection == VideoProjection.EQUIRECTANGULAR_360) {
+            PLAYBACK_SEEK_360_RIGHT
+        } else {
+            PLAYBACK_SEEK_RIGHT
+        }
+
+    private fun persistProjectionSettings() {
+        mediaStateStore.saveProjection(
+            spec,
+            currentStereoMode,
+            currentProjection,
+            immersiveYawDegrees,
+            immersivePitchDegrees,
+        )
     }
 
     private fun showControls(durationMs: Long) {
@@ -3359,8 +3491,10 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "seek_bar" -> {
                 val duration = player.duration
                 if (duration > 0) {
-                    val fraction = ((pointerX - PLAYBACK_SEEK_LEFT) /
-                        (PLAYBACK_SEEK_RIGHT - PLAYBACK_SEEK_LEFT)).coerceIn(0f, 1f)
+                    val seekLeft = playbackSeekLeft()
+                    val seekRight = playbackSeekRight()
+                    val fraction = ((pointerX - seekLeft) /
+                        (seekRight - seekLeft)).coerceIn(0f, 1f)
                     player.seekTo((duration * fraction).toLong())
                     renderVrMenu()
                 }
@@ -3375,8 +3509,56 @@ class PlayerActivity : Activity(), Player.Listener {
                 }
                 nativeSetStereoMode(currentStereoMode.wireValue)
                 applyDefaultSubtitleDepthForProjection()
-                mediaStateStore.saveProjection(spec, currentStereoMode)
+                persistProjectionSettings()
                 updateVideoAspect()
+                renderVrMenu()
+            }
+            id.startsWith("projection_view_") -> {
+                currentProjection = when (id) {
+                    "projection_view_180" ->
+                        VideoProjection.EQUIRECTANGULAR_180
+                    "projection_view_360" ->
+                        VideoProjection.EQUIRECTANGULAR_360
+                    else -> VideoProjection.FLAT
+                }
+                nativeSetVideoProjection(currentProjection.wireValue)
+                if (currentProjection != VideoProjection.FLAT) {
+                    nativeRecenterImmersive()
+                    immersiveYawDegrees = nativeGetImmersiveYaw()
+                    immersivePitchDegrees = nativeGetImmersivePitch()
+                }
+                persistProjectionSettings()
+                renderVrMenu()
+            }
+            id == "immersive_recenter" -> {
+                nativeRecenterImmersive()
+                immersiveYawDegrees = nativeGetImmersiveYaw()
+                immersivePitchDegrees = nativeGetImmersivePitch()
+                persistProjectionSettings()
+                renderVrMenu()
+            }
+            id.startsWith("immersive_yaw_") -> {
+                immersiveYawDegrees = (
+                    immersiveYawDegrees +
+                        if (id.endsWith("left")) -15f else 15f
+                    ).coerceIn(-180f, 180f)
+                nativeSetImmersiveOrientation(
+                    immersiveYawDegrees,
+                    immersivePitchDegrees,
+                )
+                persistProjectionSettings()
+                renderVrMenu()
+            }
+            id.startsWith("immersive_pitch_") -> {
+                immersivePitchDegrees = (
+                    immersivePitchDegrees +
+                        if (id.endsWith("down")) -10f else 10f
+                    ).coerceIn(-80f, 80f)
+                nativeSetImmersiveOrientation(
+                    immersiveYawDegrees,
+                    immersivePitchDegrees,
+                )
+                persistProjectionSettings()
                 renderVrMenu()
             }
             id == "swap_eyes" -> {
@@ -3677,21 +3859,31 @@ class PlayerActivity : Activity(), Player.Listener {
                 val selectedMode = when (id) {
                     "decoder_hardware" -> DecoderMode.HARDWARE
                     "decoder_software" -> DecoderMode.SOFTWARE
+                    "decoder_experimental_8k" ->
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE
                     else -> DecoderMode.AUTO
                 }
                 val requestedEffectiveMode = when (selectedMode) {
                     DecoderMode.SOFTWARE -> DecoderMode.SOFTWARE
                     DecoderMode.AUTO,
-                    DecoderMode.HARDWARE -> DecoderMode.HARDWARE
+                    DecoderMode.HARDWARE,
+                    DecoderMode.EXPERIMENTAL_8K_HARDWARE ->
+                        DecoderMode.HARDWARE
                 }
                 val position = player.currentPosition
+                val rendererConfigurationChanged =
+                    selectedMode == DecoderMode.EXPERIMENTAL_8K_HARDWARE ||
+                        decoderMode == DecoderMode.EXPERIMENTAL_8K_HARDWARE
                 decoderMode = selectedMode
                 mediaStateStore.saveDecoderMode(spec, selectedMode.wireValue)
                 if (selectedMode == DecoderMode.AUTO) {
                     // Explicitly choosing Auto asks it to probe hardware again.
                     mediaStateStore.saveDecoderAutoSoftware(spec, false)
                 }
-                if (effectiveDecoderMode == requestedEffectiveMode) {
+                if (
+                    effectiveDecoderMode == requestedEffectiveMode &&
+                    !rendererConfigurationChanged
+                ) {
                     renderVrMenu()
                     showOsd("Decoder: ${selectedMode.label}", 3_000L)
                     return
@@ -3701,8 +3893,20 @@ class PlayerActivity : Activity(), Player.Listener {
                     playbackBrowserReturn,
                     resumeOverrideMs = position,
                     autoSoftwareFallback = false,
+                    decoderModeOverride = selectedMode,
                 )
-                showOsd("Decoder: ${selectedMode.label}", 3_000L)
+                showOsd(
+                    if (
+                        selectedMode ==
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE
+                    ) {
+                        "Experimental 8K hardware decoder\n" +
+                            "Playback may fail on unsupported files"
+                    } else {
+                        "Decoder: ${selectedMode.label}"
+                    },
+                    5_000L,
+                )
             }
             id.startsWith("sync_") -> {
                 val delta = when (id) {
@@ -4465,7 +4669,18 @@ class PlayerActivity : Activity(), Player.Listener {
                             cx + offset, cy + scale * 1.02f, stroke,
                         )
                     }
-                    text(if (effectiveDecoderMode == DecoderMode.SOFTWARE) "SW" else "HW", cx, cy + 10f, 24f)
+                    text(
+                        when {
+                            decoderMode ==
+                                DecoderMode.EXPERIMENTAL_8K_HARDWARE -> "8K"
+                            effectiveDecoderMode ==
+                                DecoderMode.SOFTWARE -> "SW"
+                            else -> "HW"
+                        },
+                        cx,
+                        cy + 10f,
+                        24f,
+                    )
                 }
                 "audio_sync" -> {
                     val speaker = Path().apply {
@@ -5472,11 +5687,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 )
             }
             UiScreen.PLAYBACK -> {
-                canvas.drawRoundRect(PLAYBACK_TOOLBAR_BOUNDS, 34f, 34f, panelPaint)
+                val compact360 =
+                    currentProjection == VideoProjection.EQUIRECTANGULAR_360
+                val toolbarBounds = playbackToolbarBounds()
+                val sideInset = if (compact360) 100f else 0f
+                canvas.drawRoundRect(toolbarBounds, 34f, 34f, panelPaint)
                 val duration = player.duration.takeIf { it > 0 } ?: 0L
                 val fraction = if (duration > 0) player.currentPosition.toFloat() / duration else 0f
-                val seekLeft = PLAYBACK_SEEK_LEFT
-                val seekRight = PLAYBACK_SEEK_RIGHT
+                val seekLeft = playbackSeekLeft()
+                val seekRight = playbackSeekRight()
                 val seekWidth = seekRight - seekLeft
                 val seekBounds = RectF(seekLeft, 720f, seekRight, 790f)
                 canvas.drawRoundRect(seekLeft, 749f, seekRight, 763f, 7f, 7f,
@@ -5486,8 +5705,22 @@ class PlayerActivity : Activity(), Player.Listener {
                 canvas.drawCircle(seekLeft + seekWidth * fraction.coerceIn(0f, 1f), 756f, 18f,
                     Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorText })
                 buttons += UiButton("seek_bar", "Seek", seekBounds)
-                text(formatTime(player.currentPosition), 320f, 765f, 26f, Paint.Align.RIGHT, colorTextMuted)
-                text(formatTime(duration), 1728f, 765f, 26f, Paint.Align.LEFT, colorTextMuted)
+                text(
+                    formatTime(player.currentPosition),
+                    320f + sideInset,
+                    765f,
+                    26f,
+                    Paint.Align.RIGHT,
+                    colorTextMuted,
+                )
+                text(
+                    formatTime(duration),
+                    1728f - sideInset,
+                    765f,
+                    26f,
+                    Paint.Align.LEFT,
+                    colorTextMuted,
+                )
                 val iconTop = 820f
                 val iconBottom = 936f
                 val standardButtonSize = iconBottom - iconTop
@@ -5495,15 +5728,20 @@ class PlayerActivity : Activity(), Player.Listener {
                     RectF(left, iconTop, left + standardButtonSize, iconBottom)
 
                 // Left: navigation and language controls.
-                iconButton("back_library", "Library", standardBounds(176f))
                 iconButton(
-                    "subtitles", "Subtitles", standardBounds(316f),
+                    "back_library", "Library",
+                    standardBounds(176f + sideInset),
+                )
+                iconButton(
+                    "subtitles", "Subtitles",
+                    standardBounds(316f + sideInset),
                     playbackPopover == PlaybackPopover.SUBTITLES ||
                         subtitleChoiceIndex > 1 ||
                         subtitleSyncMs != 0,
                 )
                 iconButton(
-                    "audio", "Audio", standardBounds(456f),
+                    "audio", "Audio",
+                    standardBounds(456f + sideInset),
                     playbackPopover == PlaybackPopover.AUDIO ||
                         audioChoiceIndex > 0 ||
                         audioSyncMs != 0,
@@ -5522,14 +5760,17 @@ class PlayerActivity : Activity(), Player.Listener {
 
                 // Right: presentation and player configuration.
                 iconButton(
-                    "projection", stereoLabel(), standardBounds(1616f),
+                    "projection", projectionLabel(),
+                    standardBounds(1616f - sideInset),
                     playbackPopover == PlaybackPopover.PROJECTION ||
+                        currentProjection != VideoProjection.FLAT ||
                         currentStereoMode != StereoMode.MONO ||
                         swapEyes ||
                         screenCurvature != DEFAULT_SCREEN_CURVATURE,
                 )
                 iconButton(
-                    "settings", "Settings", standardBounds(1756f),
+                    "settings", "Settings",
+                    standardBounds(1756f - sideInset),
                         playbackPopover == PlaybackPopover.SETTINGS ||
                         playbackPopover == PlaybackPopover.CINEMA ||
                         playbackPopover == PlaybackPopover.COLOR_PIPELINE ||
@@ -5550,8 +5791,16 @@ class PlayerActivity : Activity(), Player.Listener {
                     color = colorOutline
                     strokeWidth = 2f
                 }
-                canvas.drawLine(622f, 838f, 622f, 918f, groupDividerPaint)
-                canvas.drawLine(1426f, 838f, 1426f, 918f, groupDividerPaint)
+                canvas.drawLine(
+                    622f + sideInset, 838f,
+                    622f + sideInset, 918f,
+                    groupDividerPaint,
+                )
+                canvas.drawLine(
+                    1426f - sideInset, 838f,
+                    1426f - sideInset, 918f,
+                    groupDividerPaint,
+                )
                 buttons.lastOrNull { it.id == hoveredButton }?.takeIf {
                     it.id != "seek_bar" &&
                         playbackPopover == PlaybackPopover.NONE &&
@@ -5559,8 +5808,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 }?.let { focused ->
                     val tooltipWidth = (focused.label.length * 17f + 52f).coerceIn(180f, 430f)
                     val tooltipCenter = focused.bounds.centerX().coerceIn(
-                        PLAYBACK_TOOLBAR_BOUNDS.left + tooltipWidth / 2f + 20f,
-                        PLAYBACK_TOOLBAR_BOUNDS.right - tooltipWidth / 2f - 20f,
+                        toolbarBounds.left + tooltipWidth / 2f + 20f,
+                        toolbarBounds.right - tooltipWidth / 2f - 20f,
                     )
                     val tooltip = RectF(
                         tooltipCenter - tooltipWidth / 2f, 778f,
@@ -5661,44 +5910,128 @@ class PlayerActivity : Activity(), Player.Listener {
                     PlaybackPopover.PROJECTION -> {
                         val bounds = PLAYBACK_PROJECTION_POPOVER_BOUNDS
                         popoverPanel(bounds, "Projection", 1674f)
-                        projectionGridButton(
+                        text(
+                            "View",
+                            1212f,
+                            180f,
+                            23f,
+                            Paint.Align.LEFT,
+                            colorTextMuted,
+                        )
+                        button(
+                            "projection_view_flat", "Flat",
+                            RectF(1210f, 195f, 1418f, 260f),
+                            currentProjection == VideoProjection.FLAT,
+                            fontSize = 23f,
+                        )
+                        button(
+                            "projection_view_180", "VR180",
+                            RectF(1430f, 195f, 1638f, 260f),
+                            currentProjection ==
+                                VideoProjection.EQUIRECTANGULAR_180,
+                            fontSize = 23f,
+                        )
+                        button(
+                            "projection_view_360", "VR360",
+                            RectF(1650f, 195f, 1870f, 260f),
+                            currentProjection ==
+                                VideoProjection.EQUIRECTANGULAR_360,
+                            fontSize = 23f,
+                        )
+                        text(
+                            "Stereo layout",
+                            1212f,
+                            300f,
+                            23f,
+                            Paint.Align.LEFT,
+                            colorTextMuted,
+                        )
+                        button(
                             "mode_2d", "2D",
-                            RectF(1218f, 290f, 1420f, 425f),
-                            StereoMode.MONO,
+                            RectF(1210f, 315f, 1418f, 380f),
                             currentStereoMode == StereoMode.MONO,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_full_sbs", "Full SBS",
-                            RectF(1438f, 290f, 1640f, 425f),
-                            StereoMode.SBS,
+                            RectF(1430f, 315f, 1638f, 380f),
                             currentStereoMode == StereoMode.SBS,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_half_sbs", "Half SBS",
-                            RectF(1658f, 290f, 1860f, 425f),
-                            StereoMode.HALF_SBS,
+                            RectF(1650f, 315f, 1870f, 380f),
                             currentStereoMode == StereoMode.HALF_SBS,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_full_ou", "Full OU",
-                            RectF(1218f, 443f, 1420f, 578f),
-                            StereoMode.OVER_UNDER,
+                            RectF(1210f, 392f, 1418f, 457f),
                             currentStereoMode == StereoMode.OVER_UNDER,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "mode_half_ou", "Half OU",
-                            RectF(1438f, 443f, 1640f, 578f),
-                            StereoMode.HALF_OVER_UNDER,
-                            currentStereoMode == StereoMode.HALF_OVER_UNDER,
+                            RectF(1430f, 392f, 1638f, 457f),
+                            currentStereoMode ==
+                                StereoMode.HALF_OVER_UNDER,
+                            fontSize = 22f,
                         )
-                        projectionGridButton(
+                        button(
                             "swap_eyes",
                             if (swapEyes) "Eyes swapped" else "Swap eyes",
-                            RectF(1658f, 443f, 1860f, 578f),
-                            selected = swapEyes,
-                            swapControl = true,
+                            RectF(1650f, 392f, 1870f, 457f),
+                            swapEyes,
+                            fontSize = 22f,
                         )
-                        projectionCurvatureSlider(625f)
+                        if (currentProjection == VideoProjection.FLAT) {
+                            projectionCurvatureSlider(535f)
+                        } else {
+                            text(
+                                "Orientation",
+                                1212f,
+                                505f,
+                                23f,
+                                Paint.Align.LEFT,
+                                colorTextMuted,
+                            )
+                            button(
+                                "immersive_yaw_left", "Yaw −15°",
+                                RectF(1210f, 522f, 1418f, 580f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_recenter", "Recenter",
+                                RectF(1430f, 522f, 1638f, 580f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_yaw_right", "Yaw +15°",
+                                RectF(1650f, 522f, 1870f, 580f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_pitch_down", "Pitch −10°",
+                                RectF(1320f, 594f, 1530f, 652f),
+                                fontSize = 21f,
+                            )
+                            button(
+                                "immersive_pitch_up", "Pitch +10°",
+                                RectF(1550f, 594f, 1760f, 652f),
+                                fontSize = 21f,
+                            )
+                            text(
+                                "Yaw %.0f°  •  Pitch %.0f°".format(
+                                    Locale.US,
+                                    immersiveYawDegrees,
+                                    immersivePitchDegrees,
+                                ),
+                                1540f,
+                                690f,
+                                21f,
+                                color = colorTextMuted,
+                            )
+                        }
                     }
                     PlaybackPopover.SETTINGS -> {
                         val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
@@ -5716,18 +6049,27 @@ class PlayerActivity : Activity(), Player.Listener {
                         text("Decoder", 975f, 174f, 24f, Paint.Align.LEFT)
                         button(
                             "decoder_auto", "Auto",
-                            RectF(1200f, 140f, 1410f, 192f),
+                            RectF(1200f, 140f, 1350f, 192f),
                             decoderMode == DecoderMode.AUTO, fontSize = 22f,
                         )
                         button(
                             "decoder_hardware", "Hardware",
-                            RectF(1420f, 140f, 1630f, 192f),
-                            decoderMode == DecoderMode.HARDWARE, fontSize = 22f,
+                            RectF(1360f, 140f, 1515f, 192f),
+                            decoderMode == DecoderMode.HARDWARE,
+                            fontSize = 20f,
                         )
                         button(
                             "decoder_software", "Software",
-                            RectF(1640f, 140f, 1860f, 192f),
-                            decoderMode == DecoderMode.SOFTWARE, fontSize = 22f,
+                            RectF(1525f, 140f, 1680f, 192f),
+                            decoderMode == DecoderMode.SOFTWARE,
+                            fontSize = 20f,
+                        )
+                        button(
+                            "decoder_experimental_8k", "8K HW",
+                            RectF(1690f, 140f, 1860f, 192f),
+                            decoderMode ==
+                                DecoderMode.EXPERIMENTAL_8K_HARDWARE,
+                            fontSize = 20f,
                         )
                         text("Color mode", 975f, 239f, 24f, Paint.Align.LEFT)
                         val compactModes = listOf(
@@ -6192,24 +6534,39 @@ class PlayerActivity : Activity(), Player.Listener {
                 )
                 button(
                     "decoder_auto", "Auto",
-                    RectF(350f, 330f, 860f, 475f),
+                    RectF(350f, 300f, 860f, 430f),
                     decoderMode == DecoderMode.AUTO,
                 )
                 button(
                     "decoder_hardware", "Hardware",
-                    RectF(910f, 330f, 1698f, 475f),
+                    RectF(910f, 300f, 1698f, 430f),
                     decoderMode == DecoderMode.HARDWARE,
                 )
                 button(
                     "decoder_software", "Software",
-                    RectF(350f, 535f, 1698f, 680f),
+                    RectF(350f, 480f, 860f, 610f),
                     decoderMode == DecoderMode.SOFTWARE,
                 )
-                text(
-                    "Active now: ${effectiveDecoderMode.label}",
-                    1024f, 755f, 31f, color = colorTextMuted,
+                button(
+                    "decoder_experimental_8k", "Experimental 8K HW",
+                    RectF(910f, 480f, 1698f, 610f),
+                    decoderMode ==
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE,
+                    fontSize = 31f,
                 )
-                button("modal_back", "Back", RectF(800f, 835f, 1248f, 920f), fontSize = 34f)
+                text(
+                    if (
+                        decoderMode ==
+                        DecoderMode.EXPERIMENTAL_8K_HARDWARE
+                    ) {
+                        "Forces MediaCodec beyond its advertised 8K frame-rate limit.\n" +
+                            "Active: ${activeVideoDecoderName ?: "initializing\u2026"}"
+                    } else {
+                        "Active now: ${activeVideoDecoderName ?: effectiveDecoderMode.label}"
+                    },
+                    1024f, 700f, 27f, color = colorTextMuted,
+                )
+                button("modal_back", "Back", RectF(800f, 815f, 1248f, 900f), fontSize = 34f)
             }
             UiScreen.AUDIO_SYNC -> {
                 canvas.drawRoundRect(330f, 120f, 1718f, 920f, 42f, 42f, panelPaint)
@@ -6282,6 +6639,10 @@ class PlayerActivity : Activity(), Player.Listener {
             text(it, 1024f, 91f, 36f)
         }
         uiButtons = buttons
+        nativeSetImmersivePlaybackUi(
+            uiScreen == UiScreen.PLAYBACK &&
+                currentProjection != VideoProjection.FLAT,
+        )
         nativeSetMenuInteractive(true)
         nativeSetSubtitle(bitmap)
     }
@@ -6782,6 +7143,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PGS_REFERENCE_HEIGHT = 1080f
         private const val PLAYBACK_SEEK_LEFT = 350f
         private const val PLAYBACK_SEEK_RIGHT = 1698f
+        private const val PLAYBACK_SEEK_360_LEFT = 420f
+        private const val PLAYBACK_SEEK_360_RIGHT = 1628f
         private const val PLAYBACK_AUTO_HIDE_MS = 8_000L
         private const val STATE_SAVE_INTERVAL_MS = 5_000L
         private const val AUTO_FALLBACK_RATIO_MIN = 1.55
@@ -6901,8 +7264,11 @@ class PlayerActivity : Activity(), Player.Listener {
         private val BROWSER_LIST_HIT_BOUNDS =
             RectF(BROWSER_LIST_LEFT, BROWSER_LIST_TOP, BROWSER_LIST_RIGHT, BROWSER_LIST_BOTTOM)
         private val PLAYBACK_TOOLBAR_BOUNDS = RectF(120f, 700f, 1928f, 970f)
+        private val PLAYBACK_TOOLBAR_360_BOUNDS =
+            RectF(220f, 700f, 1828f, 970f)
         private val PLAYBACK_LEFT_POPOVER_BOUNDS = RectF(150f, 105f, 860f, 720f)
-        private val PLAYBACK_PROJECTION_POPOVER_BOUNDS = RectF(1185f, 205f, 1898f, 675f)
+        private val PLAYBACK_PROJECTION_POPOVER_BOUNDS =
+            RectF(1185f, 105f, 1898f, 720f)
         private val PLAYBACK_SETTINGS_POPOVER_BOUNDS = RectF(930f, 45f, 1898f, 675f)
         init { System.loadLibrary("dreamplayer") }
 
@@ -6917,6 +7283,14 @@ class PlayerActivity : Activity(), Player.Listener {
         @JvmStatic private external fun nativeSetScreenTransform(x: Float, y: Float, z: Float, halfHeight: Float)
         @JvmStatic private external fun nativeGetScreenTransform(): FloatArray
         @JvmStatic private external fun nativeSetStereoMode(stereoMode: Int)
+        @JvmStatic private external fun nativeSetVideoProjection(projection: Int)
+        @JvmStatic private external fun nativeSetImmersiveOrientation(
+            yawDegrees: Float,
+            pitchDegrees: Float,
+        )
+        @JvmStatic private external fun nativeRecenterImmersive()
+        @JvmStatic private external fun nativeGetImmersiveYaw(): Float
+        @JvmStatic private external fun nativeGetImmersivePitch(): Float
         @JvmStatic private external fun nativeSetPictureSettings(
             pictureMode: Int,
             brightness: Float,
@@ -6949,6 +7323,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetSwapEyes(swapped: Boolean)
         @JvmStatic private external fun nativeSetVideoAvailable(available: Boolean)
+        @JvmStatic private external fun nativeSetImmersivePlaybackUi(enabled: Boolean)
         @JvmStatic private external fun nativeSetMenuInteractive(interactive: Boolean)
         @JvmStatic private external fun nativeSetSubtitle(bitmap: Bitmap)
         @JvmStatic private external fun nativeSetBitmapSubtitle(

@@ -14,6 +14,17 @@ enum class StereoMode(val wireValue: Int) {
     }
 }
 
+enum class VideoProjection(val wireValue: Int, val label: String) {
+    FLAT(0, "Flat"),
+    EQUIRECTANGULAR_180(1, "VR180"),
+    EQUIRECTANGULAR_360(2, "VR360");
+
+    companion object {
+        fun fromWire(value: Int) =
+            entries.firstOrNull { it.wireValue == value } ?: FLAT
+    }
+}
+
 data class PlaybackSpec(
     val uri: String,
     val title: String,
