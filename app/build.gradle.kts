@@ -86,6 +86,7 @@ dependencies {
     compileOnly("org.checkerframework:checker-qual:3.43.0")
     implementation("com.hierynomus:smbj:0.14.0")
     implementation("com.hierynomus:sshj:0.40.0")
+    implementation("commons-net:commons-net:3.13.0")
     implementation("eu.agno3.jcifs:jcifs-ng:2.1.10")
     implementation("org.khronos.openxr:openxr_loader_for_android:1.1.61")
 }

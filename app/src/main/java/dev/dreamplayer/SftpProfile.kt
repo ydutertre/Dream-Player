@@ -2,6 +2,21 @@ package dev.dreamplayer
 
 import java.util.UUID
 
+enum class RemoteProtocol(
+    val label: String,
+    val defaultPort: Int,
+    val encrypted: Boolean,
+) {
+    SFTP("SFTP", 22, true),
+    FTPS("FTPS", 21, true),
+    FTP("FTP", 21, false);
+
+    companion object {
+        fun fromStored(value: String): RemoteProtocol =
+            entries.firstOrNull { it.name == value } ?: SFTP
+    }
+}
+
 data class SftpProfile(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "",
@@ -12,6 +27,8 @@ data class SftpProfile(
     val startPath: String = ".",
     val hostKeyFingerprint: String = "",
     val rememberPassword: Boolean = true,
+    val protocol: RemoteProtocol = RemoteProtocol.SFTP,
+    val allowInsecureFtp: Boolean = false,
 ) {
     val displayName: String
         get() = name.trim().ifBlank { host.trim() }

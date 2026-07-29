@@ -53,6 +53,14 @@ class SftpProfileStore(context: Context) {
                             item.optString("hostKeyFingerprint"),
                         rememberPassword =
                             item.optBoolean("rememberPassword", true),
+                        protocol = RemoteProtocol.fromStored(
+                            item.optString(
+                                "protocol",
+                                RemoteProtocol.SFTP.name,
+                            )
+                        ),
+                        allowInsecureFtp =
+                            item.optBoolean("allowInsecureFtp", false),
                     ).normalized()
                 )
             }
@@ -81,6 +89,8 @@ class SftpProfileStore(context: Context) {
                         profile.hostKeyFingerprint,
                     )
                     .put("rememberPassword", profile.rememberPassword)
+                    .put("protocol", profile.protocol.name)
+                    .put("allowInsecureFtp", profile.allowInsecureFtp)
             )
         }
         val cipher = Cipher.getInstance(TRANSFORMATION).apply {

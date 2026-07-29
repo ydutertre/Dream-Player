@@ -287,7 +287,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private enum class UiScreen {
         LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
         SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
-        SFTP_PROFILES, SFTP_LOGIN, SFTP_TRUST, SFTP_FILES, SFTP_KEYBOARD,
+        SFTP_PROFILES, SFTP_LOGIN, SFTP_TRUST, FTP_WARNING,
+        SFTP_FILES, SFTP_KEYBOARD,
         SFTP_DELETE_CONFIRM,
         FILE_SEARCH_KEYBOARD,
         PLAYBACK, PROJECTION, PICTURE, DECODER, AUDIO_SYNC, AUDIO_TRACKS, SUBTITLES,
@@ -1859,30 +1860,58 @@ class PlayerActivity : Activity(), Player.Listener {
         val profile = sftpProfile.normalized()
         when {
             profile.host.isBlank() -> {
-                transientMessage = "Enter an SFTP hostname or IP address"
+                transientMessage =
+                    "Enter a ${profile.protocol.label} hostname or IP address"
                 renderVrMenu()
                 return
             }
             profile.username.isBlank() -> {
-                transientMessage = "Enter an SFTP username"
+                transientMessage = "Enter a ${profile.protocol.label} username"
                 renderVrMenu()
                 return
             }
             profile.password.isBlank() -> {
-                transientMessage = "Enter the SFTP password"
+                transientMessage = "Enter the ${profile.protocol.label} password"
                 renderVrMenu()
                 return
             }
         }
+        if (
+            profile.protocol == RemoteProtocol.FTP &&
+            !profile.allowInsecureFtp
+        ) {
+            sftpProfile = profile
+            transientMessage = null
+            uiScreen = UiScreen.FTP_WARNING
+            hoveredButton = null
+            renderVrMenu()
+            return
+        }
         sftpProfile = profile
-        transientMessage = "Connecting securely to ${profile.host}..."
+        transientMessage = "Connecting to ${profile.host}..."
         renderVrMenu()
         io.execute {
             runCatching {
-                SftpRepository(profile).use { repository ->
-                    val root = repository.canonicalize(profile.startPath)
-                    root to repository.list(root)
-                        .filter { it.isDirectory || isVideoFile(it.name) }
+                when (profile.protocol) {
+                    RemoteProtocol.SFTP ->
+                        SftpRepository(profile).use { repository ->
+                            val root =
+                                repository.canonicalize(profile.startPath)
+                            root to repository.list(root)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
+                    RemoteProtocol.FTPS,
+                    RemoteProtocol.FTP ->
+                        FtpRepository(profile).use { repository ->
+                            val root =
+                                repository.canonicalize(profile.startPath)
+                            root to repository.list(root)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
                 }
             }.onSuccess { (root, entries) -> runOnUiThread {
                 sftpPath = root
@@ -1907,7 +1936,8 @@ class PlayerActivity : Activity(), Player.Listener {
                     renderVrMenu()
                 } else {
                     transientMessage =
-                        "SFTP connection failed: ${friendlySftpError(error)}"
+                        "${profile.protocol.label} connection failed: " +
+                            friendlySftpError(error)
                     uiScreen = UiScreen.SFTP_LOGIN
                     renderVrMenu()
                 }
@@ -1925,9 +1955,22 @@ class PlayerActivity : Activity(), Player.Listener {
         renderVrMenu()
         io.execute {
             runCatching {
-                SftpRepository(profile).use { repository ->
-                    repository.list(path)
-                        .filter { it.isDirectory || isVideoFile(it.name) }
+                when (profile.protocol) {
+                    RemoteProtocol.SFTP ->
+                        SftpRepository(profile).use { repository ->
+                            repository.list(path)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
+                    RemoteProtocol.FTPS,
+                    RemoteProtocol.FTP ->
+                        FtpRepository(profile).use { repository ->
+                            repository.list(path)
+                                .filter {
+                                    it.isDirectory || isVideoFile(it.name)
+                                }
+                        }
                 }
             }.onSuccess { entries -> runOnUiThread {
                 sftpPath = path
@@ -1945,7 +1988,8 @@ class PlayerActivity : Activity(), Player.Listener {
                     sftpNavigationStack.removeLast()
                 }
                 transientMessage =
-                    "SFTP folder error: ${friendlySftpError(error)}"
+                    "${profile.protocol.label} folder error: " +
+                        friendlySftpError(error)
                 renderVrMenu()
             } }
         }
@@ -1957,6 +2001,15 @@ class PlayerActivity : Activity(), Player.Listener {
             .firstOrNull { it.isNotBlank() }
             .orEmpty()
         return when {
+            message.contains("identification", true) ||
+                message.contains("protocol version", true) ->
+                "this port is not SFTP; select FTP or FTPS"
+            message.contains("certificate", true) ||
+                message.contains("certpath", true) ->
+                "the FTPS certificate or hostname could not be verified"
+            message.contains("SSL", true) ||
+                message.contains("TLS", true) ->
+                "the server does not appear to support explicit FTPS"
             message.contains("auth", true) ||
                 message.contains("permission", true) -> "check username and password"
             message.contains("timed out", true) ||
@@ -2579,6 +2632,40 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
+            id.startsWith("remote_protocol_") -> {
+                val newProtocol = when (
+                    id.removePrefix("remote_protocol_")
+                ) {
+                    "ftps" -> RemoteProtocol.FTPS
+                    "ftp" -> RemoteProtocol.FTP
+                    else -> RemoteProtocol.SFTP
+                }
+                val oldProtocol = sftpProfile.protocol
+                val port = if (
+                    sftpProfile.port == oldProtocol.defaultPort
+                ) {
+                    newProtocol.defaultPort
+                } else {
+                    sftpProfile.port
+                }
+                sftpProfile = sftpProfile.copy(
+                    protocol = newProtocol,
+                    port = port,
+                    hostKeyFingerprint = if (
+                        newProtocol == RemoteProtocol.SFTP &&
+                        oldProtocol == RemoteProtocol.SFTP
+                    ) {
+                        sftpProfile.hostKeyFingerprint
+                    } else {
+                        ""
+                    },
+                    allowInsecureFtp = false,
+                )
+                sftpPortDraft = port.toString()
+                transientMessage = null
+                hoveredButton = null
+                renderVrMenu()
+            }
             id == "sftp_remember_password" -> {
                 sftpProfile = sftpProfile.copy(
                     rememberPassword = !sftpProfile.rememberPassword,
@@ -2586,6 +2673,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 renderVrMenu()
             }
             id == "sftp_connect" -> connectSftp()
+            id == "ftp_warning_cancel" -> {
+                uiScreen = UiScreen.SFTP_LOGIN
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "ftp_warning_continue" -> {
+                sftpProfile = sftpProfile.copy(allowInsecureFtp = true)
+                connectSftp()
+            }
             id == "sftp_login_back" -> showSftpProfiles()
             id == "sftp_delete" -> {
                 uiScreen = UiScreen.SFTP_DELETE_CONFIRM
@@ -2652,7 +2748,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     )
                 } else {
                     transientMessage =
-                        "SFTP playback is coming in the next milestone"
+                        "${sftpProfile.protocol.label} playback is coming in the next milestone"
                     renderVrMenu()
                 }
             }
@@ -3527,10 +3623,13 @@ class PlayerActivity : Activity(), Player.Listener {
         KeyboardField.DOMAIN -> "Domain (usually blank)"
         KeyboardField.SEARCH -> "Search file names"
         KeyboardField.SFTP_NAME -> "Profile name"
-        KeyboardField.SFTP_HOST -> "SFTP hostname or IP"
-        KeyboardField.SFTP_PORT -> "SFTP port"
-        KeyboardField.SFTP_USERNAME -> "SFTP username"
-        KeyboardField.SFTP_PASSWORD -> "SFTP password"
+        KeyboardField.SFTP_HOST ->
+            "${sftpProfile.protocol.label} hostname or IP"
+        KeyboardField.SFTP_PORT -> "${sftpProfile.protocol.label} port"
+        KeyboardField.SFTP_USERNAME ->
+            "${sftpProfile.protocol.label} username"
+        KeyboardField.SFTP_PASSWORD ->
+            "${sftpProfile.protocol.label} password"
         KeyboardField.SFTP_PATH -> "Starting folder"
     }
 
@@ -4702,7 +4801,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 text("Choose a source", 468f, 252f, 36f, color = colorTextMuted)
                 button("open_local", "Local video library", RectF(155f, 295f, 780f, 405f), fontSize = 38f)
                 button("open_smb", "Network shares (SMB)", RectF(155f, 435f, 780f, 545f), fontSize = 38f)
-                button("open_sftp", "Internet server (SFTP)", RectF(155f, 575f, 780f, 685f), fontSize = 38f)
+                button("open_sftp", "Internet server (FTP/SFTP)", RectF(155f, 575f, 780f, 685f), fontSize = 38f)
                 text(
                     "Browse without leaving VR.",
                     468f,
@@ -4856,13 +4955,13 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             UiScreen.SFTP_PROFILES -> {
                 canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
-                text("SFTP servers", 1024f, 135f, 64f)
+                text("Internet servers", 1024f, 135f, 64f)
                 scrollableList(sftpProfiles.size, 90f, 72f) { index, bounds ->
                     val profile = sftpProfiles[index]
                     browserEntryButton(
                         "sftp_profile_$index",
                         profile.displayName,
-                        "${profile.username}@${profile.host}:${profile.port}",
+                        "${profile.protocol.label}  •  ${profile.username}@${profile.host}:${profile.port}",
                         RectF(250f, bounds.top, 1580f, bounds.bottom),
                         true,
                     )
@@ -4873,9 +4972,9 @@ class PlayerActivity : Activity(), Player.Listener {
                     )
                 }
                 if (sftpProfiles.isEmpty()) {
-                    text("No SFTP servers saved yet.", 1024f, 440f, 44f)
+                    text("No Internet servers saved yet.", 1024f, 440f, 44f)
                     text(
-                        "Add a server to browse it securely over the Internet.",
+                        "Add an SFTP, FTPS, or FTP server.",
                         1024f, 500f, 27f, color = colorTextMuted,
                     )
                 }
@@ -4894,7 +4993,25 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             UiScreen.SFTP_LOGIN -> {
                 canvas.drawRoundRect(170f, 35f, 1878f, 990f, 42f, 42f, panelPaint)
-                text("SFTP server profile", 1024f, 105f, 56f)
+                text("Internet server profile", 1024f, 92f, 50f)
+                button(
+                    "remote_protocol_sftp", "SFTP",
+                    RectF(665f, 110f, 985f, 172f),
+                    sftpProfile.protocol == RemoteProtocol.SFTP,
+                    fontSize = 27f,
+                )
+                button(
+                    "remote_protocol_ftps", "FTPS",
+                    RectF(1000f, 110f, 1320f, 172f),
+                    sftpProfile.protocol == RemoteProtocol.FTPS,
+                    fontSize = 27f,
+                )
+                button(
+                    "remote_protocol_ftp", "FTP",
+                    RectF(1335f, 110f, 1655f, 172f),
+                    sftpProfile.protocol == RemoteProtocol.FTP,
+                    fontSize = 27f,
+                )
                 fun field(
                     id: String,
                     label: String,
@@ -4914,16 +5031,16 @@ class PlayerActivity : Activity(), Player.Listener {
                         fontSize = 31f,
                     )
                 }
-                field("name", "Profile name", sftpProfile.name, 135f)
-                field("host", "Host", sftpProfile.host, 225f)
-                field("port", "Port", sftpPortDraft, 315f)
-                field("user", "Username", sftpProfile.username, 405f)
-                field("password", "Password", sftpProfile.password, 495f, true)
-                field("path", "Start folder", sftpProfile.startPath, 585f)
+                field("name", "Profile name", sftpProfile.name, 190f)
+                field("host", "Host", sftpProfile.host, 275f)
+                field("port", "Port", sftpPortDraft, 360f)
+                field("user", "Username", sftpProfile.username, 445f)
+                field("password", "Password", sftpProfile.password, 530f, true)
+                field("path", "Start folder", sftpProfile.startPath, 615f)
                 checkbox(
                     "sftp_remember_password",
                     "Remember password securely",
-                    RectF(560f, 680f, 1488f, 742f),
+                    RectF(560f, 700f, 1488f, 762f),
                     sftpProfile.rememberPassword,
                 )
                 if (sftpProfiles.any { it.id == sftpProfile.id }) {
@@ -4941,7 +5058,14 @@ class PlayerActivity : Activity(), Player.Listener {
                     RectF(980f, 805f, 1690f, 895f), fontSize = 34f,
                 )
                 text(
-                    "The SSH server fingerprint is verified before your password is sent.",
+                    when (sftpProfile.protocol) {
+                        RemoteProtocol.SFTP ->
+                            "The SSH fingerprint is verified before authentication."
+                        RemoteProtocol.FTPS ->
+                            "Explicit TLS with certificate and hostname validation."
+                        RemoteProtocol.FTP ->
+                            "Plain FTP is unencrypted and requires explicit confirmation."
+                    },
                     1024f, 945f, 22f, color = colorTextMuted,
                 )
             }
@@ -4983,9 +5107,37 @@ class PlayerActivity : Activity(), Player.Listener {
                     RectF(950f, 700f, 1658f, 815f), fontSize = 36f,
                 )
             }
+            UiScreen.FTP_WARNING -> {
+                canvas.drawRoundRect(260f, 115f, 1788f, 900f, 42f, 42f, panelPaint)
+                text(
+                    "Plain FTP is not secure",
+                    1024f, 235f, 60f,
+                    color = Color.rgb(255, 180, 120),
+                )
+                text(
+                    "Your username, password, file names, and video data",
+                    1024f, 345f, 30f,
+                )
+                text(
+                    "will travel over the Internet without encryption.",
+                    1024f, 395f, 30f,
+                )
+                text(
+                    "Use SFTP or FTPS whenever the server supports it.",
+                    1024f, 490f, 27f, color = colorTextMuted,
+                )
+                button(
+                    "ftp_warning_cancel", "Go back",
+                    RectF(390f, 665f, 910f, 785f), fontSize = 37f,
+                )
+                button(
+                    "ftp_warning_continue", "Use plain FTP",
+                    RectF(960f, 665f, 1658f, 785f), fontSize = 37f,
+                )
+            }
             UiScreen.SFTP_DELETE_CONFIRM -> {
                 canvas.drawRoundRect(310f, 160f, 1738f, 850f, 42f, 42f, panelPaint)
-                text("Delete SFTP profile?", 1024f, 285f, 62f)
+                text("Delete server profile?", 1024f, 285f, 62f)
                 text(sftpProfile.displayName, 1024f, 385f, 40f)
                 text(
                     "This removes the saved server details and credentials.",
