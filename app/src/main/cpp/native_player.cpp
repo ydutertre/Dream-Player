@@ -2061,8 +2061,14 @@ private:
                 gSubtitle3dEnabled.load() &&
                 (horizontalStereo || verticalStereo);
             if (splitStereoSubtitle) {
+                // Baked stereo subtitle disparity is often authored for a
+                // different physical screen size and can be uncomfortable in
+                // VR. Extract one correctly shaped view and present it to both
+                // eyes; the existing 3D subtitle quad and depth control then
+                // provide predictable binocular positioning. Swap Eyes picks
+                // the alternate baked view when requested.
                 const uint32_t sourceEye =
-                    gSwapEyes.load() ? 1u - eye : eye;
+                    gSwapEyes.load() ? 1u : 0u;
                 const float sourceStart =
                     sourceEye == 0u ? 0.0f : 0.5f;
                 const float sourceEnd = sourceStart + 0.5f;
