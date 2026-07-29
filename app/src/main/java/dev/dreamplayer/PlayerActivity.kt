@@ -6501,6 +6501,10 @@ class PlayerActivity : Activity(), Player.Listener {
             text(it, 1024f, 91f, 36f)
         }
         uiButtons = buttons
+        nativeSetImmersivePlaybackUi(
+            uiScreen == UiScreen.PLAYBACK &&
+                currentProjection != VideoProjection.FLAT,
+        )
         nativeSetMenuInteractive(true)
         nativeSetSubtitle(bitmap)
     }
@@ -7181,6 +7185,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetSwapEyes(swapped: Boolean)
         @JvmStatic private external fun nativeSetVideoAvailable(available: Boolean)
+        @JvmStatic private external fun nativeSetImmersivePlaybackUi(enabled: Boolean)
         @JvmStatic private external fun nativeSetMenuInteractive(interactive: Boolean)
         @JvmStatic private external fun nativeSetSubtitle(bitmap: Bitmap)
         @JvmStatic private external fun nativeSetBitmapSubtitle(

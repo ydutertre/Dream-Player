@@ -75,6 +75,7 @@ std::atomic<float> gScreenHalfHeight{1.0f};
 std::atomic<float> gScreenCurvature{0.0f};
 std::atomic<bool> gHasVideo{false};
 std::atomic<bool> gMenuInteractive{true};
+std::atomic<bool> gImmersivePlaybackUi{false};
 std::mutex gSubtitleMutex;
 std::vector<uint8_t> gSubtitlePixels;
 std::atomic<int> gSubtitleWidth{0};
@@ -1518,8 +1519,10 @@ private:
             }
 
             const bool immersiveProjection = gVideoProjection.load() != 0;
+            const bool immersivePlaybackUi =
+                gImmersivePlaybackUi.load();
             const ScreenBasis basis =
-                gMenuInteractive.load() && immersiveProjection
+                gMenuInteractive.load() && immersivePlaybackUi
                     ? anchoredImmersiveMenuBasis_
                     : currentScreenBasis();
             const float halfHeight = gScreenHalfHeight.load();
@@ -2037,7 +2040,7 @@ private:
         const float halfHeight = gScreenHalfHeight.load();
         const float halfWidth = halfHeight * aspect;
         const ScreenBasis basis =
-            gMenuInteractive.load() && gVideoProjection.load() != 0
+            gMenuInteractive.load() && gImmersivePlaybackUi.load()
                 ? anchoredImmersiveMenuBasis_
                 : currentScreenBasis();
         const float curvature = gScreenCurvature.load();
@@ -2230,9 +2233,11 @@ private:
             const ScreenBasis subtitleBasis =
                 projectionMode == 0
                     ? basis
-                    : isMenuOverlay
+                    : isMenuOverlay && gImmersivePlaybackUi.load()
                         ? anchoredImmersiveMenuBasis_
-                        : headRelativeMenuBasis_;
+                        : isMenuOverlay
+                            ? basis
+                            : headRelativeMenuBasis_;
             float displayLeft = gSubtitleLeft.load();
             float displayTop = gSubtitleTop.load();
             float displayRight = gSubtitleRight.load();
@@ -2449,7 +2454,7 @@ private:
         glUniformMatrix4fv(glGetUniformLocation(pointerProgram_, "uMvp"), 1, GL_FALSE, mvp.m);
         glUniform4f(glGetUniformLocation(pointerProgram_, "uColor"), 0.10f, 0.78f, 1.0f, 1.0f);
         const ScreenBasis basis =
-            gMenuInteractive.load() && gVideoProjection.load() != 0
+            gMenuInteractive.load() && gImmersivePlaybackUi.load()
                 ? anchoredImmersiveMenuBasis_
                 : currentScreenBasis();
         const Vec3 lineEnd = pointerHit_ + basis.normal * 0.01f;
@@ -2804,6 +2809,17 @@ extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAvailable(JNIEnv*, jclass, jboolean available) {
     gHasVideo.store(available == JNI_TRUE);
     gAdaptiveToneMapResetGeneration.fetch_add(1);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetImmersivePlaybackUi(
+    JNIEnv*, jclass, jboolean enabled) {
+    const bool nextEnabled = enabled == JNI_TRUE;
+    const bool previousEnabled =
+        gImmersivePlaybackUi.exchange(nextEnabled);
+    if (!previousEnabled && nextEnabled) {
+        gImmersiveMenuAnchorGeneration.fetch_add(1);
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
