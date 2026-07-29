@@ -186,12 +186,18 @@ class FtpRepository(private val profile: SftpProfile) : Closeable {
     }
 
     override fun close() {
+        val hadMediaStream = mediaStream != null
         runCatching { mediaStream?.close() }
         mediaStream = null
-        if (client.isConnected) {
-            runCatching { client.completePendingCommand() }
-        }
         if (!client.isConnected) return
+        // A partially consumed RETR stream (for example after seeking) has a
+        // pending transfer reply. Waiting for completePendingCommand() here
+        // can block until the socket timeout. This session is intentionally
+        // short-lived, so disconnect it directly and reopen at the new offset.
+        if (hadMediaStream) {
+            runCatching { client.disconnect() }
+            return
+        }
         runCatching { client.logout() }
         runCatching { client.disconnect() }
     }
