@@ -2,6 +2,7 @@ package dev.dreamplayer
 
 import android.content.ContentValues
 import android.content.Context
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
@@ -188,6 +189,203 @@ class MediaStateStore(context: Context) :
                 "ALTER TABLE media_state ADD COLUMN " +
                     "immersive_pitch REAL NOT NULL DEFAULT 0"
             )
+        }
+        if (oldVersion < 16) {
+            migrateSmbMediaIdentities(db)
+        }
+    }
+
+    /**
+     * Re-keys legacy rows that used a changing SMB connection IP. The newest row wins
+     * when an IP-keyed and hostname-keyed copy already coexist; null settings are filled
+     * from the older row so resume, projection, subtitle, and picture state are retained.
+     */
+    fun migrateSmbHostIdentity(
+        oldConnectionHosts: Set<String>,
+        stableHost: String,
+        share: String,
+    ) {
+        val normalizedAliases = oldConnectionHosts
+            .map(::normalizeSmbHost)
+            .filter(String::isNotBlank)
+            .toSet()
+        val normalizedStableHost = normalizeSmbHost(stableHost)
+        if (normalizedAliases.isEmpty() || normalizedStableHost.isBlank()) return
+        writableDatabase.inTransaction { db ->
+            migrateSmbMediaIdentities(db) { location ->
+                normalizedStableHost.takeIf {
+                    location.share.equals(share, ignoreCase = true) &&
+                        normalizeSmbHost(location.host) in normalizedAliases
+                }
+            }
+        }
+    }
+
+    private data class StoredSmbLocation(
+        val host: String,
+        val share: String,
+        val pathSegments: List<String>,
+        val playbackUri: String,
+    )
+
+    private fun migrateSmbMediaIdentities(
+        db: SQLiteDatabase,
+        stableHostOverride: ((StoredSmbLocation) -> String?)? = null,
+    ) {
+        val rows = db.rawQuery("SELECT * FROM media_state", null).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.toContentValues())
+            }
+        }
+        rows.forEach { source ->
+            val location = storedSmbLocation(source) ?: return@forEach
+            val stableHost = stableHostOverride?.invoke(location)
+                ?: location.host.takeUnless(::isSmbIpv4Address)
+                ?: return@forEach
+            val stableUri = Uri.Builder()
+                .scheme("smb")
+                .authority(stableHost)
+                .apply { location.pathSegments.forEach(::appendPath) }
+                .build()
+                .toString()
+            val identity = MediaIdentity.from(
+                PlaybackSpec(
+                    uri = stableUri,
+                    title = source.getAsString("title").orEmpty(),
+                    stereoMode = StereoMode.MONO,
+                    smb = SmbCredentials(
+                        stableHost,
+                        location.share,
+                        "",
+                        "",
+                        "",
+                        stableHost,
+                    ),
+                )
+            )
+            migrateMediaRow(
+                db,
+                source,
+                identity,
+                stableUri.takeIf { stableHostOverride != null }
+                    ?: location.playbackUri,
+            )
+        }
+    }
+
+    private fun storedSmbLocation(values: ContentValues): StoredSmbLocation? {
+        val playbackUri = values.getAsString("playback_uri")
+            ?: values.getAsString("canonical_location")
+            ?: return null
+        val parsed = Uri.parse(playbackUri)
+        val canonical = Uri.parse(values.getAsString("canonical_location"))
+        if (
+            !parsed.scheme.equals("smb", ignoreCase = true) &&
+            !canonical.scheme.equals("smb", ignoreCase = true)
+        ) return null
+        val storedShare = values.getAsString("smb_share")?.takeIf { it.isNotBlank() }
+        val share = storedShare ?: canonical.pathSegments.firstOrNull() ?: return null
+        val pathSegments = when {
+            parsed.scheme.equals("smb", ignoreCase = true) && storedShare != null ->
+                parsed.pathSegments
+            canonical.pathSegments.firstOrNull().equals(share, ignoreCase = true) ->
+                canonical.pathSegments.drop(1)
+            else -> parsed.pathSegments
+        }
+        val host = parsed.host ?: canonical.host ?: return null
+        return StoredSmbLocation(host, share, pathSegments, playbackUri)
+    }
+
+    private fun migrateMediaRow(
+        db: SQLiteDatabase,
+        source: ContentValues,
+        identity: MediaIdentity,
+        playbackUri: String,
+    ) {
+        val oldId = source.getAsString("media_id") ?: return
+        val migrated = ContentValues(source).apply {
+            put("media_id", identity.id)
+            put("canonical_location", identity.canonicalLocation)
+            put("playback_uri", playbackUri)
+        }
+        if (oldId == identity.id) {
+            db.update("media_state", migrated, "media_id = ?", arrayOf(oldId))
+            return
+        }
+        val existing = db.query(
+            "media_state",
+            null,
+            "media_id = ?",
+            arrayOf(identity.id),
+            null,
+            null,
+            null,
+            "1",
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.toContentValues() else null
+        }
+        if (existing == null) {
+            db.update("media_state", migrated, "media_id = ?", arrayOf(oldId))
+            return
+        }
+        val sourceUpdated = migrated.getAsLong("updated_at") ?: 0L
+        val existingUpdated = existing.getAsLong("updated_at") ?: 0L
+        val newer = if (sourceUpdated >= existingUpdated) migrated else existing
+        val older = if (sourceUpdated >= existingUpdated) existing else migrated
+        val merged = ContentValues(newer)
+        older.valueSet().forEach { (key, value) ->
+            if (merged.get(key) == null && value != null) merged.putValue(key, value)
+        }
+        val latestPlayed = maxOf(
+            migrated.getAsLong("last_played_at") ?: Long.MIN_VALUE,
+            existing.getAsLong("last_played_at") ?: Long.MIN_VALUE,
+        ).takeUnless { it == Long.MIN_VALUE }
+        if (latestPlayed == null) merged.putNull("last_played_at")
+        else merged.put("last_played_at", latestPlayed)
+        merged.put("updated_at", maxOf(sourceUpdated, existingUpdated))
+        merged.put("media_id", identity.id)
+        merged.put("canonical_location", identity.canonicalLocation)
+        if (stableHostOverridePlayback(playbackUri)) merged.put("playback_uri", playbackUri)
+        db.delete("media_state", "media_id IN (?, ?)", arrayOf(oldId, identity.id))
+        db.insertOrThrow("media_state", null, merged)
+    }
+
+    private fun stableHostOverridePlayback(playbackUri: String): Boolean =
+        Uri.parse(playbackUri).scheme.equals("smb", ignoreCase = true)
+
+    private fun Cursor.toContentValues(): ContentValues = ContentValues(columnCount).also { values ->
+        for (index in 0 until columnCount) {
+            val key = getColumnName(index)
+            when (getType(index)) {
+                Cursor.FIELD_TYPE_NULL -> values.putNull(key)
+                Cursor.FIELD_TYPE_INTEGER -> values.put(key, getLong(index))
+                Cursor.FIELD_TYPE_FLOAT -> values.put(key, getDouble(index))
+                Cursor.FIELD_TYPE_BLOB -> values.put(key, getBlob(index))
+                else -> values.put(key, getString(index))
+            }
+        }
+    }
+
+    private fun ContentValues.putValue(key: String, value: Any) {
+        when (value) {
+            is String -> put(key, value)
+            is Long -> put(key, value)
+            is Int -> put(key, value)
+            is Double -> put(key, value)
+            is Float -> put(key, value)
+            is Boolean -> put(key, value)
+            is ByteArray -> put(key, value)
+            else -> put(key, value.toString())
+        }
+    }
+
+    private inline fun SQLiteDatabase.inTransaction(block: (SQLiteDatabase) -> Unit) {
+        beginTransaction()
+        try {
+            block(this)
+            setTransactionSuccessful()
+        } finally {
+            endTransaction()
         }
     }
 
@@ -496,7 +694,7 @@ class MediaStateStore(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "media-state.db"
-        private const val DATABASE_VERSION = 15
+        private const val DATABASE_VERSION = 16
     }
 }
 
@@ -508,13 +706,12 @@ data class MediaIdentity(
         fun from(spec: PlaybackSpec): MediaIdentity {
             val parsed = Uri.parse(spec.uri)
             val canonical = if (parsed.scheme.equals("smb", ignoreCase = true)) {
-                // Friendly SMB hostnames may replace a discovered IP in the UI. Keep the
-                // stable connection target in the identity so that migration does not lose
-                // resume positions and other per-file settings saved under the original IP.
-                val host = (spec.smb?.connectionTarget ?: parsed.host)
+                // A hostname identifies the server; its current IP is only a replaceable
+                // transport address. IP-only servers retain their address-based identity.
+                val host = (spec.smb?.host ?: parsed.host)
                     .orEmpty()
                     .trim()
-                    .lowercase(Locale.ROOT)
+                    .let(::normalizeSmbHost)
                 val share = spec.smb?.share.orEmpty().trim().trim('/', '\\').lowercase(Locale.ROOT)
                 val path = parsed.pathSegments
                     .joinToString("/")

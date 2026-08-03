@@ -1785,36 +1785,55 @@ class PlayerActivity : Activity(), Player.Listener {
         parsed: Uri,
         generation: Int,
     ) {
-        val host = parsed.host.orEmpty()
+        val recentHost = parsed.host.orEmpty()
         val share = recent.smbShare.orEmpty()
         val filePath = parsed.pathSegments.joinToString("\\")
-        if (host.isBlank() || share.isBlank() || filePath.isBlank()) {
+        if (recentHost.isBlank() || share.isBlank() || filePath.isBlank()) {
             transientMessage = "Cannot open recent SMB file: its server, share, or path is missing"
             renderVrMenu()
             return
         }
 
-        val saved = smbCredentialStore.load()
+        val rememberedProfile = smbCredentialStore.load()
+        val exactSavedMatch = rememberedProfile
             ?.takeIf {
-                smbHostsMatch(it.host, host) || smbHostsMatch(it.connectionTarget, host)
+                smbHostsMatch(it.host, recentHost) ||
+                    smbHostsMatch(it.connectionTarget, recentHost)
             }
-        val credentials = (saved ?: SmbCredentials(host, share, "", "", ""))
+        // Older database rows may contain only the server's former IP. With a single
+        // remembered SMB profile, an exact folder/file match on its named server is the
+        // verification needed to migrate that otherwise orphaned Recent entry.
+        val saved = exactSavedMatch ?: rememberedProfile?.takeIf {
+            isSmbIpv4Address(recentHost) && !isSmbIpv4Address(it.host)
+        }
+        val stableHost = saved?.host
+            ?.takeUnless(::isSmbIpv4Address)
+            ?: recentHost
+        val credentials = (saved ?: SmbCredentials(stableHost, share, "", "", ""))
             .copy(
-                host = host,
+                host = stableHost,
                 share = share,
-                connectionHost = saved?.connectionTarget ?: host,
+                connectionHost = exactSavedMatch?.connectionTarget ?: recentHost,
             )
         val parentPath = filePath.substringBeforeLast('\\', "")
         transientMessage = "Opening ${recent.title}..."
         renderVrMenu()
         io.execute {
             runCatching {
-                SmbRepository(credentials).use { repository ->
-                    repository.list(parentPath)
-                        .filter { it.isDirectory || isVideoFile(it.name) }
-                }
-            }.onSuccess { entries -> runOnUiThread {
+                val resolved = resolveRecentSmbFolder(credentials, parentPath)
+                mediaStateStore.migrateSmbHostIdentity(
+                    oldConnectionHosts = setOf(
+                        recentHost,
+                        credentials.connectionTarget,
+                        resolved.credentials.connectionTarget,
+                    ),
+                    stableHost = stableHost,
+                    share = share,
+                )
+                resolved
+            }.onSuccess { resolved -> runOnUiThread {
                     if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                    val entries = resolved.entries
                     val selectedEntry = entries.firstOrNull {
                         !it.isDirectory && it.path.equals(filePath, ignoreCase = true)
                     }
@@ -1824,9 +1843,12 @@ class PlayerActivity : Activity(), Player.Listener {
                         renderVrMenu()
                         return@runOnUiThread
                     }
-                    smbCredentials = credentials
-                    smbDisplayHost = host
+                    smbCredentials = resolved.credentials
+                    smbDisplayHost = stableHost
                     rememberSmbCredentials = saved != null
+                    if (rememberSmbCredentials) {
+                        smbCredentialStore.save(resolved.credentials.copy(share = ""))
+                    }
                     smbPath = parentPath
                     smbEntries = entries
                     smbNavigationStack.clear()
@@ -1847,7 +1869,7 @@ class PlayerActivity : Activity(), Player.Listener {
                         selected,
                         queue,
                         BrowserReturnState.Smb(
-                            credentials = credentials,
+                            credentials = resolved.credentials,
                             path = parentPath,
                             entries = entries,
                             scrollOffset = recentScrollOffset(
@@ -1867,6 +1889,49 @@ class PlayerActivity : Activity(), Player.Listener {
                 }
             }
         }
+    }
+
+    private data class ResolvedRecentSmbFolder(
+        val credentials: SmbCredentials,
+        val entries: List<SmbEntry>,
+    )
+
+    /**
+     * Reopens a remembered SMB folder without exposing DHCP address changes to the user.
+     * A discovered address is accepted only when its resolved name matches the stable host.
+     */
+    private fun resolveRecentSmbFolder(
+        credentials: SmbCredentials,
+        parentPath: String,
+    ): ResolvedRecentSmbFolder {
+        val attemptedTargets = linkedSetOf<String>()
+        var lastFailure: Throwable? = null
+
+        fun attempt(connectionTarget: String): ResolvedRecentSmbFolder? {
+            val normalizedTarget = normalizeSmbHost(connectionTarget)
+            if (normalizedTarget.isBlank() || !attemptedTargets.add(normalizedTarget)) return null
+            val candidate = credentials.copy(connectionHost = connectionTarget)
+            return runCatching {
+                val entries = SmbRepository(candidate).use { repository ->
+                    repository.list(parentPath)
+                        .filter { it.isDirectory || isVideoFile(it.name) }
+                }
+                ResolvedRecentSmbFolder(candidate, entries)
+            }.onFailure { lastFailure = it }.getOrNull()
+        }
+
+        attempt(credentials.connectionTarget)?.let { return it }
+        if (!isSmbIpv4Address(credentials.host)) {
+            attempt(credentials.host)?.let { return it }
+            SmbDiscovery(this).discover()
+                .asSequence()
+                .filter { server ->
+                    smbHostsMatch(credentials.host, server.displayName) ||
+                        smbHostsMatch(credentials.host, server.host)
+                }
+                .forEach { server -> attempt(server.host)?.let { return it } }
+        }
+        throw lastFailure ?: IllegalStateException("The SMB server could not be found")
     }
 
     private fun resolveRecentRemote(
@@ -2131,8 +2196,24 @@ class PlayerActivity : Activity(), Player.Listener {
         transientMessage = "Connecting to ${smbCredentials.host}..."
         renderVrMenu()
         val credentials = smbCredentials.copy(share = "")
+        val previousCredentials = smbCredentialStore.load()
         io.execute {
-            runCatching { SmbShareBrowser().listShares(credentials) }
+            runCatching {
+                val shares = SmbShareBrowser().listShares(credentials)
+                val aliases = setOf(
+                    previousCredentials?.host.orEmpty(),
+                    previousCredentials?.connectionTarget.orEmpty(),
+                    credentials.connectionTarget,
+                )
+                shares.forEach { share ->
+                    mediaStateStore.migrateSmbHostIdentity(
+                        oldConnectionHosts = aliases,
+                        stableHost = credentials.host,
+                        share = share,
+                    )
+                }
+                shares
+            }
                 .onSuccess { shares -> runOnUiThread {
                     smbCredentials = credentials
                     if (rememberSmbCredentials) smbCredentialStore.save(credentials)

@@ -25,6 +25,9 @@ data class SmbServer(
 
 private val IPV4_ADDRESS = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
 
+internal fun isSmbIpv4Address(value: String): Boolean =
+    IPV4_ADDRESS.matches(normalizeSmbHost(value))
+
 internal fun normalizeSmbHost(value: String): String = value.trim()
     .trimEnd('.')
     .lowercase(Locale.ROOT)
@@ -35,7 +38,7 @@ internal fun smbHostsMatch(first: String, second: String): Boolean {
     val right = normalizeSmbHost(second)
     if (left.isBlank() || right.isBlank()) return false
     if (left == right) return true
-    return !IPV4_ADDRESS.matches(left) && !IPV4_ADDRESS.matches(right) &&
+    return !isSmbIpv4Address(left) && !isSmbIpv4Address(right) &&
         left.substringBefore('.') == right.substringBefore('.')
 }
 
