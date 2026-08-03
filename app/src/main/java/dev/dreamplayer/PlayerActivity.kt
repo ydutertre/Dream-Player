@@ -4914,6 +4914,7 @@ class PlayerActivity : Activity(), Player.Listener {
             y: Float,
             logarithmic: Boolean = false,
             valueLabelX: Float = 1768f,
+            labelFontSize: Float = 24f,
         ) {
             val bounds = RectF(
                 SETTINGS_SLIDER_LEFT,
@@ -4929,7 +4930,7 @@ class PlayerActivity : Activity(), Player.Listener {
             } else {
                 ((value - minimum) / (maximum - minimum)).coerceIn(0f, 1f)
             }
-            text(label, 975f, y + 9f, 24f, Paint.Align.LEFT)
+            text(label, 975f, y + 9f, labelFontSize, Paint.Align.LEFT)
             text(valueLabel, valueLabelX, y + 9f, 22f, Paint.Align.RIGHT, colorTextMuted)
             canvas.drawRoundRect(
                 SETTINGS_SLIDER_LEFT, y - 5f, SETTINGS_SLIDER_RIGHT, y + 5f,
@@ -7228,12 +7229,13 @@ class PlayerActivity : Activity(), Player.Listener {
                             fontSize = 22f,
                         )
                         compactSettingsSlider(
-                            "settings_slider_scene", "Dark scene brightness",
+                            "settings_slider_scene", "Dark brightness",
                             "%.0f%%".format(Locale.US, sceneBrightness * 100f),
                             sceneBrightness,
                             SCENE_BRIGHTNESS_MIN,
                             SCENE_BRIGHTNESS_MAX,
                             335f,
+                            labelFontSize = 20f,
                         )
                         compactSettingsSlider(
                             "settings_slider_passthrough_brightness", "Passthrough brightness",
@@ -7242,6 +7244,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             0f,
                             1f,
                             435f,
+                            labelFontSize = 18f,
                         )
                         text(
                             "Passthrough is global and does not change movie picture settings.",
