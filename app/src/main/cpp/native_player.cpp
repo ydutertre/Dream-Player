@@ -87,6 +87,13 @@ std::atomic<float> gSubtitleLeft{0.0f};
 std::atomic<float> gSubtitleTop{0.0f};
 std::atomic<float> gSubtitleRight{1.0f};
 std::atomic<float> gSubtitleBottom{1.0f};
+std::atomic<float> gTextSubtitleRed{1.0f};
+std::atomic<float> gTextSubtitleGreen{1.0f};
+std::atomic<float> gTextSubtitleBlue{1.0f};
+std::atomic<float> gTextSubtitleBrightness{1.0f};
+std::atomic<float> gTextSubtitleScale{1.0f};
+std::atomic<float> gTextSubtitleHorizontalPosition{0.5f};
+std::atomic<float> gTextSubtitleVerticalPosition{0.0f};
 bool gSubtitleDirty = false;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr int kScreenSegments = 40;
@@ -1204,8 +1211,17 @@ private:
             precision mediump float;
             in vec2 vUv;
             uniform sampler2D uSubtitle;
+            uniform vec3 uTextTint;
+            uniform float uTextBrightness;
+            uniform int uApplyTextStyle;
             out vec4 fragColor;
-            void main() { fragColor = texture(uSubtitle, vec2(vUv.x, 1.0 - vUv.y)); }
+            void main() {
+                vec4 sampleColor = texture(uSubtitle, vec2(vUv.x, 1.0 - vUv.y));
+                if (uApplyTextStyle != 0) {
+                    sampleColor.rgb *= uTextTint * uTextBrightness;
+                }
+                fragColor = sampleColor;
+            }
         )glsl";
         const char* pointerFragment = R"glsl(#version 300 es
             precision mediump float;
@@ -2390,22 +2406,44 @@ private:
                     }
                 }
             }
-            const float subtitleTop =
-                isBitmapSubtitle
-                    ? halfHeight * (1.0f - 2.0f * displayTop)
-                    : (isMenuOverlay ? halfHeight : -halfHeight + 0.31f);
-            const float subtitleBottom =
-                isBitmapSubtitle
-                    ? halfHeight * (1.0f - 2.0f * displayBottom)
-                    : (isMenuOverlay ? -halfHeight : -halfHeight + 0.01f);
+            float subtitleTop = 0.0f;
+            float subtitleBottom = 0.0f;
+            if (isBitmapSubtitle) {
+                subtitleTop = halfHeight * (1.0f - 2.0f * displayTop);
+                subtitleBottom = halfHeight * (1.0f - 2.0f * displayBottom);
+            } else if (isMenuOverlay) {
+                subtitleTop = halfHeight;
+                subtitleBottom = -halfHeight;
+            } else {
+                const float textScale =
+                    std::clamp(gTextSubtitleScale.load(), 0.6f, 1.8f);
+                const float textHalfHeight = 0.15f * textScale;
+                const float minimumCenter = -halfHeight + textHalfHeight + 0.01f;
+                const float maximumCenter = halfHeight - textHalfHeight - 0.01f;
+                const float verticalPosition = std::clamp(
+                    gTextSubtitleVerticalPosition.load(), 0.0f, 1.0f);
+                const float center = minimumCenter +
+                    (maximumCenter - minimumCenter) * verticalPosition;
+                subtitleTop = center + textHalfHeight;
+                subtitleBottom = center - textHalfHeight;
+            }
             const float subtitleTextureAspect =
                 static_cast<float>(gSubtitleWidth.load()) /
                 static_cast<float>(gSubtitleHeight.load());
-            const float subtitleHalfWidth =
+            const float rawSubtitleHalfWidth =
                 isMenuOverlay
                     ? halfHeight * kMenuAspect
                     : (subtitleTop - subtitleBottom) * 0.5f *
                         subtitleTextureAspect;
+            const float subtitleHalfWidth =
+                !isBitmapSubtitle && !isMenuOverlay
+                    ? std::min(rawSubtitleHalfWidth, halfWidth * 0.98f)
+                    : rawSubtitleHalfWidth;
+            const float textHorizontalOffset =
+                !isBitmapSubtitle && !isMenuOverlay
+                    ? (gTextSubtitleHorizontalPosition.load() * 2.0f - 1.0f) *
+                        std::max(0.0f, halfWidth - subtitleHalfWidth)
+                    : 0.0f;
             const float subtitleForward =
                 isMenuOverlay ? 0.01f : gSubtitleDepthMeters.load();
             const float subtitleReferenceHalfWidth =
@@ -2455,7 +2493,9 @@ private:
                                 subtitleBasis,
                                 subtitleReferenceHalfWidth,
                                 subtitleHalfWidth,
-                                normalizedHorizontal,
+                                normalizedHorizontal +
+                                    textHorizontalOffset /
+                                        std::max(subtitleHalfWidth, 0.0001f),
                                 vertical,
                                 curvature,
                                 subtitleForward);
@@ -2496,6 +2536,18 @@ private:
                 glUniform1i(
                     glGetUniformLocation(subtitleProgram_, "uSubtitle"),
                     0);
+                const bool applyTextStyle = !isMenuOverlay && !isBitmapSubtitle;
+                glUniform3f(
+                    glGetUniformLocation(subtitleProgram_, "uTextTint"),
+                    gTextSubtitleRed.load(),
+                    gTextSubtitleGreen.load(),
+                    gTextSubtitleBlue.load());
+                glUniform1f(
+                    glGetUniformLocation(subtitleProgram_, "uTextBrightness"),
+                    gTextSubtitleBrightness.load());
+                glUniform1i(
+                    glGetUniformLocation(subtitleProgram_, "uApplyTextStyle"),
+                    applyTextStyle ? 1 : 0);
                 glDrawArrays(GL_TRIANGLES, 0, kScreenSegments * 6);
                 glDisable(GL_BLEND);
             }
@@ -2906,6 +2958,34 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetSubtitle3dEnabled(
     jclass,
     jboolean enabled) {
     gSubtitle3dEnabled.store(enabled == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetTextSubtitleAppearance(
+    JNIEnv*,
+    jclass,
+    jfloat red,
+    jfloat green,
+    jfloat blue,
+    jfloat brightness,
+    jfloat scale,
+    jfloat horizontalPosition,
+    jfloat verticalPosition) {
+    if (std::isfinite(red)) gTextSubtitleRed.store(std::clamp(red, 0.0f, 1.0f));
+    if (std::isfinite(green)) gTextSubtitleGreen.store(std::clamp(green, 0.0f, 1.0f));
+    if (std::isfinite(blue)) gTextSubtitleBlue.store(std::clamp(blue, 0.0f, 1.0f));
+    if (std::isfinite(brightness)) {
+        gTextSubtitleBrightness.store(std::clamp(brightness, 0.25f, 1.0f));
+    }
+    if (std::isfinite(scale)) gTextSubtitleScale.store(std::clamp(scale, 0.6f, 1.8f));
+    if (std::isfinite(horizontalPosition)) {
+        gTextSubtitleHorizontalPosition.store(
+            std::clamp(horizontalPosition, 0.0f, 1.0f));
+    }
+    if (std::isfinite(verticalPosition)) {
+        gTextSubtitleVerticalPosition.store(
+            std::clamp(verticalPosition, 0.0f, 1.0f));
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL

@@ -114,6 +114,11 @@ class PlayerActivity : Activity(), Player.Listener {
     private var subtitleDepthMeters = DEFAULT_2D_SUBTITLE_DEPTH_METERS
     private var subtitleDepthIsCustom = false
     private var subtitle3dEnabled = false
+    private var textSubtitleColor = DEFAULT_TEXT_SUBTITLE_COLOR
+    private var textSubtitleBrightness = DEFAULT_TEXT_SUBTITLE_BRIGHTNESS
+    private var textSubtitleScale = DEFAULT_TEXT_SUBTITLE_SCALE
+    private var textSubtitleHorizontalPosition = DEFAULT_TEXT_SUBTITLE_HORIZONTAL_POSITION
+    private var textSubtitleVerticalPosition = DEFAULT_TEXT_SUBTITLE_VERTICAL_POSITION
     private var audioChoices: List<AudioChoice> = listOf(
         AudioChoice("Auto", null, -1, AUDIO_AUTO),
     )
@@ -309,7 +314,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private enum class PlaybackPopover {
-        NONE, SUBTITLES, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
+        NONE, SUBTITLES, SUBTITLE_APPEARANCE, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
         ADAPTIVE_HDR, RENDER_QUALITY,
     }
 
@@ -499,6 +504,7 @@ class PlayerActivity : Activity(), Player.Listener {
         val group: Tracks.Group?,
         val trackIndex: Int,
         val fingerprint: String,
+        val isBitmap: Boolean = false,
     )
 
     private data class AudioChoice(
@@ -599,6 +605,8 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         loadCinemaTunings(picturePreferences)
         applyCinemaSettings(persist = false)
+        loadTextSubtitleAppearance()
+        applyTextSubtitleAppearance(persist = false)
         val browserPreferences = getSharedPreferences(BROWSER_PREFS, Context.MODE_PRIVATE)
         browserSortField = BrowserSortField.entries.getOrElse(
             browserPreferences.getInt(PREF_BROWSER_SORT_FIELD, BrowserSortField.NAME.ordinal)
@@ -2590,7 +2598,13 @@ class PlayerActivity : Activity(), Player.Listener {
                 val baseFingerprint = subtitleFingerprint(format)
                 val occurrence = fingerprintOccurrences.getOrDefault(baseFingerprint, 0)
                 fingerprintOccurrences[baseFingerprint] = occurrence + 1
-                discovered += SubtitleChoice(name, group, trackIndex, "$baseFingerprint#$occurrence")
+                discovered += SubtitleChoice(
+                    name,
+                    group,
+                    trackIndex,
+                    "$baseFingerprint#$occurrence",
+                    isBitmapSubtitleMime(format.sampleMimeType),
+                )
             }
         }
         val discoveredAudio = mutableListOf(AudioChoice("Auto", null, -1, AUDIO_AUTO))
@@ -3170,6 +3184,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun playbackPopoverBounds(popover: PlaybackPopover): RectF? = when (popover) {
         PlaybackPopover.SUBTITLES,
+        PlaybackPopover.SUBTITLE_APPEARANCE,
         PlaybackPopover.AUDIO -> PLAYBACK_LEFT_POPOVER_BOUNDS
         PlaybackPopover.PROJECTION -> PLAYBACK_PROJECTION_POPOVER_BOUNDS
         PlaybackPopover.SETTINGS,
@@ -3678,6 +3693,28 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "subtitles" -> {
                 togglePlaybackPopover(PlaybackPopover.SUBTITLES)
             }
+            id == "subtitle_appearance" -> {
+                stopTrackListScroll()
+                playbackPopover = PlaybackPopover.SUBTITLE_APPEARANCE
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "subtitle_appearance_back" -> {
+                playbackPopover = PlaybackPopover.SUBTITLES
+                ensureSelectedTrackVisible()
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "subtitle_appearance_reset" -> {
+                resetTextSubtitleAppearance()
+                renderVrMenu()
+            }
+            id.startsWith("subtitle_color_") -> {
+                val index = id.removePrefix("subtitle_color_").toIntOrNull() ?: return
+                textSubtitleColor = TEXT_SUBTITLE_COLORS.getOrNull(index)?.second ?: return
+                applyTextSubtitleAppearance(persist = true)
+                renderVrMenu()
+            }
             id == "settings" -> {
                 togglePlaybackPopover(PlaybackPopover.SETTINGS)
             }
@@ -3767,6 +3804,42 @@ class PlayerActivity : Activity(), Player.Listener {
                     ),
                     persist,
                 )
+                renderVrMenu()
+            }
+            id == "subtitle_appearance_slider_brightness" -> {
+                val fraction = subtitleAppearanceSliderFraction(pointerX)
+                if (!fraction.isFinite()) return
+                textSubtitleBrightness = lerp(
+                    TEXT_SUBTITLE_BRIGHTNESS_MIN,
+                    TEXT_SUBTITLE_BRIGHTNESS_MAX,
+                    fraction,
+                )
+                applyTextSubtitleAppearance(persist)
+                renderVrMenu()
+            }
+            id == "subtitle_appearance_slider_size" -> {
+                val fraction = subtitleAppearanceSliderFraction(pointerX)
+                if (!fraction.isFinite()) return
+                textSubtitleScale = lerp(
+                    TEXT_SUBTITLE_SCALE_MIN,
+                    TEXT_SUBTITLE_SCALE_MAX,
+                    fraction,
+                )
+                applyTextSubtitleAppearance(persist)
+                renderVrMenu()
+            }
+            id == "subtitle_appearance_slider_horizontal" -> {
+                val fraction = subtitleAppearanceSliderFraction(pointerX)
+                if (!fraction.isFinite()) return
+                textSubtitleHorizontalPosition = fraction
+                applyTextSubtitleAppearance(persist)
+                renderVrMenu()
+            }
+            id == "subtitle_appearance_slider_vertical" -> {
+                val fraction = subtitleAppearanceSliderFraction(pointerX)
+                if (!fraction.isFinite()) return
+                textSubtitleVerticalPosition = fraction
+                applyTextSubtitleAppearance(persist)
                 renderVrMenu()
             }
             id == "subtitle_3d_enabled" -> {
@@ -4296,6 +4369,107 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
+    private fun loadTextSubtitleAppearance() {
+        val preferences = getSharedPreferences(SUBTITLE_PREFS, Context.MODE_PRIVATE)
+        textSubtitleColor = preferences.getInt(
+            PREF_TEXT_SUBTITLE_COLOR,
+            DEFAULT_TEXT_SUBTITLE_COLOR,
+        ) or 0xff000000.toInt()
+        // Persisted colors are always opaque. This also repairs legacy/corrupt values
+        // whose alpha byte was zero without changing their selected RGB tint.
+        textSubtitleColor = Color.rgb(
+            Color.red(textSubtitleColor),
+            Color.green(textSubtitleColor),
+            Color.blue(textSubtitleColor),
+        )
+        textSubtitleBrightness = preferences
+            .getFloat(PREF_TEXT_SUBTITLE_BRIGHTNESS, DEFAULT_TEXT_SUBTITLE_BRIGHTNESS)
+            .sanitized(
+                TEXT_SUBTITLE_BRIGHTNESS_MIN,
+                TEXT_SUBTITLE_BRIGHTNESS_MAX,
+                DEFAULT_TEXT_SUBTITLE_BRIGHTNESS,
+            )
+        textSubtitleScale = preferences
+            .getFloat(PREF_TEXT_SUBTITLE_SCALE, DEFAULT_TEXT_SUBTITLE_SCALE)
+            .sanitized(
+                TEXT_SUBTITLE_SCALE_MIN,
+                TEXT_SUBTITLE_SCALE_MAX,
+                DEFAULT_TEXT_SUBTITLE_SCALE,
+            )
+        textSubtitleHorizontalPosition = preferences
+            .getFloat(
+                PREF_TEXT_SUBTITLE_HORIZONTAL_POSITION,
+                DEFAULT_TEXT_SUBTITLE_HORIZONTAL_POSITION,
+            )
+            .sanitized(0f, 1f, DEFAULT_TEXT_SUBTITLE_HORIZONTAL_POSITION)
+        textSubtitleVerticalPosition = preferences
+            .getFloat(
+                PREF_TEXT_SUBTITLE_VERTICAL_POSITION,
+                DEFAULT_TEXT_SUBTITLE_VERTICAL_POSITION,
+            )
+            .sanitized(0f, 1f, DEFAULT_TEXT_SUBTITLE_VERTICAL_POSITION)
+    }
+
+    private fun applyTextSubtitleAppearance(persist: Boolean) {
+        nativeSetTextSubtitleAppearance(
+            Color.red(textSubtitleColor) / 255f,
+            Color.green(textSubtitleColor) / 255f,
+            Color.blue(textSubtitleColor) / 255f,
+            textSubtitleBrightness,
+            textSubtitleScale,
+            textSubtitleHorizontalPosition,
+            textSubtitleVerticalPosition,
+        )
+        if (persist) {
+            getSharedPreferences(SUBTITLE_PREFS, Context.MODE_PRIVATE).edit()
+                .putInt(PREF_TEXT_SUBTITLE_COLOR, textSubtitleColor)
+                .putFloat(PREF_TEXT_SUBTITLE_BRIGHTNESS, textSubtitleBrightness)
+                .putFloat(PREF_TEXT_SUBTITLE_SCALE, textSubtitleScale)
+                .putFloat(
+                    PREF_TEXT_SUBTITLE_HORIZONTAL_POSITION,
+                    textSubtitleHorizontalPosition,
+                )
+                .putFloat(
+                    PREF_TEXT_SUBTITLE_VERTICAL_POSITION,
+                    textSubtitleVerticalPosition,
+                )
+                .apply()
+        }
+    }
+
+    private fun resetTextSubtitleAppearance() {
+        textSubtitleColor = DEFAULT_TEXT_SUBTITLE_COLOR
+        textSubtitleBrightness = DEFAULT_TEXT_SUBTITLE_BRIGHTNESS
+        textSubtitleScale = DEFAULT_TEXT_SUBTITLE_SCALE
+        textSubtitleHorizontalPosition = DEFAULT_TEXT_SUBTITLE_HORIZONTAL_POSITION
+        textSubtitleVerticalPosition = DEFAULT_TEXT_SUBTITLE_VERTICAL_POSITION
+        applyTextSubtitleAppearance(persist = true)
+    }
+
+    private fun subtitleAppearanceSliderFraction(pointerX: Float): Float =
+        ((pointerX - SUBTITLE_APPEARANCE_SLIDER_LEFT) /
+            (SUBTITLE_APPEARANCE_SLIDER_RIGHT - SUBTITLE_APPEARANCE_SLIDER_LEFT))
+            .coerceIn(0f, 1f)
+
+    private fun activeSubtitleIsBitmap(): Boolean {
+        if (latestCues.any { it.bitmap != null }) return true
+        val explicit = subtitleChoices.getOrNull(subtitleChoiceIndex)
+        if (subtitleChoiceIndex >= 2) return explicit?.isBitmap == true
+        if (subtitleChoiceIndex == 0) {
+            return subtitleChoices.drop(2).any { choice ->
+                choice.isBitmap &&
+                    choice.group?.isTrackSelected(choice.trackIndex) == true
+            }
+        }
+        return false
+    }
+
+    private fun isBitmapSubtitleMime(mimeType: String?): Boolean = mimeType in setOf(
+        "application/pgs",
+        "application/vobsub",
+        "application/dvbsubs",
+    )
+
     private fun setScreenCurvature(value: Float, persist: Boolean) {
         val adjusted = value.coerceIn(SCREEN_CURVATURE_MIN, SCREEN_CURVATURE_MAX)
         screenCurvature = adjusted
@@ -4790,6 +4964,67 @@ class PlayerActivity : Activity(), Player.Listener {
                 },
             )
             buttons += UiButton(id, "Subtitle depth", bounds)
+        }
+
+        fun subtitleAppearanceSlider(
+            id: String,
+            label: String,
+            valueLabel: String,
+            value: Float,
+            minimum: Float,
+            maximum: Float,
+            y: Float,
+            enabled: Boolean,
+        ) {
+            val fraction = ((value - minimum) / (maximum - minimum)).coerceIn(0f, 1f)
+            val bounds = RectF(
+                SUBTITLE_APPEARANCE_SLIDER_LEFT,
+                y - 24f,
+                SUBTITLE_APPEARANCE_SLIDER_RIGHT,
+                y + 24f,
+            )
+            text(
+                label,
+                190f,
+                y + 8f,
+                22f,
+                Paint.Align.LEFT,
+                if (enabled) colorText else colorTextMuted,
+            )
+            text(valueLabel, 820f, y + 8f, 20f, Paint.Align.RIGHT, colorTextMuted)
+            val railColor = if (enabled) colorOutline else Color.rgb(17, 29, 40)
+            canvas.drawRoundRect(
+                SUBTITLE_APPEARANCE_SLIDER_LEFT,
+                y - 5f,
+                SUBTITLE_APPEARANCE_SLIDER_RIGHT,
+                y + 5f,
+                5f,
+                5f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = railColor },
+            )
+            val knobX = SUBTITLE_APPEARANCE_SLIDER_LEFT +
+                (SUBTITLE_APPEARANCE_SLIDER_RIGHT - SUBTITLE_APPEARANCE_SLIDER_LEFT) * fraction
+            if (enabled) {
+                canvas.drawRoundRect(
+                    SUBTITLE_APPEARANCE_SLIDER_LEFT,
+                    y - 5f,
+                    knobX,
+                    y + 5f,
+                    5f,
+                    5f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply { color = colorAccent },
+                )
+            }
+            val focused = enabled && (hoveredButton == id || activeSlider == id)
+            canvas.drawCircle(
+                knobX,
+                y,
+                if (focused) 18f else 14f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (enabled) colorText else colorTextMuted
+                },
+            )
+            if (enabled) buttons += UiButton(id, label, bounds)
         }
 
         fun projectionCurvatureSlider(y: Float) {
@@ -6234,8 +6469,130 @@ class PlayerActivity : Activity(), Player.Listener {
                         checkbox(
                             "subtitle_3d_enabled",
                             "3D subtitle",
-                            RectF(190f, 646f, 820f, 708f),
+                            RectF(190f, 646f, 490f, 708f),
                             subtitle3dEnabled,
+                        )
+                        button(
+                            "subtitle_appearance",
+                            "Appearance",
+                            RectF(505f, 646f, 820f, 708f),
+                            fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.SUBTITLE_APPEARANCE -> {
+                        val bounds = PLAYBACK_LEFT_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Text appearance", 374f)
+                        val enabled = !activeSubtitleIsBitmap()
+                        val previewColor = Color.rgb(
+                            (Color.red(textSubtitleColor) * textSubtitleBrightness)
+                                .toInt().coerceIn(0, 255),
+                            (Color.green(textSubtitleColor) * textSubtitleBrightness)
+                                .toInt().coerceIn(0, 255),
+                            (Color.blue(textSubtitleColor) * textSubtitleBrightness)
+                                .toInt().coerceIn(0, 255),
+                        )
+                        text(
+                            if (enabled) "Subtitle preview" else "Image subtitle appearance is embedded",
+                            505f,
+                            218f,
+                            if (enabled) 25f * textSubtitleScale else 21f,
+                            color = if (enabled) previewColor else colorTextMuted,
+                        )
+                        text("Color", 190f, 245f, 22f, Paint.Align.LEFT, colorTextMuted)
+                        TEXT_SUBTITLE_COLORS.forEachIndexed { index, (label, color) ->
+                            val centerX = 235f + index * 91f
+                            val centerY = 270f
+                            val swatchBounds = RectF(
+                                centerX - 29f,
+                                centerY - 29f,
+                                centerX + 29f,
+                                centerY + 29f,
+                            )
+                            val selected = color == textSubtitleColor
+                            canvas.drawCircle(
+                                centerX,
+                                centerY,
+                                22f,
+                                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    this.color = if (enabled) color else Color.rgb(74, 82, 88)
+                                },
+                            )
+                            canvas.drawCircle(
+                                centerX,
+                                centerY,
+                                if (selected) 28f else 25f,
+                                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    this.color = if (selected) colorAccentBright else colorOutline
+                                    style = Paint.Style.STROKE
+                                    strokeWidth = if (selected) 4f else 2f
+                                },
+                            )
+                            if (enabled) {
+                                buttons += UiButton("subtitle_color_$index", label, swatchBounds, selected)
+                            }
+                        }
+                        subtitleAppearanceSlider(
+                            "subtitle_appearance_slider_brightness",
+                            "Brightness",
+                            "%.0f%%".format(Locale.US, textSubtitleBrightness * 100f),
+                            textSubtitleBrightness,
+                            TEXT_SUBTITLE_BRIGHTNESS_MIN,
+                            TEXT_SUBTITLE_BRIGHTNESS_MAX,
+                            350f,
+                            enabled,
+                        )
+                        subtitleAppearanceSlider(
+                            "subtitle_appearance_slider_size",
+                            "Size",
+                            "%.0f%%".format(Locale.US, textSubtitleScale * 100f),
+                            textSubtitleScale,
+                            TEXT_SUBTITLE_SCALE_MIN,
+                            TEXT_SUBTITLE_SCALE_MAX,
+                            425f,
+                            enabled,
+                        )
+                        subtitleAppearanceSlider(
+                            "subtitle_appearance_slider_horizontal",
+                            "Horizontal",
+                            when {
+                                textSubtitleHorizontalPosition < 0.45f -> "Left"
+                                textSubtitleHorizontalPosition > 0.55f -> "Right"
+                                else -> "Center"
+                            },
+                            textSubtitleHorizontalPosition,
+                            0f,
+                            1f,
+                            500f,
+                            enabled,
+                        )
+                        subtitleAppearanceSlider(
+                            "subtitle_appearance_slider_vertical",
+                            "Vertical",
+                            when {
+                                textSubtitleVerticalPosition < 0.1f -> "Bottom"
+                                textSubtitleVerticalPosition > 0.9f -> "Top"
+                                else -> "%.0f%%".format(
+                                    Locale.US,
+                                    textSubtitleVerticalPosition * 100f,
+                                )
+                            },
+                            textSubtitleVerticalPosition,
+                            0f,
+                            1f,
+                            575f,
+                            enabled,
+                        )
+                        button(
+                            "subtitle_appearance_back",
+                            "Back",
+                            RectF(190f, 625f, 490f, 690f),
+                            fontSize = 22f,
+                        )
+                        button(
+                            "subtitle_appearance_reset",
+                            "Reset appearance",
+                            RectF(505f, 625f, 820f, 690f),
+                            fontSize = 20f,
                         )
                     }
                     PlaybackPopover.AUDIO -> {
@@ -7388,6 +7745,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun isSlider(id: String): Boolean =
         id == "seek_bar" ||
             id == "subtitle_depth_slider" ||
+            id.startsWith("subtitle_appearance_slider_") ||
             id == "screen_curvature_slider" ||
             id.startsWith("picture_slider_") ||
             id.startsWith("settings_slider_")
@@ -7532,7 +7890,15 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_3D_SUBTITLE_DEPTH_METERS = 0.12f
         private const val AUDIO_AUTO = "audio:auto"
         private const val PICTURE_PREFS = "picture-preferences"
+        private const val SUBTITLE_PREFS = "subtitle-preferences"
         private const val BROWSER_PREFS = "browser-preferences"
+        private const val PREF_TEXT_SUBTITLE_COLOR = "text-subtitle-color"
+        private const val PREF_TEXT_SUBTITLE_BRIGHTNESS = "text-subtitle-brightness"
+        private const val PREF_TEXT_SUBTITLE_SCALE = "text-subtitle-scale"
+        private const val PREF_TEXT_SUBTITLE_HORIZONTAL_POSITION =
+            "text-subtitle-horizontal-position"
+        private const val PREF_TEXT_SUBTITLE_VERTICAL_POSITION =
+            "text-subtitle-vertical-position"
         private const val PREF_BROWSER_SORT_FIELD = "sort-field"
         private const val PREF_BROWSER_SORT_ASCENDING = "sort-ascending"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
@@ -7567,6 +7933,24 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_CINEMA_MIDTONE_EV = 0.15f
         private const val DEFAULT_CINEMA_COLOR_INTENSITY = 1.10f
         private const val DEFAULT_SCREEN_CURVATURE = 0f
+        private val DEFAULT_TEXT_SUBTITLE_COLOR = Color.WHITE
+        private const val DEFAULT_TEXT_SUBTITLE_BRIGHTNESS = 1f
+        private const val DEFAULT_TEXT_SUBTITLE_SCALE = 1f
+        private const val DEFAULT_TEXT_SUBTITLE_HORIZONTAL_POSITION = 0.5f
+        private const val DEFAULT_TEXT_SUBTITLE_VERTICAL_POSITION = 0f
+        private const val TEXT_SUBTITLE_BRIGHTNESS_MIN = 0.25f
+        private const val TEXT_SUBTITLE_BRIGHTNESS_MAX = 1f
+        private const val TEXT_SUBTITLE_SCALE_MIN = 0.6f
+        private const val TEXT_SUBTITLE_SCALE_MAX = 1.8f
+        private val TEXT_SUBTITLE_COLORS = listOf(
+            "White" to Color.rgb(255, 255, 255),
+            "Warm white" to Color.rgb(255, 233, 199),
+            "Yellow" to Color.rgb(255, 227, 110),
+            "Amber" to Color.rgb(255, 184, 77),
+            "Cyan" to Color.rgb(121, 231, 255),
+            "Green" to Color.rgb(154, 245, 154),
+            "Pink" to Color.rgb(255, 155, 203),
+        )
         private const val SCREEN_CURVATURE_MIN = 0f
         private const val SCREEN_CURVATURE_MAX = 1f
         private const val PICTURE_BRIGHTNESS_MIN = -0.016f
@@ -7622,6 +8006,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val SETTINGS_SLIDER_RIGHT = 1685f
         private const val SUBTITLE_DEPTH_SLIDER_LEFT = 340f
         private const val SUBTITLE_DEPTH_SLIDER_RIGHT = 690f
+        private const val SUBTITLE_APPEARANCE_SLIDER_LEFT = 350f
+        private const val SUBTITLE_APPEARANCE_SLIDER_RIGHT = 690f
         private const val SCREEN_CURVATURE_SLIDER_LEFT = 1470f
         private const val SCREEN_CURVATURE_SLIDER_RIGHT = 1775f
         private const val POINTER_PRESSED = 1
@@ -7705,6 +8091,15 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetSubtitleDepth(depthMeters: Float)
         @JvmStatic private external fun nativeSetSubtitle3dEnabled(enabled: Boolean)
+        @JvmStatic private external fun nativeSetTextSubtitleAppearance(
+            red: Float,
+            green: Float,
+            blue: Float,
+            brightness: Float,
+            scale: Float,
+            horizontalPosition: Float,
+            verticalPosition: Float,
+        )
         @JvmStatic private external fun nativeSetScreenCurvature(curvature: Float)
     }
 }
