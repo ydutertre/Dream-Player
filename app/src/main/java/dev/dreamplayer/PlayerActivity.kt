@@ -1701,7 +1701,9 @@ class PlayerActivity : Activity(), Player.Listener {
         }
 
         val saved = smbCredentialStore.load()
-            ?.takeIf { hostsMatch(it.host, host) }
+            ?.takeIf {
+                smbHostsMatch(it.host, host) || smbHostsMatch(it.connectionTarget, host)
+            }
         val credentials = (saved ?: SmbCredentials(host, share, "", "", ""))
             .copy(
                 host = host,
@@ -1837,8 +1839,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     }?.let {
                         SmbServer(it.connectionTarget, it.host)
                     }
-                    smbServers = (listOfNotNull(remembered) + servers)
-                        .distinctBy { it.host.lowercase(Locale.ROOT) }
+                    smbServers = mergeSmbServers(remembered, servers)
                     transientMessage = if (smbServers.isEmpty()) "No SMB servers found; use Add server" else null
                     renderVrMenu()
                 } }
@@ -1882,10 +1883,11 @@ class PlayerActivity : Activity(), Player.Listener {
             ?: server.host
         smbDisplayHost = preferredHost
         val saved = smbCredentialStore.load()
-        val savedMatches = saved != null && sequenceOf(
-            server.host,
-            server.displayName,
-        ).any { candidate -> hostsMatch(saved.host, candidate) }
+        val savedMatches = saved != null && sequenceOf(saved.host, saved.connectionTarget).any { savedHost ->
+            sequenceOf(server.host, server.displayName).any { candidate ->
+                smbHostsMatch(savedHost, candidate)
+            }
+        }
         if (savedMatches) {
             rememberSmbCredentials = true
             smbCredentials = requireNotNull(saved).copy(
@@ -1901,19 +1903,6 @@ class PlayerActivity : Activity(), Player.Listener {
                 connectionHost = server.host,
             )
         }
-    }
-
-    private fun hostsMatch(first: String, second: String): Boolean {
-        fun normalized(value: String) = value.trim()
-            .trimEnd('.')
-            .lowercase(Locale.ROOT)
-            .removeSuffix(".local")
-        val left = normalized(first)
-        val right = normalized(second)
-        if (left == right) return true
-        val ipv4 = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
-        return !ipv4.matches(left) && !ipv4.matches(right) &&
-            left.substringBefore('.') == right.substringBefore('.')
     }
 
     private fun connectSmb(autoLogin: Boolean = false) {

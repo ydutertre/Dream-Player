@@ -10,6 +10,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -21,6 +22,48 @@ data class SmbServer(
     /** Friendly DNS/NetBIOS name when one can be resolved, otherwise [host]. */
     val displayName: String = host,
 )
+
+private val IPV4_ADDRESS = Regex("""\d{1,3}(?:\.\d{1,3}){3}""")
+
+internal fun normalizeSmbHost(value: String): String = value.trim()
+    .trimEnd('.')
+    .lowercase(Locale.ROOT)
+    .removeSuffix(".local")
+
+internal fun smbHostsMatch(first: String, second: String): Boolean {
+    val left = normalizeSmbHost(first)
+    val right = normalizeSmbHost(second)
+    if (left.isBlank() || right.isBlank()) return false
+    if (left == right) return true
+    return !IPV4_ADDRESS.matches(left) && !IPV4_ADDRESS.matches(right) &&
+        left.substringBefore('.') == right.substringBefore('.')
+}
+
+internal fun smbServersMatch(first: SmbServer, second: SmbServer): Boolean {
+    val firstNames = sequenceOf(first.host, first.displayName).filter { it.isNotBlank() }
+    val secondNames = sequenceOf(second.host, second.displayName).filter { it.isNotBlank() }.toList()
+    return firstNames.any { firstName ->
+        secondNames.any { secondName -> smbHostsMatch(firstName, secondName) }
+    }
+}
+
+/**
+ * Combines the remembered profile with the current scan. A friendly hostname is the
+ * stable identity; the freshly discovered address is the current connection target.
+ */
+internal fun mergeSmbServers(
+    remembered: SmbServer?,
+    discovered: List<SmbServer>,
+): List<SmbServer> {
+    val liveServers = ArrayList<SmbServer>(discovered.size)
+    discovered.forEach { server ->
+        if (liveServers.none { smbServersMatch(it, server) }) liveServers += server
+    }
+    if (remembered == null || liveServers.any { smbServersMatch(it, remembered) }) {
+        return liveServers
+    }
+    return listOf(remembered) + liveServers
+}
 
 /** Finds SMB2/3 hosts by probing TCP 445 on the active LAN. */
 class SmbDiscovery(private val context: Context) {

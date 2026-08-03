@@ -89,4 +89,5 @@ dependencies {
     implementation("commons-net:commons-net:3.13.0")
     implementation("eu.agno3.jcifs:jcifs-ng:2.1.10")
     implementation("org.khronos.openxr:openxr_loader_for_android:1.1.61")
+    testImplementation("junit:junit:4.13.2")
 }
