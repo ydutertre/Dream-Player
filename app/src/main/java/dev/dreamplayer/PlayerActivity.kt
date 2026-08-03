@@ -133,6 +133,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var transientMessage: String? = null
     private val io = Executors.newSingleThreadExecutor()
     private var recentMedia: List<MediaStateStore.RecentMedia> = emptyList()
+    private var recentResolveGeneration = 0
     private var browserMetadata: Map<String, MediaStateStore.BrowserMetadata> = emptyMap()
     private var currentMediaMarkedPlayed = false
     private var playbackQueue: List<PlaybackSpec> = emptyList()
@@ -637,6 +638,7 @@ class PlayerActivity : Activity(), Player.Listener {
         setIntent(intent)
         val newSpec = playbackSpecFromIntent(intent) ?: return
         if (newSpec.uri.isBlank() || isFinishing || isDestroyed) return
+        recentResolveGeneration++
         clearPlaybackQueue()
         resumePlaybackOnForeground = true
         loadMedia(newSpec)
@@ -1693,6 +1695,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun playRecent(index: Int) {
         val recent = recentMedia.getOrNull(index) ?: return
         clearPlaybackQueue()
+        val generation = ++recentResolveGeneration
         val parsed = Uri.parse(recent.uri)
         val remoteProtocol = when (parsed.scheme?.lowercase(Locale.ROOT)) {
             "sftp" -> RemoteProtocol.SFTP
@@ -1701,40 +1704,92 @@ class PlayerActivity : Activity(), Player.Listener {
             else -> null
         }
         if (remoteProtocol != null) {
-            val defaultPort = remoteProtocol.defaultPort
-            val port = parsed.port.takeIf { it > 0 } ?: defaultPort
-            val remoteProfile = sftpProfiles.firstOrNull {
-                it.protocol == remoteProtocol &&
-                    it.port == port &&
-                    it.host.equals(parsed.host, ignoreCase = true)
-            }
-            if (remoteProfile == null) {
-                transientMessage =
-                    "Cannot reopen remote file: its saved server profile is unavailable"
-                renderVrMenu()
-                return
-            }
-            transientMessage = null
-            loadMedia(
-                PlaybackSpec(
-                    recent.uri,
-                    recent.title,
-                    StereoMode.MONO,
-                    remote = remoteProfile,
-                )
-            )
+            resolveRecentRemote(recent, parsed, remoteProtocol, generation)
             return
         }
-        if (!parsed.scheme.equals("smb", ignoreCase = true)) {
-            transientMessage = null
-            loadMedia(PlaybackSpec(recent.uri, recent.title, StereoMode.MONO))
+        if (parsed.scheme.equals("smb", ignoreCase = true)) {
+            resolveRecentSmb(recent, parsed, generation)
+            return
+        }
+        if (parsed.scheme.equals("content", ignoreCase = true)) {
+            resolveRecentLocal(recent, generation)
             return
         }
 
+        // A URL or document provider without a browsable folder still retains its
+        // previous direct-open behavior, with adjacent-file controls disabled.
+        transientMessage = null
+        loadMedia(PlaybackSpec(recent.uri, recent.title, StereoMode.MONO))
+    }
+
+    private fun recentScrollOffset(selectedIndex: Int, itemCount: Int): Float {
+        val maximum = (itemCount - BROWSER_VISIBLE_ROWS).coerceAtLeast(0).toFloat()
+        return (selectedIndex - BROWSER_VISIBLE_ROWS / 2f).coerceIn(0f, maximum)
+    }
+
+    private fun recentResolutionIsCurrent(generation: Int): Boolean =
+        generation == recentResolveGeneration && !isFinishing && !isDestroyed
+
+    private fun resolveRecentLocal(
+        recent: MediaStateStore.RecentMedia,
+        generation: Int,
+    ) {
+        transientMessage = "Opening ${recent.title}..."
+        renderVrMenu()
+        io.execute {
+            runCatching { LocalVideoRepository(this).list() }
+                .onSuccess { videos -> runOnUiThread {
+                    if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                    val video = videos.firstOrNull { it.uri.toString() == recent.uri }
+                    if (video == null) {
+                        transientMessage = "Could not find ${recent.title} in the local library"
+                        hoveredButton = null
+                        renderVrMenu()
+                        return@runOnUiThread
+                    }
+                    localVideos = videos
+                    localFolder = video.folder
+                    browserSearchQuery = ""
+                    refreshBrowserMetadata()
+                    val selected = localPlaybackSpec(video)
+                    val queue = localBrowserItems.map { localPlaybackSpec(it.video) }
+                    val selectedIndex = localBrowserItems.indexOfFirst {
+                        it.video.uri == video.uri
+                    }
+                    transientMessage = null
+                    startQueuedPlayback(
+                        selected,
+                        queue,
+                        BrowserReturnState.Local(
+                            folder = video.folder,
+                            scrollOffset = recentScrollOffset(
+                                selectedIndex,
+                                localBrowserItems.size,
+                            ),
+                            searchQuery = "",
+                        ),
+                    )
+                } }
+                .onFailure { error -> runOnUiThread {
+                    if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                    transientMessage = "Could not open recent local file: " +
+                        error.message.orEmpty().ifBlank { error.javaClass.simpleName }
+                    hoveredButton = null
+                    renderVrMenu()
+                } }
+        }
+    }
+
+    private fun resolveRecentSmb(
+        recent: MediaStateStore.RecentMedia,
+        parsed: Uri,
+        generation: Int,
+    ) {
         val host = parsed.host.orEmpty()
         val share = recent.smbShare.orEmpty()
-        if (host.isBlank() || share.isBlank()) {
-            transientMessage = "Cannot open recent SMB file: its server or share is missing"
+        val filePath = parsed.pathSegments.joinToString("\\")
+        if (host.isBlank() || share.isBlank() || filePath.isBlank()) {
+            transientMessage = "Cannot open recent SMB file: its server, share, or path is missing"
             renderVrMenu()
             return
         }
@@ -1749,37 +1804,155 @@ class PlayerActivity : Activity(), Player.Listener {
                 share = share,
                 connectionHost = saved?.connectionTarget ?: host,
             )
-        val path = parsed.pathSegments.joinToString("\\")
+        val parentPath = filePath.substringBeforeLast('\\', "")
         transientMessage = "Opening ${recent.title}..."
         renderVrMenu()
         io.execute {
             runCatching {
                 SmbRepository(credentials).use { repository ->
-                    repository.open(path).use { /* Opening proves authentication and file access. */ }
+                    repository.list(parentPath)
+                        .filter { it.isDirectory || isVideoFile(it.name) }
                 }
-            }.onSuccess {
-                runOnUiThread {
+            }.onSuccess { entries -> runOnUiThread {
+                    if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                    val selectedEntry = entries.firstOrNull {
+                        !it.isDirectory && it.path.equals(filePath, ignoreCase = true)
+                    }
+                    if (selectedEntry == null) {
+                        transientMessage = "Could not find ${recent.title} in its SMB folder"
+                        hoveredButton = null
+                        renderVrMenu()
+                        return@runOnUiThread
+                    }
                     smbCredentials = credentials
                     smbDisplayHost = host
                     rememberSmbCredentials = saved != null
+                    smbPath = parentPath
+                    smbEntries = entries
+                    smbNavigationStack.clear()
+                    browserSearchQuery = ""
+                    refreshBrowserMetadata()
+                    val selected = smbPlaybackSpec(selectedEntry)
+                    val queue = smbBrowserItems.asSequence()
+                        .map { it.entry }
+                        .filterNot { it.isDirectory }
+                        .map(::smbPlaybackSpec)
+                        .toList()
+                    val selectedIndex = smbBrowserItems.indexOfFirst {
+                        !it.entry.isDirectory &&
+                            it.entry.path.equals(filePath, ignoreCase = true)
+                    }
                     transientMessage = null
-                    loadMedia(
-                        PlaybackSpec(
-                            recent.uri,
-                            recent.title,
-                            StereoMode.MONO,
-                            smb = credentials,
-                        )
+                    startQueuedPlayback(
+                        selected,
+                        queue,
+                        BrowserReturnState.Smb(
+                            credentials = credentials,
+                            path = parentPath,
+                            entries = entries,
+                            scrollOffset = recentScrollOffset(
+                                selectedIndex,
+                                smbBrowserItems.size,
+                            ),
+                            searchQuery = "",
+                        ),
                     )
                 }
-            }.onFailure { error ->
-                runOnUiThread {
+            }.onFailure { error -> runOnUiThread {
+                    if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
                     transientMessage =
                         "Could not open recent SMB file: ${friendlySmbError(error)}"
                     hoveredButton = null
                     renderVrMenu()
                 }
             }
+        }
+    }
+
+    private fun resolveRecentRemote(
+        recent: MediaStateStore.RecentMedia,
+        parsed: Uri,
+        protocol: RemoteProtocol,
+        generation: Int,
+    ) {
+        val port = parsed.port.takeIf { it > 0 } ?: protocol.defaultPort
+        val profile = sftpProfiles.firstOrNull {
+            it.protocol == protocol && it.port == port &&
+                it.host.equals(parsed.host, ignoreCase = true)
+        }
+        if (profile == null) {
+            transientMessage =
+                "Cannot reopen remote file: its saved server profile is unavailable"
+            renderVrMenu()
+            return
+        }
+        val requestedPath = parsed.path.orEmpty()
+        if (requestedPath.isBlank()) {
+            transientMessage = "Cannot reopen remote file: its path is missing"
+            renderVrMenu()
+            return
+        }
+        val parentCandidate = requestedPath.substringBeforeLast('/', "").ifBlank {
+            if (requestedPath.startsWith('/')) "/" else "."
+        }
+        transientMessage = "Opening ${recent.title}..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                when (protocol) {
+                    RemoteProtocol.SFTP -> SftpRepository(profile).use { repository ->
+                        val parent = repository.canonicalize(parentCandidate)
+                        parent to repository.list(parent)
+                            .filter { it.isDirectory || isVideoFile(it.name) }
+                    }
+                    RemoteProtocol.FTPS,
+                    RemoteProtocol.FTP -> FtpRepository(profile).use { repository ->
+                        val parent = repository.canonicalize(parentCandidate)
+                        parent to repository.list(parent)
+                            .filter { it.isDirectory || isVideoFile(it.name) }
+                    }
+                }
+            }.onSuccess { (parent, entries) -> runOnUiThread {
+                if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                val expectedName = parsed.lastPathSegment.orEmpty()
+                val selectedEntry = entries.firstOrNull {
+                    !it.isDirectory && it.name == expectedName
+                }
+                if (selectedEntry == null) {
+                    transientMessage = "Could not find ${recent.title} in its server folder"
+                    hoveredButton = null
+                    renderVrMenu()
+                    return@runOnUiThread
+                }
+                sftpProfile = profile
+                sftpPortDraft = profile.port.toString()
+                sftpPath = parent
+                sftpEntries = entries
+                sftpNavigationStack.clear()
+                val selected = remotePlaybackSpec(selectedEntry)
+                val queue = entries.asSequence()
+                    .filterNot { it.isDirectory }
+                    .map(::remotePlaybackSpec)
+                    .toList()
+                val selectedIndex = entries.indexOf(selectedEntry)
+                transientMessage = null
+                startQueuedPlayback(
+                    selected,
+                    queue,
+                    BrowserReturnState.Remote(
+                        profile = profile,
+                        path = parent,
+                        entries = entries,
+                        scrollOffset = recentScrollOffset(selectedIndex, entries.size),
+                    ),
+                )
+            } }.onFailure { error -> runOnUiThread {
+                if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                transientMessage = "Could not open recent ${protocol.label} file: " +
+                    friendlySftpError(error)
+                hoveredButton = null
+                renderVrMenu()
+            } }
         }
     }
 
@@ -1827,6 +2000,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun openLocalBrowser() {
+        recentResolveGeneration++
         val permission = if (Build.VERSION.SDK_INT >= 33) {
             Manifest.permission.READ_MEDIA_VIDEO
         } else {
@@ -1866,6 +2040,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun discoverSmbServers() {
+        recentResolveGeneration++
         uiScreen = UiScreen.SMB_SERVERS
         browserScrollOffset = 0f
         smbServerListScrollOffset = 0f
@@ -2032,6 +2207,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun showSftpProfiles() {
+        recentResolveGeneration++
         sftpProfiles = sftpProfileStore.load()
         uiScreen = UiScreen.SFTP_PROFILES
         browserScrollOffset = sftpProfileListScrollOffset
