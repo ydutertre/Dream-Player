@@ -135,6 +135,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private var recentMedia: List<MediaStateStore.RecentMedia> = emptyList()
     private var browserMetadata: Map<String, MediaStateStore.BrowserMetadata> = emptyMap()
     private var currentMediaMarkedPlayed = false
+    private var playbackQueue: List<PlaybackSpec> = emptyList()
+    private var playbackQueueIndex = -1
     private var localVideos: List<LocalVideo> = emptyList()
     private var localFolder: String? = null
     private var localBrowserItems: List<LocalBrowserItem> = emptyList()
@@ -449,6 +451,41 @@ class PlayerActivity : Activity(), Player.Listener {
         val metadata: MediaStateStore.BrowserMetadata?,
     )
 
+    private fun startQueuedPlayback(
+        selected: PlaybackSpec,
+        queue: List<PlaybackSpec>,
+        browserReturn: BrowserReturnState,
+    ) {
+        val selectedIndex = queue.indexOfFirst { it.uri == selected.uri }
+        playbackQueue = queue.toList()
+        playbackQueueIndex = selectedIndex
+        loadMedia(selected, browserReturn)
+    }
+
+    private fun clearPlaybackQueue() {
+        playbackQueue = emptyList()
+        playbackQueueIndex = -1
+    }
+
+    private fun canPlayPreviousVideo(): Boolean = playbackQueueIndex > 0
+
+    private fun canPlayNextVideo(): Boolean =
+        playbackQueueIndex >= 0 && playbackQueueIndex < playbackQueue.lastIndex
+
+    private fun playAdjacentVideo(offset: Int) {
+        val targetIndex = playbackQueueIndex + offset
+        val target = playbackQueue.getOrNull(targetIndex) ?: return
+        // A quick next-then-previous gesture can return to the URI that is still loaded.
+        // Invalidate any subtitle scan for the abandoned intermediate target first.
+        subtitleDiscoveryGeneration++
+        playbackQueueIndex = targetIndex
+        playbackPopover = PlaybackPopover.NONE
+        activeSlider = null
+        hoveredButton = null
+        loadMedia(target, playbackBrowserReturn)
+        showControls(8_000L)
+    }
+
     private data class UiButton(
         val id: String,
         val label: String,
@@ -600,6 +637,7 @@ class PlayerActivity : Activity(), Player.Listener {
         setIntent(intent)
         val newSpec = playbackSpecFromIntent(intent) ?: return
         if (newSpec.uri.isBlank() || isFinishing || isDestroyed) return
+        clearPlaybackQueue()
         resumePlaybackOnForeground = true
         loadMedia(newSpec)
     }
@@ -1654,6 +1692,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun playRecent(index: Int) {
         val recent = recentMedia.getOrNull(index) ?: return
+        clearPlaybackQueue()
         val parsed = Uri.parse(recent.uri)
         val remoteProtocol = when (parsed.scheme?.lowercase(Locale.ROOT)) {
             "sftp" -> RemoteProtocol.SFTP
@@ -1746,7 +1785,9 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun returnToSourceBrowser() {
         val destination = playbackBrowserReturn
+        subtitleDiscoveryGeneration++
         playbackBrowserReturn = null
+        clearPlaybackQueue()
         playbackPopover = PlaybackPopover.NONE
         uiVisible = true
         hoveredButton = null
@@ -2243,6 +2284,7 @@ class PlayerActivity : Activity(), Player.Listener {
         runCatching {
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+        clearPlaybackQueue()
         loadMedia(PlaybackSpec(uri.toString(), uri.lastPathSegment ?: "Video", currentStereoMode))
     }
 
@@ -3096,8 +3138,13 @@ class PlayerActivity : Activity(), Player.Listener {
                         rollbackNavigationOnFailure = true,
                     )
                 } else {
-                    loadMedia(
-                        remotePlaybackSpec(entry),
+                    val selected = remotePlaybackSpec(entry)
+                    startQueuedPlayback(
+                        selected,
+                        sftpEntries.asSequence()
+                            .filterNot { it.isDirectory }
+                            .map(::remotePlaybackSpec)
+                            .toList(),
                         BrowserReturnState.Remote(
                             profile = sftpProfile,
                             path = sftpPath,
@@ -3189,8 +3236,14 @@ class PlayerActivity : Activity(), Player.Listener {
                     )
                     browseSmb(entry.path, rollbackNavigationOnFailure = true)
                 } else {
-                    loadMedia(
-                        smbPlaybackSpec(entry),
+                    val selected = smbPlaybackSpec(entry)
+                    startQueuedPlayback(
+                        selected,
+                        smbBrowserItems.asSequence()
+                            .map { it.entry }
+                            .filterNot { it.isDirectory }
+                            .map(::smbPlaybackSpec)
+                            .toList(),
                         BrowserReturnState.Smb(
                             credentials = smbCredentials,
                             path = smbPath,
@@ -3300,8 +3353,10 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             id.startsWith("video_") -> {
                 val video = localVideos[id.removePrefix("video_").toInt()]
-                loadMedia(
-                    localPlaybackSpec(video),
+                val selected = localPlaybackSpec(video)
+                startQueuedPlayback(
+                    selected,
+                    localBrowserItems.map { localPlaybackSpec(it.video) },
                     BrowserReturnState.Local(
                         folder = requireNotNull(localFolder),
                         scrollOffset = browserScrollOffset,
@@ -3323,6 +3378,8 @@ class PlayerActivity : Activity(), Player.Listener {
                 player.seekTo((player.currentPosition + 10_000L).coerceAtMost(player.duration.coerceAtLeast(0L)))
                 renderVrMenu()
             }
+            id == "previous_video" -> playAdjacentVideo(-1)
+            id == "next_video" -> playAdjacentVideo(1)
             id == "play_pause" -> {
                 if (player.isPlaying) player.pause() else player.play()
                 renderVrMenu()
@@ -4524,8 +4581,9 @@ class PlayerActivity : Activity(), Player.Listener {
             bounds: RectF,
             selected: Boolean = false,
             prominent: Boolean = false,
+            enabled: Boolean = true,
         ) {
-            val hovered = hoveredButton == id
+            val hovered = enabled && hoveredButton == id
             val fill = when {
                 hovered -> colorHover
                 selected -> colorSelected
@@ -4548,11 +4606,16 @@ class PlayerActivity : Activity(), Player.Listener {
             val cy = bounds.centerY()
             val scale = minOf(bounds.width(), bounds.height()) * if (prominent) 0.25f else 0.27f
             val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = if (prominent) colorSurface else colorText
+                color = when {
+                    !enabled -> colorTextMuted
+                    prominent -> colorSurface
+                    else -> colorText
+                }
                 style = Paint.Style.STROKE
                 strokeWidth = 7f
                 strokeCap = Paint.Cap.ROUND
                 strokeJoin = Paint.Join.ROUND
+                alpha = if (enabled) 255 else 90
             }
             val solid = Paint(stroke).apply { style = Paint.Style.FILL }
             when (id) {
@@ -4582,6 +4645,23 @@ class PlayerActivity : Activity(), Player.Listener {
                     }
                     canvas.drawPath(arrow, solid)
                     text("10", cx, cy + 12f, 28f)
+                }
+                "previous_video", "next_video" -> {
+                    val backwards = id == "previous_video"
+                    val direction = if (backwards) -1f else 1f
+                    val barX = cx + direction * scale * 0.82f
+                    canvas.drawLine(
+                        barX, cy - scale * 0.9f,
+                        barX, cy + scale * 0.9f,
+                        stroke,
+                    )
+                    val triangle = Path().apply {
+                        moveTo(cx + direction * scale * 0.56f, cy)
+                        lineTo(cx - direction * scale * 0.48f, cy - scale * 0.82f)
+                        lineTo(cx - direction * scale * 0.48f, cy + scale * 0.82f)
+                        close()
+                    }
+                    canvas.drawPath(triangle, solid)
                 }
                 "play_pause" -> {
                     if (player.isPlaying) {
@@ -4729,7 +4809,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     }
                 }
             }
-            buttons += UiButton(id, label, bounds, selected)
+            if (enabled) buttons += UiButton(id, label, bounds, selected)
         }
 
         fun popoverPanel(bounds: RectF, title: String, anchorX: Float) {
@@ -5736,16 +5816,45 @@ class PlayerActivity : Activity(), Player.Listener {
                         audioSyncMs != 0,
                 )
 
-                // Center: the primary playback controls remain centered independently
-                // of the number or width of controls in the side groups.
-                iconButton("seek_back", "Back 10 seconds", RectF(816f, iconTop, 928f, iconBottom))
+                // Center: previous, seek, playback, seek, and next remain centered as one
+                // aspect-stable group. The immersive toolbar uses a tighter layout.
+                val queueButtonSize = if (compact360) 84f else 104f
+                val seekButtonSize = if (compact360) 96f else 112f
+                val playButtonSize = if (compact360) 128f else 144f
+                val centerGap = if (compact360) 12f else 20f
+                val centerGroupWidth = queueButtonSize * 2f + seekButtonSize * 2f +
+                    playButtonSize + centerGap * 4f
+                var centerX = 1024f - centerGroupWidth / 2f
+                fun centerBounds(size: Float): RectF {
+                    val top = (iconTop + iconBottom - size) / 2f
+                    return RectF(centerX, top, centerX + size, top + size).also {
+                        centerX += size + centerGap
+                    }
+                }
+                iconButton(
+                    "previous_video", "Previous video",
+                    centerBounds(queueButtonSize),
+                    enabled = canPlayPreviousVideo(),
+                )
+                iconButton(
+                    "seek_back", "Back 10 seconds",
+                    centerBounds(seekButtonSize),
+                )
                 iconButton(
                     "play_pause",
                     if (player.isPlaying) "Pause" else "Play",
-                    RectF(952f, 806f, 1096f, 950f),
+                    centerBounds(playButtonSize),
                     prominent = true,
                 )
-                iconButton("seek_forward", "Forward 10 seconds", RectF(1120f, iconTop, 1232f, iconBottom))
+                iconButton(
+                    "seek_forward", "Forward 10 seconds",
+                    centerBounds(seekButtonSize),
+                )
+                iconButton(
+                    "next_video", "Next video",
+                    centerBounds(queueButtonSize),
+                    enabled = canPlayNextVideo(),
+                )
 
                 // Right: presentation and player configuration.
                 iconButton(
