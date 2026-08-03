@@ -81,6 +81,8 @@ class PlayerActivity : Activity(), Player.Listener {
         VideoTransfer.HLG to defaultCinemaTuning(VideoTransfer.HLG),
     )
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
+    private var passthroughEnabled = false
+    private var passthroughBrightness = DEFAULT_PASSTHROUGH_BRIGHTNESS
     private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
     private var adaptiveToneMapEnabled = false
     private var adaptiveToneMapMinNits = DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS
@@ -315,7 +317,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private enum class PlaybackPopover {
         NONE, SUBTITLES, SUBTITLE_APPEARANCE, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
-        ADAPTIVE_HDR, RENDER_QUALITY,
+        ADAPTIVE_HDR, RENDER_QUALITY, ENVIRONMENT,
     }
 
     private enum class PictureMode(val wireValue: Int) {
@@ -523,6 +525,11 @@ class PlayerActivity : Activity(), Player.Listener {
         sceneBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
             .sanitized(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, DEFAULT_SCENE_BRIGHTNESS)
+        passthroughEnabled = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_PASSTHROUGH_ENABLED, false)
+        passthroughBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+            .getFloat(PREF_PASSTHROUGH_BRIGHTNESS, DEFAULT_PASSTHROUGH_BRIGHTNESS)
+            .sanitized(0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS)
         toneMapPeakNits = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
             .sanitized(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX, DEFAULT_TONE_MAP_PEAK_NITS)
@@ -605,6 +612,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         loadCinemaTunings(picturePreferences)
         applyCinemaSettings(persist = false)
+        applyEnvironmentSettings(persist = false)
         loadTextSubtitleAppearance()
         applyTextSubtitleAppearance(persist = false)
         val browserPreferences = getSharedPreferences(BROWSER_PREFS, Context.MODE_PRIVATE)
@@ -3191,7 +3199,8 @@ class PlayerActivity : Activity(), Player.Listener {
         PlaybackPopover.CINEMA,
         PlaybackPopover.COLOR_PIPELINE,
         PlaybackPopover.ADAPTIVE_HDR,
-        PlaybackPopover.RENDER_QUALITY -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
+        PlaybackPopover.RENDER_QUALITY,
+        PlaybackPopover.ENVIRONMENT -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
         PlaybackPopover.NONE -> null
     }
 
@@ -3772,6 +3781,30 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
+            id == "environment" -> {
+                playbackPopover = PlaybackPopover.ENVIRONMENT
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "environment_back" -> {
+                playbackPopover = PlaybackPopover.SETTINGS
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "environment_dark" -> {
+                passthroughEnabled = false
+                applyEnvironmentSettings()
+                renderVrMenu()
+            }
+            id == "environment_passthrough" -> {
+                if (nativeIsPassthroughSupported()) {
+                    passthroughEnabled = true
+                    applyEnvironmentSettings()
+                    renderVrMenu()
+                } else {
+                    showOsd("Passthrough is not available from this OpenXR runtime")
+                }
+            }
             id == "settings_picture" -> {
                 playbackPopover = PlaybackPopover.NONE
                 uiScreen = UiScreen.PICTURE
@@ -4114,6 +4147,10 @@ class PlayerActivity : Activity(), Player.Listener {
                                 .apply()
                         }
                     }
+                    "passthrough_brightness" -> {
+                        passthroughBrightness = fraction
+                        applyEnvironmentSettings(persist)
+                    }
                 }
                 val cinemaSlider =
                     slider == "tone_depth" ||
@@ -4125,7 +4162,8 @@ class PlayerActivity : Activity(), Player.Listener {
                         slider == "adaptive_min" ||
                         slider == "adaptive_max" ||
                         slider == "tone_priority" ||
-                        slider == "resolution_scale"
+                        slider == "resolution_scale" ||
+                        slider == "passthrough_brightness"
                 val adaptiveSlider =
                     slider == "adaptive_min" ||
                         slider == "adaptive_max" ||
@@ -4134,9 +4172,11 @@ class PlayerActivity : Activity(), Player.Listener {
                     applyCinemaSettings(persist)
                 } else if (adaptiveSlider) {
                     applyAdaptiveToneMapping(persist)
-                } else if (slider == "resolution_scale") {
-                    // The panel already explains that restart is required. Keep it open so
-                    // the user can continue dragging or compare nearby scale values.
+                } else if (
+                    slider == "resolution_scale" || slider == "passthrough_brightness"
+                ) {
+                    // These global controls were already applied above. Keep their panel open
+                    // so the user can continue dragging or compare nearby values.
                 } else {
                     applyPictureSettings(persist && !globalOnlySlider)
                 }
@@ -4186,6 +4226,10 @@ class PlayerActivity : Activity(), Player.Listener {
                             .putFloat(PREF_SCENE_BRIGHTNESS, sceneBrightness)
                             .apply()
                     }
+                    "passthrough_brightness" -> {
+                        passthroughBrightness = DEFAULT_PASSTHROUGH_BRIGHTNESS
+                        applyEnvironmentSettings()
+                    }
                     "resolution_scale" -> {
                         renderResolutionScale = DEFAULT_RENDER_RESOLUTION_SCALE
                         getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
@@ -4212,7 +4256,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     applyAdaptiveToneMapping()
                 } else if (cinemaSlider) {
                     applyCinemaSettings()
-                } else if (slider == "resolution_scale") {
+                } else if (slider == "resolution_scale" || slider == "passthrough_brightness") {
                     // Keep the render-quality panel open after resetting this slider.
                 } else {
                     applyPictureSettings(
@@ -6381,6 +6425,8 @@ class PlayerActivity : Activity(), Player.Listener {
                         playbackPopover == PlaybackPopover.COLOR_PIPELINE ||
                         playbackPopover == PlaybackPopover.ADAPTIVE_HDR ||
                         playbackPopover == PlaybackPopover.RENDER_QUALITY ||
+                        playbackPopover == PlaybackPopover.ENVIRONMENT ||
+                        passthroughEnabled ||
                         pictureMode != PictureMode.AUTO ||
                         pictureBrightness != DEFAULT_PICTURE_BRIGHTNESS ||
                         pictureExposure != defaultExposureForCurrentColorMode() ||
@@ -6868,39 +6914,37 @@ class PlayerActivity : Activity(), Player.Listener {
                             506f,
                             logarithmic = true,
                         )
-                        compactSettingsSlider(
-                            "settings_slider_scene", "Scene brightness",
-                            "%.0f%%".format(Locale.US, sceneBrightness * 100f),
-                            sceneBrightness,
-                            SCENE_BRIGHTNESS_MIN,
-                            SCENE_BRIGHTNESS_MAX,
-                            566f,
-                        )
                         button(
                             "cinema_tune", "Tune",
-                            RectF(975f, 605f, 1137f, 660f),
+                            RectF(975f, 605f, 1113f, 660f),
                             fontSize = 17f,
                         )
                         button(
                             "color_pipeline", "HDR / gamut",
-                            RectF(1147f, 605f, 1309f, 660f),
+                            RectF(1123f, 605f, 1261f, 660f),
                             fontSize = 16f,
                         )
                         button(
                             "adaptive_hdr", "Adaptive HDR",
-                            RectF(1319f, 605f, 1481f, 660f),
+                            RectF(1271f, 605f, 1409f, 660f),
                             adaptiveToneMapEnabled,
-                            fontSize = 16f,
+                            fontSize = 15f,
                         )
                         button(
                             "render_quality", "Resolution",
-                            RectF(1491f, 605f, 1653f, 660f),
+                            RectF(1419f, 605f, 1557f, 660f),
                             fontSize = 16f,
                         )
                         button(
+                            "environment", if (passthroughEnabled) "Passthrough" else "Environment",
+                            RectF(1567f, 605f, 1705f, 660f),
+                            passthroughEnabled,
+                            fontSize = 15f,
+                        )
+                        button(
                             "picture_reset", "Reset sliders",
-                            RectF(1663f, 605f, 1860f, 660f),
-                            fontSize = 16f,
+                            RectF(1715f, 605f, 1860f, 660f),
+                            fontSize = 14f,
                         )
                     }
                     PlaybackPopover.CINEMA -> {
@@ -7160,6 +7204,51 @@ class PlayerActivity : Activity(), Player.Listener {
                         )
                         button(
                             "render_quality_back", "Back",
+                            RectF(1530f, 590f, 1860f, 650f),
+                            fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.ENVIRONMENT -> {
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Environment", 1814f)
+                        text(
+                            "Choose the space around the movie screen.",
+                            975f, 132f, 21f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "environment_dark", "Dark",
+                            RectF(1120f, 170f, 1478f, 230f),
+                            !passthroughEnabled,
+                            fontSize = 22f,
+                        )
+                        button(
+                            "environment_passthrough", "Passthrough",
+                            RectF(1490f, 170f, 1860f, 230f),
+                            passthroughEnabled,
+                            fontSize = 22f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_scene", "Dark scene brightness",
+                            "%.0f%%".format(Locale.US, sceneBrightness * 100f),
+                            sceneBrightness,
+                            SCENE_BRIGHTNESS_MIN,
+                            SCENE_BRIGHTNESS_MAX,
+                            335f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_passthrough_brightness", "Passthrough brightness",
+                            "%.0f%%".format(Locale.US, passthroughBrightness * 100f),
+                            passthroughBrightness,
+                            0f,
+                            1f,
+                            435f,
+                        )
+                        text(
+                            "Passthrough is global and does not change movie picture settings.",
+                            975f, 535f, 20f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "environment_back", "Back",
                             RectF(1530f, 590f, 1860f, 650f),
                             fontSize = 22f,
                         )
@@ -7604,6 +7693,19 @@ class PlayerActivity : Activity(), Player.Listener {
         }
     }
 
+    private fun applyEnvironmentSettings(persist: Boolean = true) {
+        passthroughBrightness = passthroughBrightness.sanitized(
+            0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS,
+        )
+        nativeSetPassthrough(passthroughEnabled, passthroughBrightness)
+        if (persist) {
+            getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(PREF_PASSTHROUGH_ENABLED, passthroughEnabled)
+                .putFloat(PREF_PASSTHROUGH_BRIGHTNESS, passthroughBrightness)
+                .apply()
+        }
+    }
+
     private fun applyAdaptiveToneMapping(persist: Boolean = true) {
         adaptiveToneMapMinNits = adaptiveToneMapMinNits.sanitized(
             ADAPTIVE_TONE_MAP_NITS_MIN,
@@ -7902,6 +8004,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_BROWSER_SORT_FIELD = "sort-field"
         private const val PREF_BROWSER_SORT_ASCENDING = "sort-ascending"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
+        private const val PREF_PASSTHROUGH_ENABLED = "passthrough-enabled"
+        private const val PREF_PASSTHROUGH_BRIGHTNESS = "passthrough-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
         private const val PREF_ADAPTIVE_TONE_MAP_MIN_NITS = "adaptive-tone-map-min-nits"
@@ -7923,6 +8027,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_SATURATION = 1f
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
+        private const val DEFAULT_PASSTHROUGH_BRIGHTNESS = 1f
         private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
         private const val DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS = 100f
         private const val DEFAULT_ADAPTIVE_TONE_MAP_MAX_NITS = 600f
@@ -8034,6 +8139,8 @@ class PlayerActivity : Activity(), Player.Listener {
             renderResolutionScale: Float,
         )
         @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
+        @JvmStatic private external fun nativeSetPassthrough(enabled: Boolean, brightness: Float)
+        @JvmStatic private external fun nativeIsPassthroughSupported(): Boolean
         @JvmStatic private external fun nativeRequestStop()
         @JvmStatic private external fun nativeSetVideoAspect(aspect: Float)
         @JvmStatic private external fun nativeSetScreenTransform(x: Float, y: Float, z: Float, halfHeight: Float)

@@ -67,6 +67,9 @@ std::atomic<float> gHdrMaxFallNits{0.0f};
 // 0 = legacy hard clip, 1 = luminance/hue-direction preserving compression.
 std::atomic<int> gGamutMappingMode{0};
 std::atomic<float> gSceneBrightness{0.5f};
+std::atomic<bool> gPassthroughRequested{false};
+std::atomic<float> gPassthroughBrightness{1.0f};
+std::atomic<bool> gPassthroughSupported{false};
 std::atomic<bool> gSwapEyes{false};
 std::atomic<float> gScreenX{0.0f};
 std::atomic<float> gScreenY{0.0f};
@@ -633,6 +636,21 @@ private:
     XrInstance instance_ = XR_NULL_HANDLE;
     XrSystemId systemId_ = XR_NULL_SYSTEM_ID;
     XrSession session_ = XR_NULL_HANDLE;
+    XrPassthroughFB passthrough_ = XR_NULL_HANDLE;
+    XrPassthroughLayerFB passthroughLayer_ = XR_NULL_HANDLE;
+    PFN_xrCreatePassthroughFB createPassthrough_ = nullptr;
+    PFN_xrDestroyPassthroughFB destroyPassthrough_ = nullptr;
+    PFN_xrPassthroughStartFB startPassthrough_ = nullptr;
+    PFN_xrPassthroughPauseFB pausePassthrough_ = nullptr;
+    PFN_xrCreatePassthroughLayerFB createPassthroughLayer_ = nullptr;
+    PFN_xrDestroyPassthroughLayerFB destroyPassthroughLayer_ = nullptr;
+    PFN_xrPassthroughLayerPauseFB pausePassthroughLayer_ = nullptr;
+    PFN_xrPassthroughLayerResumeFB resumePassthroughLayer_ = nullptr;
+    PFN_xrPassthroughLayerSetStyleFB setPassthroughStyle_ = nullptr;
+    bool passthroughExtensionAvailable_ = false;
+    bool alphaBlendSupported_ = false;
+    bool fbPassthroughUsable_ = false;
+    bool passthroughRunning_ = false;
     XrSpace space_ = XR_NULL_HANDLE;
     XrActionSet actionSet_ = XR_NULL_HANDLE;
     XrAction aimAction_ = XR_NULL_HANDLE;
@@ -720,10 +738,34 @@ private:
         checkXr(initializeLoader(reinterpret_cast<XrLoaderInitInfoBaseHeaderKHR*>(&loaderInfo)),
                 "xrInitializeLoaderKHR");
 
-        const char* extensions[] = {
+        uint32_t extensionCount = 0;
+        checkXr(
+            xrEnumerateInstanceExtensionProperties(
+                nullptr, 0, &extensionCount, nullptr),
+            "xrEnumerateInstanceExtensionProperties(count)");
+        std::vector<XrExtensionProperties> availableExtensions(
+            extensionCount, {XR_TYPE_EXTENSION_PROPERTIES});
+        checkXr(
+            xrEnumerateInstanceExtensionProperties(
+                nullptr,
+                extensionCount,
+                &extensionCount,
+                availableExtensions.data()),
+            "xrEnumerateInstanceExtensionProperties(list)");
+        passthroughExtensionAvailable_ = std::any_of(
+            availableExtensions.begin(), availableExtensions.end(),
+            [](const XrExtensionProperties& extension) {
+                return std::strcmp(
+                    extension.extensionName,
+                    XR_FB_PASSTHROUGH_EXTENSION_NAME) == 0;
+            });
+        std::vector<const char*> extensions{
             XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
             XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
         };
+        if (passthroughExtensionAvailable_) {
+            extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
+        }
         XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
         androidInfo.applicationVM = vm;
         androidInfo.applicationActivity = activity_;
@@ -736,13 +778,37 @@ private:
                      XR_MAX_ENGINE_NAME_SIZE - 1);
         createInfo.applicationInfo.engineVersion = 1;
         createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-        createInfo.enabledExtensionCount = 2;
-        createInfo.enabledExtensionNames = extensions;
+        createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+        createInfo.enabledExtensionNames = extensions.data();
         checkXr(xrCreateInstance(&createInfo, &instance_), "xrCreateInstance");
 
         XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
         systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         checkXr(xrGetSystem(instance_, &systemInfo, &systemId_), "xrGetSystem");
+
+        uint32_t blendModeCount = 0;
+        checkXr(
+            xrEnumerateEnvironmentBlendModes(
+                instance_,
+                systemId_,
+                XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                0,
+                &blendModeCount,
+                nullptr),
+            "xrEnumerateEnvironmentBlendModes(count)");
+        std::vector<XrEnvironmentBlendMode> blendModes(blendModeCount);
+        checkXr(
+            xrEnumerateEnvironmentBlendModes(
+                instance_,
+                systemId_,
+                XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                blendModeCount,
+                &blendModeCount,
+                blendModes.data()),
+            "xrEnumerateEnvironmentBlendModes(list)");
+        alphaBlendSupported_ = std::find(
+            blendModes.begin(), blendModes.end(),
+            XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) != blendModes.end();
 
         PFN_xrGetOpenGLESGraphicsRequirementsKHR requirementsFn = nullptr;
         checkXr(xrGetInstanceProcAddr(instance_, "xrGetOpenGLESGraphicsRequirementsKHR",
@@ -758,6 +824,7 @@ private:
         sessionInfo.next = &graphicsBinding;
         sessionInfo.systemId = systemId_;
         checkXr(xrCreateSession(instance_, &sessionInfo, &session_), "xrCreateSession");
+        initializePassthrough();
 
         XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -774,6 +841,105 @@ private:
             "enumerate views");
         views_.assign(count, {XR_TYPE_VIEW});
         createSwapchains();
+    }
+
+    template <typename Function>
+    bool loadOptionalFunction(const char* name, Function& function) {
+        return XR_SUCCEEDED(xrGetInstanceProcAddr(
+            instance_, name,
+            reinterpret_cast<PFN_xrVoidFunction*>(&function))) && function != nullptr;
+    }
+
+    void initializePassthrough() {
+        gPassthroughSupported.store(false);
+        if (!passthroughExtensionAvailable_) {
+            gPassthroughSupported.store(alphaBlendSupported_);
+            return;
+        }
+        const bool loaded =
+            loadOptionalFunction("xrCreatePassthroughFB", createPassthrough_) &&
+            loadOptionalFunction("xrDestroyPassthroughFB", destroyPassthrough_) &&
+            loadOptionalFunction("xrPassthroughStartFB", startPassthrough_) &&
+            loadOptionalFunction("xrPassthroughPauseFB", pausePassthrough_) &&
+            loadOptionalFunction("xrCreatePassthroughLayerFB", createPassthroughLayer_) &&
+            loadOptionalFunction("xrDestroyPassthroughLayerFB", destroyPassthroughLayer_) &&
+            loadOptionalFunction("xrPassthroughLayerPauseFB", pausePassthroughLayer_) &&
+            loadOptionalFunction("xrPassthroughLayerResumeFB", resumePassthroughLayer_) &&
+            loadOptionalFunction("xrPassthroughLayerSetStyleFB", setPassthroughStyle_);
+        if (!loaded) {
+            LOGE("OpenXR passthrough functions are incomplete; using alpha fallback");
+            gPassthroughSupported.store(alphaBlendSupported_);
+            return;
+        }
+
+        XrSystemPassthroughPropertiesFB passthroughProperties{
+            XR_TYPE_SYSTEM_PASSTHROUGH_PROPERTIES_FB};
+        XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
+        systemProperties.next = &passthroughProperties;
+        const XrResult propertiesResult = xrGetSystemProperties(
+            instance_, systemId_, &systemProperties);
+        if (XR_FAILED(propertiesResult) || !passthroughProperties.supportsPassthrough) {
+            LOGE("OpenXR runtime reports passthrough unavailable; using alpha fallback");
+            gPassthroughSupported.store(alphaBlendSupported_);
+            return;
+        }
+
+        XrPassthroughCreateInfoFB passthroughInfo{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
+        XrResult result = createPassthrough_(session_, &passthroughInfo, &passthrough_);
+        if (XR_FAILED(result)) {
+            LOGE("xrCreatePassthroughFB failed: %d", result);
+            passthrough_ = XR_NULL_HANDLE;
+            gPassthroughSupported.store(alphaBlendSupported_);
+            return;
+        }
+        XrPassthroughLayerCreateInfoFB layerInfo{
+            XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB};
+        layerInfo.passthrough = passthrough_;
+        layerInfo.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
+        result = createPassthroughLayer_(session_, &layerInfo, &passthroughLayer_);
+        if (XR_FAILED(result)) {
+            LOGE("xrCreatePassthroughLayerFB failed: %d", result);
+            destroyPassthrough_(passthrough_);
+            passthrough_ = XR_NULL_HANDLE;
+            passthroughLayer_ = XR_NULL_HANDLE;
+            gPassthroughSupported.store(alphaBlendSupported_);
+            return;
+        }
+        XrPassthroughStyleFB style{XR_TYPE_PASSTHROUGH_STYLE_FB};
+        style.textureOpacityFactor = 1.0f;
+        style.edgeColor = {0.0f, 0.0f, 0.0f, 0.0f};
+        setPassthroughStyle_(passthroughLayer_, &style);
+        fbPassthroughUsable_ = true;
+        gPassthroughSupported.store(true);
+        LOGI("OpenXR passthrough initialized");
+    }
+
+    bool updatePassthroughState() {
+        const bool requested = gPassthroughRequested.load() && gPassthroughSupported.load();
+        if (!fbPassthroughUsable_ || !passthrough_ || !passthroughLayer_) {
+            return requested && alphaBlendSupported_;
+        }
+        if (requested == passthroughRunning_) return requested;
+        XrResult result = XR_SUCCESS;
+        if (requested) {
+            result = startPassthrough_(passthrough_);
+            if (XR_SUCCEEDED(result)) result = resumePassthroughLayer_(passthroughLayer_);
+        } else {
+            result = pausePassthroughLayer_(passthroughLayer_);
+            const XrResult pauseResult = pausePassthrough_(passthrough_);
+            if (XR_SUCCEEDED(result)) result = pauseResult;
+        }
+        if (XR_FAILED(result)) {
+            LOGE("OpenXR passthrough state change failed: %d", result);
+            if (requested) {
+                fbPassthroughUsable_ = false;
+                gPassthroughSupported.store(alphaBlendSupported_);
+                return alphaBlendSupported_;
+            }
+        } else {
+            passthroughRunning_ = requested;
+        }
+        return requested && (passthroughRunning_ || alphaBlendSupported_);
     }
 
     XrPath path(const char* value) {
@@ -2048,7 +2214,13 @@ private:
 
         std::vector<XrCompositionLayerProjectionView> projectionViews;
         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        const XrCompositionLayerBaseHeader* layers[1]{};
+        XrCompositionLayerPassthroughFB passthroughComposition{
+            XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
+        const XrCompositionLayerBaseHeader* layers[2]{};
+        uint32_t layerCount = 0;
+        const bool passthroughActive = updatePassthroughState();
+        const bool explicitPassthrough =
+            passthroughActive && fbPassthroughUsable_ && passthroughLayer_;
         if (state.shouldRender && gResumed.load()) {
             XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
             locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -2067,7 +2239,7 @@ private:
             uploadSubtitleIfNeeded();
             projectionViews.resize(count, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
             for (uint32_t eye = 0; eye < count; ++eye) {
-                renderEye(eye, views_[eye]);
+                renderEye(eye, views_[eye], passthroughActive);
                 auto& view = projectionViews[eye];
                 view.pose = views_[eye].pose;
                 view.fov = views_[eye].fov;
@@ -2076,20 +2248,31 @@ private:
                 view.subImage.imageArrayIndex = 0;
             }
             layer.space = space_;
+            if (passthroughActive) {
+                layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            }
             layer.viewCount = count;
             layer.views = projectionViews.data();
-            layers[0] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
+            if (explicitPassthrough) {
+                passthroughComposition.layerHandle = passthroughLayer_;
+                layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(
+                    &passthroughComposition);
+            }
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
         }
 
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = state.predictedDisplayTime;
-        end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        end.layerCount = layers[0] ? 1u : 0u;
-        end.layers = layers[0] ? layers : nullptr;
+        end.environmentBlendMode =
+            passthroughActive && !explicitPassthrough
+                ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        end.layerCount = layerCount;
+        end.layers = layerCount > 0 ? layers : nullptr;
         checkXr(xrEndFrame(session_, &end), "xrEndFrame");
     }
 
-    void renderEye(uint32_t eye, const XrView& view) {
+    void renderEye(uint32_t eye, const XrView& view, bool passthroughActive) {
         auto& chain = swapchains_[eye];
         uint32_t imageIndex = 0;
         XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -2102,12 +2285,18 @@ private:
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                chain.images[imageIndex].image, 0);
         glViewport(0, 0, chain.width, chain.height);
-        const float sceneBrightness = gSceneBrightness.load();
-        glClearColor(
-            0.018f * sceneBrightness,
-            0.024f * sceneBrightness,
-            0.035f * sceneBrightness,
-            1.0f);
+        if (passthroughActive) {
+            const float dimmingAlpha = 1.0f - std::clamp(
+                gPassthroughBrightness.load(), 0.0f, 1.0f);
+            glClearColor(0.0f, 0.0f, 0.0f, dimmingAlpha);
+        } else {
+            const float sceneBrightness = gSceneBrightness.load();
+            glClearColor(
+                0.018f * sceneBrightness,
+                0.024f * sceneBrightness,
+                0.035f * sceneBrightness,
+                1.0f);
+        }
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
 
@@ -2620,6 +2809,20 @@ private:
         if (shutdownComplete_) return;
         shutdownComplete_ = true;
         videoSurface_.destroy(env_);
+        gPassthroughSupported.store(false);
+        if (passthroughRunning_ && passthroughLayer_ && pausePassthroughLayer_) {
+            pausePassthroughLayer_(passthroughLayer_);
+        }
+        if (passthroughRunning_ && passthrough_ && pausePassthrough_) {
+            pausePassthrough_(passthrough_);
+        }
+        passthroughRunning_ = false;
+        if (passthroughLayer_ && destroyPassthroughLayer_) {
+            destroyPassthroughLayer_(passthroughLayer_);
+        }
+        if (passthrough_ && destroyPassthrough_) destroyPassthrough_(passthrough_);
+        passthroughLayer_ = XR_NULL_HANDLE;
+        passthrough_ = XR_NULL_HANDLE;
         if (sessionRunning_ && session_) xrEndSession(session_);
         sessionRunning_ = false;
         for (auto& chain : swapchains_) if (chain.handle) xrDestroySwapchain(chain.handle);
@@ -2694,6 +2897,20 @@ Java_dev_dreamplayer_PlayerActivity_nativeRun(
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetResumed(JNIEnv*, jclass, jboolean resumed) {
     gResumed.store(resumed == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetPassthrough(
+        JNIEnv*, jclass, jboolean enabled, jfloat brightness) {
+    gPassthroughRequested.store(enabled == JNI_TRUE);
+    if (std::isfinite(brightness)) {
+        gPassthroughBrightness.store(std::clamp(brightness, 0.0f, 1.0f));
+    }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeIsPassthroughSupported(JNIEnv*, jclass) {
+    return gPassthroughSupported.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
