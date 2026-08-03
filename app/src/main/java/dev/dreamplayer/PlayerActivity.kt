@@ -120,6 +120,9 @@ class PlayerActivity : Activity(), Player.Listener {
     private var audioChoiceIndex = 0
     private var pendingAudioFingerprint: String? = null
     private var osdGeneration = 0
+    private var nowPlayingGeneration = 0
+    private var nowPlayingTitle: String? = null
+    private var pendingNowPlayingUri: String? = null
     private var videoSurface: Surface? = null
     private var mediaLoaded = false
     private var playbackCompleted = false
@@ -1304,6 +1307,9 @@ class PlayerActivity : Activity(), Player.Listener {
         autoSoftwareFallback: Boolean = false,
         decoderModeOverride: DecoderMode? = null,
     ) {
+        if (!mediaLoaded || spec.uri != newSpec.uri) {
+            pendingNowPlayingUri = newSpec.uri
+        }
         if (spec.uri != newSpec.uri) {
             remoteRecoveryAttempts = 0
             remotePlaybackStableAtMs = 0L
@@ -1961,6 +1967,9 @@ class PlayerActivity : Activity(), Player.Listener {
         subtitleDiscoveryGeneration++
         playbackBrowserReturn = null
         clearPlaybackQueue()
+        pendingNowPlayingUri = null
+        nowPlayingTitle = null
+        nowPlayingGeneration++
         playbackPopover = PlaybackPopover.NONE
         uiVisible = true
         hoveredButton = null
@@ -2607,6 +2616,14 @@ class PlayerActivity : Activity(), Player.Listener {
             mediaStateStore.markPlayed(spec)
             currentMediaMarkedPlayed = true
         }
+        if (
+            playbackState == Player.STATE_READY &&
+            mediaLoaded &&
+            pendingNowPlayingUri == spec.uri
+        ) {
+            pendingNowPlayingUri = null
+            showNowPlaying(spec.title)
+        }
         if (playbackState == Player.STATE_ENDED && mediaLoaded) {
             playbackCompleted = true
             saveCurrentMediaState(positionOverrideMs = 0L)
@@ -3109,6 +3126,26 @@ class PlayerActivity : Activity(), Player.Listener {
                 if (uiVisible) renderVrMenu()
             }
         }, durationMs)
+    }
+
+    private fun showNowPlaying(title: String) {
+        nowPlayingTitle = title
+        showControls(NOW_PLAYING_DURATION_MS)
+        val generation = ++nowPlayingGeneration
+        mainHandler.postDelayed({
+            if (nowPlayingGeneration == generation) {
+                nowPlayingTitle = null
+                if (uiVisible) renderVrMenu()
+            }
+        }, NOW_PLAYING_DURATION_MS)
+    }
+
+    private fun middleEllipsize(value: String, maximumCharacters: Int): String {
+        if (value.length <= maximumCharacters || maximumCharacters < 5) return value
+        val available = maximumCharacters - 1
+        val startLength = (available + 1) / 2
+        val endLength = available - startLength
+        return value.take(startLength) + "…" + value.takeLast(endLength)
     }
 
     private fun openBrowserSearch() {
@@ -5937,6 +5974,13 @@ class PlayerActivity : Activity(), Player.Listener {
                 val toolbarBounds = playbackToolbarBounds()
                 val sideInset = if (compact360) 100f else 0f
                 canvas.drawRoundRect(toolbarBounds, 34f, 34f, panelPaint)
+                text(
+                    middleEllipsize(spec.title, if (compact360) 58 else 76),
+                    1024f,
+                    730f,
+                    if (compact360) 22f else 24f,
+                    color = Color.rgb(126, 151, 170),
+                )
                 val duration = player.duration.takeIf { it > 0 } ?: 0L
                 val fraction = if (duration > 0) player.currentPosition.toFloat() / duration else 0f
                 val seekLeft = playbackSeekLeft()
@@ -6901,6 +6945,35 @@ class PlayerActivity : Activity(), Player.Listener {
             browserSortPopover()
         }
 
+        if (uiScreen == UiScreen.PLAYBACK) {
+            nowPlayingTitle?.let { title ->
+                val toolbar = playbackToolbarBounds()
+                val compact = currentProjection == VideoProjection.EQUIRECTANGULAR_360
+                val halfWidth = if (compact) 500f else 650f
+                val top = toolbar.top - 66f
+                val bottom = toolbar.top - 14f
+                canvas.drawRoundRect(
+                    1024f - halfWidth,
+                    top,
+                    1024f + halfWidth,
+                    bottom,
+                    18f,
+                    18f,
+                    Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.argb(178, 4, 13, 21)
+                    },
+                )
+                text(
+                    "Now playing  •  " +
+                        middleEllipsize(title, if (compact) 52 else 72),
+                    1024f,
+                    bottom - 15f,
+                    if (compact) 23f else 25f,
+                    color = Color.rgb(145, 168, 185),
+                )
+            }
+        }
+
         transientMessage?.let {
             canvas.drawRoundRect(280f, 35f, 1768f, 115f, 24f, 24f,
                 Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(245, 91, 31, 39) })
@@ -7420,6 +7493,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PLAYBACK_SEEK_360_LEFT = 420f
         private const val PLAYBACK_SEEK_360_RIGHT = 1628f
         private const val PLAYBACK_AUTO_HIDE_MS = 8_000L
+        private const val NOW_PLAYING_DURATION_MS = 4_000L
         private const val STATE_SAVE_INTERVAL_MS = 5_000L
         private const val AUTO_FALLBACK_RATIO_MIN = 1.55
         private const val AUTO_FALLBACK_RATIO_MAX = 2.45
