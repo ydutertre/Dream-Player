@@ -4370,10 +4370,6 @@ class PlayerActivity : Activity(), Player.Listener {
         audioSyncMs = adjusted
         audioSyncProcessor.setDelayMs(adjusted)
         mediaStateStore.saveAudioSync(spec, adjusted)
-        // Re-seeking flushes the PCM processor so the new offset starts at a
-        // clean media boundary instead of changing halfway through a buffer.
-        val position = player.currentPosition
-        player.seekTo(position)
         Log.i("DreamPlayerAudio", "Audio sync set to ${adjusted}ms")
     }
 
