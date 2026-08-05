@@ -81,7 +81,13 @@ class PlayerActivity : Activity(), Player.Listener {
         VideoTransfer.HLG to defaultCinemaTuning(VideoTransfer.HLG),
     )
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
-    private var passthroughEnabled = false
+    private var environmentMode = EnvironmentMode.VOID
+    private var theaterBrightness = DEFAULT_THEATER_BRIGHTNESS
+    private var theaterImageOffsetX = 0f
+    private var theaterImageOffsetY = 0f
+    private var theaterImageHalfHeight = DEFAULT_THEATER_IMAGE_HALF_HEIGHT
+    private var theaterSeatRow = DEFAULT_THEATER_SEAT_ROW
+    private var theaterSeatColumn = DEFAULT_THEATER_SEAT_COLUMN
     private var passthroughBrightness = DEFAULT_PASSTHROUGH_BRIGHTNESS
     private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
     private var adaptiveToneMapEnabled = false
@@ -317,7 +323,16 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private enum class PlaybackPopover {
         NONE, SUBTITLES, SUBTITLE_APPEARANCE, AUDIO, PROJECTION, SETTINGS, CINEMA, COLOR_PIPELINE,
-        ADAPTIVE_HDR, RENDER_QUALITY, ENVIRONMENT,
+        ADAPTIVE_HDR, RENDER_QUALITY, ENVIRONMENT, THEATER,
+    }
+
+    private enum class EnvironmentMode(val wireValue: Int) {
+        VOID(0), THEATER(1), PASSTHROUGH(2);
+
+        companion object {
+            fun fromWire(value: Int): EnvironmentMode =
+                entries.firstOrNull { it.wireValue == value } ?: VOID
+        }
     }
 
     private enum class PictureMode(val wireValue: Int) {
@@ -522,18 +537,85 @@ class PlayerActivity : Activity(), Player.Listener {
         sftpProfileStore = SftpProfileStore(this)
         sftpProfiles = sftpProfileStore.load()
         mediaStateStore = MediaStateStore(this)
-        sceneBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        if (!picturePreferences.getBoolean(PREF_THEATER_LARGE_AUDITORIUM_MIGRATED, false)) {
+            val migration = picturePreferences.edit()
+            if (picturePreferences.contains(PREF_THEATER_IMAGE_HALF_HEIGHT)) {
+                migration.putFloat(
+                    PREF_THEATER_IMAGE_HALF_HEIGHT,
+                    (picturePreferences.getFloat(
+                        PREF_THEATER_IMAGE_HALF_HEIGHT,
+                        1f,
+                    ) * THEATER_LARGE_AUDITORIUM_SCALE).coerceIn(
+                        THEATER_IMAGE_HALF_HEIGHT_MIN,
+                        THEATER_IMAGE_HALF_HEIGHT_MAX,
+                    ),
+                )
+            }
+            if (picturePreferences.contains(PREF_THEATER_IMAGE_OFFSET_X)) {
+                migration.putFloat(
+                    PREF_THEATER_IMAGE_OFFSET_X,
+                    (picturePreferences.getFloat(PREF_THEATER_IMAGE_OFFSET_X, 0f) *
+                        THEATER_LARGE_AUDITORIUM_SCALE).coerceIn(
+                        -THEATER_MAX_OFFSET,
+                        THEATER_MAX_OFFSET,
+                    ),
+                )
+            }
+            if (picturePreferences.contains(PREF_THEATER_IMAGE_OFFSET_Y)) {
+                migration.putFloat(
+                    PREF_THEATER_IMAGE_OFFSET_Y,
+                    (picturePreferences.getFloat(PREF_THEATER_IMAGE_OFFSET_Y, 0f) *
+                        THEATER_LARGE_AUDITORIUM_SCALE).coerceIn(
+                        -THEATER_MAX_OFFSET,
+                        THEATER_MAX_OFFSET,
+                    ),
+                )
+            }
+            migration
+                .putBoolean(PREF_THEATER_LARGE_AUDITORIUM_MIGRATED, true)
+                .apply()
+        }
+        sceneBrightness = picturePreferences
             .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
             .sanitized(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, DEFAULT_SCENE_BRIGHTNESS)
-        passthroughEnabled = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
-            .getBoolean(PREF_PASSTHROUGH_ENABLED, false)
-        passthroughBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        environmentMode = if (picturePreferences.contains(PREF_ENVIRONMENT_MODE)) {
+            EnvironmentMode.fromWire(
+                picturePreferences.getInt(PREF_ENVIRONMENT_MODE, EnvironmentMode.VOID.wireValue)
+            )
+        } else if (picturePreferences.getBoolean(PREF_PASSTHROUGH_ENABLED, false)) {
+            EnvironmentMode.PASSTHROUGH
+        } else {
+            EnvironmentMode.VOID
+        }
+        theaterBrightness = picturePreferences
+            .getFloat(PREF_THEATER_BRIGHTNESS, DEFAULT_THEATER_BRIGHTNESS)
+            .sanitized(0f, 1f, DEFAULT_THEATER_BRIGHTNESS)
+        theaterImageOffsetX = picturePreferences
+            .getFloat(PREF_THEATER_IMAGE_OFFSET_X, 0f)
+            .sanitized(-THEATER_MAX_OFFSET, THEATER_MAX_OFFSET, 0f)
+        theaterImageOffsetY = picturePreferences
+            .getFloat(PREF_THEATER_IMAGE_OFFSET_Y, 0f)
+            .sanitized(-THEATER_MAX_OFFSET, THEATER_MAX_OFFSET, 0f)
+        theaterImageHalfHeight = picturePreferences
+            .getFloat(PREF_THEATER_IMAGE_HALF_HEIGHT, DEFAULT_THEATER_IMAGE_HALF_HEIGHT)
+            .sanitized(
+                THEATER_IMAGE_HALF_HEIGHT_MIN,
+                THEATER_IMAGE_HALF_HEIGHT_MAX,
+                DEFAULT_THEATER_IMAGE_HALF_HEIGHT,
+            )
+        theaterSeatRow = picturePreferences
+            .getInt(PREF_THEATER_SEAT_ROW, DEFAULT_THEATER_SEAT_ROW)
+            .coerceIn(0, 2)
+        theaterSeatColumn = picturePreferences
+            .getInt(PREF_THEATER_SEAT_COLUMN, DEFAULT_THEATER_SEAT_COLUMN)
+            .coerceIn(-1, 1)
+        passthroughBrightness = picturePreferences
             .getFloat(PREF_PASSTHROUGH_BRIGHTNESS, DEFAULT_PASSTHROUGH_BRIGHTNESS)
             .sanitized(0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS)
         toneMapPeakNits = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_TONE_MAP_PEAK_NITS, DEFAULT_TONE_MAP_PEAK_NITS)
             .sanitized(TONE_MAP_PEAK_NITS_MIN, TONE_MAP_PEAK_NITS_MAX, DEFAULT_TONE_MAP_PEAK_NITS)
-        val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
         adaptiveToneMapEnabled =
             picturePreferences.getBoolean(PREF_ADAPTIVE_TONE_MAP_ENABLED, false)
         adaptiveToneMapMinNits = picturePreferences
@@ -3200,7 +3282,8 @@ class PlayerActivity : Activity(), Player.Listener {
         PlaybackPopover.COLOR_PIPELINE,
         PlaybackPopover.ADAPTIVE_HDR,
         PlaybackPopover.RENDER_QUALITY,
-        PlaybackPopover.ENVIRONMENT -> PLAYBACK_SETTINGS_POPOVER_BOUNDS
+        PlaybackPopover.ENVIRONMENT, PlaybackPopover.THEATER ->
+            PLAYBACK_SETTINGS_POPOVER_BOUNDS
         PlaybackPopover.NONE -> null
     }
 
@@ -3782,6 +3865,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 renderVrMenu()
             }
             id == "environment" -> {
+                readTheaterTransformFromNative()
                 playbackPopover = PlaybackPopover.ENVIRONMENT
                 hoveredButton = null
                 renderVrMenu()
@@ -3791,19 +3875,57 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
-            id == "environment_dark" -> {
-                passthroughEnabled = false
+            id == "environment_void" -> {
+                environmentMode = EnvironmentMode.VOID
+                applyEnvironmentSettings()
+                renderVrMenu()
+            }
+            id == "theater_controls" -> {
+                readTheaterTransformFromNative()
+                playbackPopover = PlaybackPopover.THEATER
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "theater_back" -> {
+                playbackPopover = PlaybackPopover.ENVIRONMENT
+                hoveredButton = null
+                renderVrMenu()
+            }
+            id == "theater_recenter" -> {
+                nativeRecenterTheater()
+                renderVrMenu()
+            }
+            id.startsWith("theater_seat_") -> {
+                val parts = id.removePrefix("theater_seat_").split('_')
+                if (parts.size == 2) {
+                    theaterSeatRow = parts[0].toIntOrNull()?.coerceIn(0, 2)
+                        ?: theaterSeatRow
+                    theaterSeatColumn = parts[1].toIntOrNull()?.coerceIn(-1, 1)
+                        ?: theaterSeatColumn
+                    applyEnvironmentSettings()
+                    renderVrMenu()
+                }
+            }
+            id == "environment_theater" -> {
+                environmentMode = EnvironmentMode.THEATER
                 applyEnvironmentSettings()
                 renderVrMenu()
             }
             id == "environment_passthrough" -> {
                 if (nativeIsPassthroughSupported()) {
-                    passthroughEnabled = true
+                    environmentMode = EnvironmentMode.PASSTHROUGH
                     applyEnvironmentSettings()
                     renderVrMenu()
                 } else {
                     showOsd("Passthrough is not available from this OpenXR runtime")
                 }
+            }
+            id == "theater_screen_reset" -> {
+                theaterImageOffsetX = 0f
+                theaterImageOffsetY = 0f
+                theaterImageHalfHeight = DEFAULT_THEATER_IMAGE_HALF_HEIGHT
+                applyEnvironmentSettings()
+                renderVrMenu()
             }
             id == "settings_picture" -> {
                 playbackPopover = PlaybackPopover.NONE
@@ -4151,6 +4273,46 @@ class PlayerActivity : Activity(), Player.Listener {
                         passthroughBrightness = fraction
                         applyEnvironmentSettings(persist)
                     }
+                    "theater_brightness" -> {
+                        theaterBrightness = fraction
+                        applyEnvironmentSettings(persist)
+                    }
+                    "theater_size" -> {
+                        theaterImageHalfHeight = lerp(
+                            THEATER_IMAGE_HALF_HEIGHT_MIN,
+                            THEATER_IMAGE_HALF_HEIGHT_MAX,
+                            fraction,
+                        )
+                        applyEnvironmentSettings(persist)
+                    }
+                    "theater_horizontal" -> {
+                        theaterImageOffsetX = lerp(
+                            -THEATER_HORIZONTAL_OFFSET_RANGE,
+                            THEATER_HORIZONTAL_OFFSET_RANGE,
+                            fraction,
+                        )
+                        applyEnvironmentSettings(persist)
+                        readTheaterTransformFromNative()
+                    }
+                    "theater_vertical" -> {
+                        theaterImageOffsetY = lerp(
+                            -THEATER_VERTICAL_OFFSET_RANGE,
+                            THEATER_VERTICAL_OFFSET_RANGE,
+                            fraction,
+                        )
+                        applyEnvironmentSettings(persist)
+                        readTheaterTransformFromNative()
+                    }
+                    "theater_curvature" -> {
+                        setScreenCurvature(
+                            lerp(
+                                SCREEN_CURVATURE_MIN,
+                                SCREEN_CURVATURE_MAX,
+                                fraction,
+                            ),
+                            persist,
+                        )
+                    }
                 }
                 val cinemaSlider =
                     slider == "tone_depth" ||
@@ -4163,7 +4325,12 @@ class PlayerActivity : Activity(), Player.Listener {
                         slider == "adaptive_max" ||
                         slider == "tone_priority" ||
                         slider == "resolution_scale" ||
-                        slider == "passthrough_brightness"
+                        slider == "passthrough_brightness" ||
+                        slider == "theater_brightness" ||
+                        slider == "theater_size" ||
+                        slider == "theater_horizontal" ||
+                        slider == "theater_vertical" ||
+                        slider == "theater_curvature"
                 val adaptiveSlider =
                     slider == "adaptive_min" ||
                         slider == "adaptive_max" ||
@@ -4173,7 +4340,10 @@ class PlayerActivity : Activity(), Player.Listener {
                 } else if (adaptiveSlider) {
                     applyAdaptiveToneMapping(persist)
                 } else if (
-                    slider == "resolution_scale" || slider == "passthrough_brightness"
+                    slider == "resolution_scale" ||
+                        slider == "passthrough_brightness" ||
+                        slider == "theater_brightness" ||
+                        slider.startsWith("theater_")
                 ) {
                     // These global controls were already applied above. Keep their panel open
                     // so the user can continue dragging or compare nearby values.
@@ -4230,6 +4400,25 @@ class PlayerActivity : Activity(), Player.Listener {
                         passthroughBrightness = DEFAULT_PASSTHROUGH_BRIGHTNESS
                         applyEnvironmentSettings()
                     }
+                    "theater_brightness" -> {
+                        theaterBrightness = DEFAULT_THEATER_BRIGHTNESS
+                        applyEnvironmentSettings()
+                    }
+                    "theater_size" -> {
+                        theaterImageHalfHeight = DEFAULT_THEATER_IMAGE_HALF_HEIGHT
+                        applyEnvironmentSettings()
+                    }
+                    "theater_horizontal" -> {
+                        theaterImageOffsetX = 0f
+                        applyEnvironmentSettings()
+                    }
+                    "theater_vertical" -> {
+                        theaterImageOffsetY = 0f
+                        applyEnvironmentSettings()
+                    }
+                    "theater_curvature" -> {
+                        setScreenCurvature(DEFAULT_SCREEN_CURVATURE, persist = true)
+                    }
                     "resolution_scale" -> {
                         renderResolutionScale = DEFAULT_RENDER_RESOLUTION_SCALE
                         getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
@@ -4256,7 +4445,11 @@ class PlayerActivity : Activity(), Player.Listener {
                     applyAdaptiveToneMapping()
                 } else if (cinemaSlider) {
                     applyCinemaSettings()
-                } else if (slider == "resolution_scale" || slider == "passthrough_brightness") {
+                } else if (
+                    slider == "resolution_scale" ||
+                    slider == "passthrough_brightness" ||
+                    slider.startsWith("theater_")
+                ) {
                     // Keep the render-quality panel open after resetting this slider.
                 } else {
                     applyPictureSettings(
@@ -6423,7 +6616,8 @@ class PlayerActivity : Activity(), Player.Listener {
                         playbackPopover == PlaybackPopover.ADAPTIVE_HDR ||
                         playbackPopover == PlaybackPopover.RENDER_QUALITY ||
                         playbackPopover == PlaybackPopover.ENVIRONMENT ||
-                        passthroughEnabled ||
+                        playbackPopover == PlaybackPopover.THEATER ||
+                        environmentMode != EnvironmentMode.VOID ||
                         pictureMode != PictureMode.AUTO ||
                         pictureBrightness != DEFAULT_PICTURE_BRIGHTNESS ||
                         pictureExposure != defaultExposureForCurrentColorMode() ||
@@ -6933,9 +7127,14 @@ class PlayerActivity : Activity(), Player.Listener {
                             fontSize = 16f,
                         )
                         button(
-                            "environment", if (passthroughEnabled) "Passthrough" else "Environment",
+                            "environment",
+                            when (environmentMode) {
+                                EnvironmentMode.VOID -> "Environment"
+                                EnvironmentMode.THEATER -> "Theater"
+                                EnvironmentMode.PASSTHROUGH -> "Passthrough"
+                            },
                             RectF(1567f, 605f, 1705f, 660f),
-                            passthroughEnabled,
+                            environmentMode != EnvironmentMode.VOID,
                             fontSize = 15f,
                         )
                         button(
@@ -7213,16 +7412,22 @@ class PlayerActivity : Activity(), Player.Listener {
                             975f, 132f, 21f, Paint.Align.LEFT, colorTextMuted,
                         )
                         button(
-                            "environment_dark", "Dark",
-                            RectF(1120f, 170f, 1478f, 230f),
-                            !passthroughEnabled,
-                            fontSize = 22f,
+                            "environment_void", "Void",
+                            RectF(975f, 170f, 1255f, 230f),
+                            environmentMode == EnvironmentMode.VOID,
+                            fontSize = 20f,
+                        )
+                        button(
+                            "environment_theater", "Theater",
+                            RectF(1265f, 170f, 1550f, 230f),
+                            environmentMode == EnvironmentMode.THEATER,
+                            fontSize = 20f,
                         )
                         button(
                             "environment_passthrough", "Passthrough",
-                            RectF(1490f, 170f, 1860f, 230f),
-                            passthroughEnabled,
-                            fontSize = 22f,
+                            RectF(1560f, 170f, 1860f, 230f),
+                            environmentMode == EnvironmentMode.PASSTHROUGH,
+                            fontSize = 19f,
                         )
                         compactSettingsSlider(
                             "settings_slider_scene", "Dark brightness",
@@ -7230,8 +7435,17 @@ class PlayerActivity : Activity(), Player.Listener {
                             sceneBrightness,
                             SCENE_BRIGHTNESS_MIN,
                             SCENE_BRIGHTNESS_MAX,
-                            335f,
+                            305f,
                             labelFontSize = 20f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_theater_brightness", "Theater brightness",
+                            "%.0f%%".format(Locale.US, theaterBrightness * 100f),
+                            theaterBrightness,
+                            0f,
+                            1f,
+                            395f,
+                            labelFontSize = 18f,
                         )
                         compactSettingsSlider(
                             "settings_slider_passthrough_brightness", "Passthrough brightness",
@@ -7239,17 +7453,134 @@ class PlayerActivity : Activity(), Player.Listener {
                             passthroughBrightness,
                             0f,
                             1f,
-                            435f,
+                            485f,
                             labelFontSize = 18f,
                         )
                         text(
-                            "Passthrough is global and does not change movie picture settings.",
-                            975f, 535f, 20f, Paint.Align.LEFT, colorTextMuted,
+                            "Theater image position and size are global; movie curvature stays per file.",
+                            975f, 555f, 18f, Paint.Align.LEFT, colorTextMuted,
+                        )
+                        button(
+                            "theater_controls", "Theater setup",
+                            RectF(975f, 590f, 1370f, 650f),
+                            fontSize = 19f,
                         )
                         button(
                             "environment_back", "Back",
                             RectF(1530f, 590f, 1860f, 650f),
                             fontSize = 22f,
+                        )
+                    }
+                    PlaybackPopover.THEATER -> {
+                        val bounds = PLAYBACK_SETTINGS_POPOVER_BOUNDS
+                        popoverPanel(bounds, "Theater setup", 1814f)
+                        text(
+                            "SCREEN",
+                            1325f, 126f, 17f, Paint.Align.CENTER, colorAccent,
+                        )
+                        val seatLeft = 1110f
+                        val seatTop = 150f
+                        val seatWidth = 145f
+                        val seatHeight = 48f
+                        val seatGap = 10f
+                        for (row in 0..2) {
+                            text(
+                                when (row) {
+                                    0 -> "Front"
+                                    1 -> "Center"
+                                    else -> "Back"
+                                },
+                                1088f,
+                                seatTop + row * (seatHeight + seatGap) + 31f,
+                                17f,
+                                Paint.Align.RIGHT,
+                                colorTextMuted,
+                            )
+                            for (columnIndex in 0..2) {
+                                val column = columnIndex - 1
+                                val left = seatLeft + columnIndex * (seatWidth + seatGap)
+                                button(
+                                    "theater_seat_${row}_${column}",
+                                    when (column) {
+                                        -1 -> "Left"
+                                        0 -> "Middle"
+                                        else -> "Right"
+                                    },
+                                    RectF(
+                                        left,
+                                        seatTop + row * (seatHeight + seatGap),
+                                        left + seatWidth,
+                                        seatTop + row * (seatHeight + seatGap) + seatHeight,
+                                    ),
+                                    theaterSeatRow == row && theaterSeatColumn == column,
+                                    fontSize = 16f,
+                                )
+                            }
+                        }
+                        button(
+                            "theater_recenter", "Recenter",
+                            RectF(1600f, 150f, 1860f, 205f),
+                            fontSize = 18f,
+                        )
+                        button(
+                            "theater_screen_reset", "Reset image",
+                            RectF(1600f, 215f, 1860f, 270f),
+                            fontSize = 18f,
+                        )
+                        button(
+                            "theater_back", "Back",
+                            RectF(1600f, 280f, 1860f, 335f),
+                            fontSize = 18f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_theater_size", "Image size",
+                            "%.0f%%".format(
+                                Locale.US,
+                                theaterImageHalfHeight /
+                                    DEFAULT_THEATER_IMAGE_HALF_HEIGHT * 100f,
+                            ),
+                            theaterImageHalfHeight,
+                            THEATER_IMAGE_HALF_HEIGHT_MIN,
+                            THEATER_IMAGE_HALF_HEIGHT_MAX,
+                            385f,
+                            labelFontSize = 19f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_theater_horizontal", "Horizontal",
+                            "%+.0f%%".format(
+                                Locale.US,
+                                theaterImageOffsetX / THEATER_HORIZONTAL_OFFSET_RANGE * 100f,
+                            ),
+                            theaterImageOffsetX,
+                            -THEATER_HORIZONTAL_OFFSET_RANGE,
+                            THEATER_HORIZONTAL_OFFSET_RANGE,
+                            455f,
+                            labelFontSize = 19f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_theater_vertical", "Vertical",
+                            "%+.0f%%".format(
+                                Locale.US,
+                                theaterImageOffsetY / THEATER_VERTICAL_OFFSET_RANGE * 100f,
+                            ),
+                            theaterImageOffsetY,
+                            -THEATER_VERTICAL_OFFSET_RANGE,
+                            THEATER_VERTICAL_OFFSET_RANGE,
+                            525f,
+                            labelFontSize = 19f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_theater_curvature", "Screen curvature",
+                            if (screenCurvature < 0.01f) {
+                                "Flat"
+                            } else {
+                                "%.0f%%".format(Locale.US, screenCurvature * 100f)
+                            },
+                            screenCurvature,
+                            SCREEN_CURVATURE_MIN,
+                            SCREEN_CURVATURE_MAX,
+                            595f,
+                            labelFontSize = 18f,
                         )
                     }
                     PlaybackPopover.NONE -> Unit
@@ -7497,6 +7828,8 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun saveCurrentMediaState(positionOverrideMs: Long? = null) {
+        readTheaterTransformFromNative()
+        persistTheaterTransform()
         if (!mediaLoaded || !::player.isInitialized || spec.uri.isBlank()) return
         val nativeTransform = nativeGetScreenTransform()
         if (nativeTransform.size != 4) return
@@ -7693,16 +8026,67 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun applyEnvironmentSettings(persist: Boolean = true) {
+        theaterBrightness = theaterBrightness.sanitized(
+            0f, 1f, DEFAULT_THEATER_BRIGHTNESS,
+        )
+        theaterImageOffsetX = theaterImageOffsetX.sanitized(
+            -THEATER_MAX_OFFSET, THEATER_MAX_OFFSET, 0f,
+        )
+        theaterImageOffsetY = theaterImageOffsetY.sanitized(
+            -THEATER_MAX_OFFSET, THEATER_MAX_OFFSET, 0f,
+        )
+        theaterImageHalfHeight = theaterImageHalfHeight.sanitized(
+            THEATER_IMAGE_HALF_HEIGHT_MIN,
+            THEATER_IMAGE_HALF_HEIGHT_MAX,
+            DEFAULT_THEATER_IMAGE_HALF_HEIGHT,
+        )
         passthroughBrightness = passthroughBrightness.sanitized(
             0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS,
         )
-        nativeSetPassthrough(passthroughEnabled, passthroughBrightness)
+        nativeSetEnvironment(
+            environmentMode.wireValue,
+            theaterBrightness,
+            passthroughBrightness,
+            theaterImageOffsetX,
+            theaterImageOffsetY,
+            theaterImageHalfHeight,
+        )
+        nativeSetTheaterSeat(theaterSeatRow, theaterSeatColumn)
         if (persist) {
             getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
-                .putBoolean(PREF_PASSTHROUGH_ENABLED, passthroughEnabled)
+                .putInt(PREF_ENVIRONMENT_MODE, environmentMode.wireValue)
+                .putBoolean(
+                    PREF_PASSTHROUGH_ENABLED,
+                    environmentMode == EnvironmentMode.PASSTHROUGH,
+                )
+                .putFloat(PREF_THEATER_BRIGHTNESS, theaterBrightness)
                 .putFloat(PREF_PASSTHROUGH_BRIGHTNESS, passthroughBrightness)
+                .putFloat(PREF_THEATER_IMAGE_OFFSET_X, theaterImageOffsetX)
+                .putFloat(PREF_THEATER_IMAGE_OFFSET_Y, theaterImageOffsetY)
+                .putFloat(PREF_THEATER_IMAGE_HALF_HEIGHT, theaterImageHalfHeight)
+                .putInt(PREF_THEATER_SEAT_ROW, theaterSeatRow)
+                .putInt(PREF_THEATER_SEAT_COLUMN, theaterSeatColumn)
                 .apply()
         }
+    }
+
+    private fun readTheaterTransformFromNative() {
+        if (!nativeStarted) return
+        val transform = nativeGetTheaterScreenTransform()
+        if (transform.size != 3 || transform.any { !it.isFinite() }) return
+        theaterImageOffsetX = transform[0]
+        theaterImageOffsetY = transform[1]
+        theaterImageHalfHeight = transform[2]
+    }
+
+    private fun persistTheaterTransform() {
+        getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
+            .putFloat(PREF_THEATER_IMAGE_OFFSET_X, theaterImageOffsetX)
+            .putFloat(PREF_THEATER_IMAGE_OFFSET_Y, theaterImageOffsetY)
+            .putFloat(PREF_THEATER_IMAGE_HALF_HEIGHT, theaterImageHalfHeight)
+            .putInt(PREF_THEATER_SEAT_ROW, theaterSeatRow)
+            .putInt(PREF_THEATER_SEAT_COLUMN, theaterSeatColumn)
+            .apply()
     }
 
     private fun applyAdaptiveToneMapping(persist: Boolean = true) {
@@ -8005,6 +8389,15 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_PASSTHROUGH_ENABLED = "passthrough-enabled"
         private const val PREF_PASSTHROUGH_BRIGHTNESS = "passthrough-brightness"
+        private const val PREF_ENVIRONMENT_MODE = "environment-mode"
+        private const val PREF_THEATER_BRIGHTNESS = "theater-brightness"
+        private const val PREF_THEATER_IMAGE_OFFSET_X = "theater-image-offset-x"
+        private const val PREF_THEATER_IMAGE_OFFSET_Y = "theater-image-offset-y"
+        private const val PREF_THEATER_IMAGE_HALF_HEIGHT = "theater-image-half-height"
+        private const val PREF_THEATER_SEAT_ROW = "theater-seat-row"
+        private const val PREF_THEATER_SEAT_COLUMN = "theater-seat-column"
+        private const val PREF_THEATER_LARGE_AUDITORIUM_MIGRATED =
+            "theater-large-auditorium-migrated"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
         private const val PREF_ADAPTIVE_TONE_MAP_MIN_NITS = "adaptive-tone-map-min-nits"
@@ -8026,6 +8419,10 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_SATURATION = 1f
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
+        private const val DEFAULT_THEATER_BRIGHTNESS = 0.35f
+        private const val DEFAULT_THEATER_IMAGE_HALF_HEIGHT = 2.15f
+        private const val DEFAULT_THEATER_SEAT_ROW = 1
+        private const val DEFAULT_THEATER_SEAT_COLUMN = 0
         private const val DEFAULT_PASSTHROUGH_BRIGHTNESS = 1f
         private const val DEFAULT_TONE_MAP_PEAK_NITS = 100f
         private const val DEFAULT_ADAPTIVE_TONE_MAP_MIN_NITS = 100f
@@ -8069,6 +8466,12 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PICTURE_VIBRANCE_MAX = 1f
         private const val SCENE_BRIGHTNESS_MIN = 0f
         private const val SCENE_BRIGHTNESS_MAX = 1f
+        private const val THEATER_LARGE_AUDITORIUM_SCALE = 2.15f
+        private const val THEATER_MAX_OFFSET = 5.4f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MIN = 0.90f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 3.10f
+        private const val THEATER_HORIZONTAL_OFFSET_RANGE = 2.40f
+        private const val THEATER_VERTICAL_OFFSET_RANGE = 1.15f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
         private const val ADAPTIVE_TONE_MAP_NITS_MIN = 100f
@@ -8139,6 +8542,17 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
         @JvmStatic private external fun nativeSetPassthrough(enabled: Boolean, brightness: Float)
+        @JvmStatic private external fun nativeSetEnvironment(
+            mode: Int,
+            theaterBrightness: Float,
+            passthroughBrightness: Float,
+            theaterOffsetX: Float,
+            theaterOffsetY: Float,
+            theaterHalfHeight: Float,
+        )
+        @JvmStatic private external fun nativeGetTheaterScreenTransform(): FloatArray
+        @JvmStatic private external fun nativeSetTheaterSeat(row: Int, column: Int)
+        @JvmStatic private external fun nativeRecenterTheater()
         @JvmStatic private external fun nativeIsPassthroughSupported(): Boolean
         @JvmStatic private external fun nativeRequestStop()
         @JvmStatic private external fun nativeSetVideoAspect(aspect: Float)
