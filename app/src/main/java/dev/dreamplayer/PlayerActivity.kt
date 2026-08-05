@@ -83,6 +83,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
     private var environmentMode = EnvironmentMode.VOID
     private var theaterBrightness = DEFAULT_THEATER_BRIGHTNESS
+    private var theaterCeilingExpansion = DEFAULT_THEATER_CEILING_EXPANSION
     private var theaterImageOffsetX = 0f
     private var theaterImageOffsetY = 0f
     private var theaterImageHalfHeight = DEFAULT_THEATER_IMAGE_HALF_HEIGHT
@@ -591,6 +592,9 @@ class PlayerActivity : Activity(), Player.Listener {
         theaterBrightness = picturePreferences
             .getFloat(PREF_THEATER_BRIGHTNESS, DEFAULT_THEATER_BRIGHTNESS)
             .sanitized(0f, 1f, DEFAULT_THEATER_BRIGHTNESS)
+        theaterCeilingExpansion = picturePreferences
+            .getFloat(PREF_THEATER_CEILING_EXPANSION, DEFAULT_THEATER_CEILING_EXPANSION)
+            .sanitized(0f, 1f, DEFAULT_THEATER_CEILING_EXPANSION)
         theaterImageOffsetX = picturePreferences
             .getFloat(PREF_THEATER_IMAGE_OFFSET_X, 0f)
             .sanitized(-THEATER_MAX_OFFSET, THEATER_MAX_OFFSET, 0f)
@@ -601,7 +605,7 @@ class PlayerActivity : Activity(), Player.Listener {
             .getFloat(PREF_THEATER_IMAGE_HALF_HEIGHT, DEFAULT_THEATER_IMAGE_HALF_HEIGHT)
             .sanitized(
                 THEATER_IMAGE_HALF_HEIGHT_MIN,
-                THEATER_IMAGE_HALF_HEIGHT_MAX,
+                theaterImageHalfHeightMax(),
                 DEFAULT_THEATER_IMAGE_HALF_HEIGHT,
             )
         theaterSeatRow = picturePreferences
@@ -4277,10 +4281,15 @@ class PlayerActivity : Activity(), Player.Listener {
                         theaterBrightness = fraction
                         applyEnvironmentSettings(persist)
                     }
+                    "theater_ceiling" -> {
+                        theaterCeilingExpansion = fraction
+                        applyEnvironmentSettings(persist)
+                        readTheaterTransformFromNative()
+                    }
                     "theater_size" -> {
                         theaterImageHalfHeight = lerp(
                             THEATER_IMAGE_HALF_HEIGHT_MIN,
-                            THEATER_IMAGE_HALF_HEIGHT_MAX,
+                            theaterImageHalfHeightMax(),
                             fraction,
                         )
                         applyEnvironmentSettings(persist)
@@ -4327,6 +4336,7 @@ class PlayerActivity : Activity(), Player.Listener {
                         slider == "resolution_scale" ||
                         slider == "passthrough_brightness" ||
                         slider == "theater_brightness" ||
+                        slider == "theater_ceiling" ||
                         slider == "theater_size" ||
                         slider == "theater_horizontal" ||
                         slider == "theater_vertical" ||
@@ -4402,6 +4412,10 @@ class PlayerActivity : Activity(), Player.Listener {
                     }
                     "theater_brightness" -> {
                         theaterBrightness = DEFAULT_THEATER_BRIGHTNESS
+                        applyEnvironmentSettings()
+                    }
+                    "theater_ceiling" -> {
+                        theaterCeilingExpansion = DEFAULT_THEATER_CEILING_EXPANSION
                         applyEnvironmentSettings()
                     }
                     "theater_size" -> {
@@ -6728,16 +6742,9 @@ class PlayerActivity : Activity(), Player.Listener {
                             (Color.blue(textSubtitleColor) * textSubtitleBrightness)
                                 .toInt().coerceIn(0, 255),
                         )
-                        val theaterViewingDistanceScale =
-                            if (environmentMode == EnvironmentMode.THEATER) {
-                                when (theaterSeatRow.coerceIn(0, 2)) {
-                                    1 -> 1.442f
-                                    2 -> 1.950f
-                                    else -> 1f
-                                }
-                            } else {
-                                1f
-                            }
+                        val theaterViewingDistanceScale = if (
+                            environmentMode == EnvironmentMode.THEATER
+                        ) theaterSubtitleViewingDistanceScale() else 1f
                         text(
                             if (enabled) "Subtitle preview" else "Image subtitle appearance is embedded",
                             505f,
@@ -7555,8 +7562,8 @@ class PlayerActivity : Activity(), Player.Listener {
                             ),
                             theaterImageHalfHeight,
                             THEATER_IMAGE_HALF_HEIGHT_MIN,
-                            THEATER_IMAGE_HALF_HEIGHT_MAX,
-                            385f,
+                            theaterImageHalfHeightMax(),
+                            355f,
                             labelFontSize = 19f,
                         )
                         compactSettingsSlider(
@@ -7568,7 +7575,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             theaterImageOffsetX,
                             -THEATER_HORIZONTAL_OFFSET_RANGE,
                             THEATER_HORIZONTAL_OFFSET_RANGE,
-                            455f,
+                            413f,
                             labelFontSize = 19f,
                         )
                         compactSettingsSlider(
@@ -7580,7 +7587,7 @@ class PlayerActivity : Activity(), Player.Listener {
                             theaterImageOffsetY,
                             -THEATER_VERTICAL_OFFSET_RANGE,
                             THEATER_VERTICAL_OFFSET_RANGE,
-                            525f,
+                            471f,
                             labelFontSize = 19f,
                         )
                         compactSettingsSlider(
@@ -7593,7 +7600,16 @@ class PlayerActivity : Activity(), Player.Listener {
                             screenCurvature,
                             SCREEN_CURVATURE_MIN,
                             SCREEN_CURVATURE_MAX,
-                            595f,
+                            529f,
+                            labelFontSize = 18f,
+                        )
+                        compactSettingsSlider(
+                            "settings_slider_theater_ceiling", "Ceiling height",
+                            theaterCeilingDescription(),
+                            theaterCeilingExpansion,
+                            0f,
+                            1f,
+                            587f,
                             labelFontSize = 18f,
                         )
                     }
@@ -8049,14 +8065,18 @@ class PlayerActivity : Activity(), Player.Listener {
         theaterImageOffsetY = theaterImageOffsetY.sanitized(
             -THEATER_MAX_OFFSET, THEATER_MAX_OFFSET, 0f,
         )
+        theaterCeilingExpansion = theaterCeilingExpansion.sanitized(
+            0f, 1f, DEFAULT_THEATER_CEILING_EXPANSION,
+        )
         theaterImageHalfHeight = theaterImageHalfHeight.sanitized(
             THEATER_IMAGE_HALF_HEIGHT_MIN,
-            THEATER_IMAGE_HALF_HEIGHT_MAX,
+            theaterImageHalfHeightMax(),
             DEFAULT_THEATER_IMAGE_HALF_HEIGHT,
         )
         passthroughBrightness = passthroughBrightness.sanitized(
             0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS,
         )
+        nativeSetTheaterCeilingHeight(theaterCeilingExpansion)
         nativeSetEnvironment(
             environmentMode.wireValue,
             theaterBrightness,
@@ -8074,6 +8094,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     environmentMode == EnvironmentMode.PASSTHROUGH,
                 )
                 .putFloat(PREF_THEATER_BRIGHTNESS, theaterBrightness)
+                .putFloat(PREF_THEATER_CEILING_EXPANSION, theaterCeilingExpansion)
                 .putFloat(PREF_PASSTHROUGH_BRIGHTNESS, passthroughBrightness)
                 .putFloat(PREF_THEATER_IMAGE_OFFSET_X, theaterImageOffsetX)
                 .putFloat(PREF_THEATER_IMAGE_OFFSET_Y, theaterImageOffsetY)
@@ -8226,6 +8247,34 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun lerp(minimum: Float, maximum: Float, fraction: Float): Float =
         minimum + (maximum - minimum) * fraction
+
+    private fun theaterScreenHalfHeight(): Float = lerp(
+        THEATER_SCREEN_BASE_HALF_HEIGHT,
+        THEATER_SCREEN_IMAX_HALF_HEIGHT,
+        theaterCeilingExpansion,
+    )
+
+    private fun theaterImageHalfHeightMax(): Float = theaterScreenHalfHeight() * 1.07f
+
+    private fun theaterCeilingDescription(): String {
+        val screenAspect = THEATER_SCREEN_WIDTH_METERS / (theaterScreenHalfHeight() * 2f)
+        return "%.2f:1".format(Locale.US, screenAspect)
+    }
+
+    private fun theaterSubtitleViewingDistanceScale(): Float {
+        val row = theaterSeatRow.coerceIn(0, 2)
+        val seatY = floatArrayOf(0.25f, 0.86f, 1.55f)[row] +
+            floatArrayOf(0.12f, 0.50f, 1.05f)[row] * theaterCeilingExpansion
+        val seatZ = floatArrayOf(-0.50f, 2.20f, 5.20f)[row] +
+            floatArrayOf(0.40f, 0.90f, 1.40f)[row] * theaterCeilingExpansion
+        val screenCenterY = 1.55f +
+            floatArrayOf(0.12f, 0.50f, 1.05f)[row] * theaterCeilingExpansion
+        val distance = kotlin.math.hypot(
+            THEATER_SCREEN_DISTANCE_METERS - seatZ,
+            screenCenterY - seatY,
+        )
+        return distance / THEATER_FRONT_REFERENCE_DISTANCE_METERS
+    }
 
     // Float.coerceIn() does NOT sanitize NaN: comparisons against NaN are
     // always false, so a NaN receiver passes through coerceIn() unchanged.
@@ -8405,6 +8454,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_PASSTHROUGH_BRIGHTNESS = "passthrough-brightness"
         private const val PREF_ENVIRONMENT_MODE = "environment-mode"
         private const val PREF_THEATER_BRIGHTNESS = "theater-brightness"
+        private const val PREF_THEATER_CEILING_EXPANSION = "theater-ceiling-expansion"
         private const val PREF_THEATER_IMAGE_OFFSET_X = "theater-image-offset-x"
         private const val PREF_THEATER_IMAGE_OFFSET_Y = "theater-image-offset-y"
         private const val PREF_THEATER_IMAGE_HALF_HEIGHT = "theater-image-half-height"
@@ -8434,6 +8484,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
         private const val DEFAULT_THEATER_BRIGHTNESS = 0.35f
+        private const val DEFAULT_THEATER_CEILING_EXPANSION = 0f
         private const val DEFAULT_THEATER_IMAGE_HALF_HEIGHT = 2.15f
         private const val DEFAULT_THEATER_SEAT_ROW = 1
         private const val DEFAULT_THEATER_SEAT_COLUMN = 0
@@ -8483,7 +8534,12 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val THEATER_LARGE_AUDITORIUM_SCALE = 2.15f
         private const val THEATER_MAX_OFFSET = 7.6f
         private const val THEATER_IMAGE_HALF_HEIGHT_MIN = 0.90f
-        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 3.42f
+        private const val THEATER_SCREEN_WIDTH_METERS = 15.2f
+        private const val THEATER_SCREEN_DISTANCE_METERS = 6.2f
+        private const val THEATER_SCREEN_BASE_HALF_HEIGHT = 3.2f
+        private const val THEATER_SCREEN_IMAX_HALF_HEIGHT = 5.3146853f
+        private const val THEATER_FRONT_REFERENCE_DISTANCE_METERS = 5.846f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 5.686713f
         private const val THEATER_HORIZONTAL_OFFSET_RANGE = 2.40f
         private const val THEATER_VERTICAL_OFFSET_RANGE = 1.15f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
@@ -8556,6 +8612,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
         @JvmStatic private external fun nativeSetPassthrough(enabled: Boolean, brightness: Float)
+        @JvmStatic private external fun nativeSetTheaterCeilingHeight(expansion: Float)
         @JvmStatic private external fun nativeSetEnvironment(
             mode: Int,
             theaterBrightness: Float,
