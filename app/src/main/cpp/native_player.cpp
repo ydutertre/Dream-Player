@@ -123,8 +123,10 @@ constexpr int kMaximumGeometryVertices = 131072;
 constexpr float kMaximumScreenEdgeAngle = 38.0f * kPi / 180.0f;
 constexpr float kMaximumOverlayEdgeAngle = 50.0f * kPi / 180.0f;
 constexpr float kTheaterScreenDistance = 6.2f;
-constexpr float kTheaterScreenHalfWidth = 5.4f;
-constexpr float kTheaterScreenHalfHeight = 2.9f;
+// Use nearly the complete front wall as the projection aperture. A narrow
+// proscenium border remains for clean overscan masking and spatial context.
+constexpr float kTheaterScreenHalfWidth = 7.6f;
+constexpr float kTheaterScreenHalfHeight = 3.2f;
 constexpr int kAdaptiveAnalysisWidth = 32;
 constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
@@ -215,7 +217,7 @@ Vec3 theaterWorldPoint(const Vec3& localPoint) {
 
 ScreenBasis theaterScreenBasis() {
     return {
-        theaterWorldPoint({0.0f, 1.25f, -kTheaterScreenDistance}),
+        theaterWorldPoint({0.0f, 1.55f, -kTheaterScreenDistance}),
         rotateTheaterYaw({1.0f, 0.0f, 0.0f}),
         {0.0f, 1.0f, 0.0f},
         rotateTheaterYaw({0.0f, 0.0f, 1.0f}),
@@ -3200,9 +3202,9 @@ private:
         appendTheaterBox(shell, -8.35f, 5.05f, -6.90f, 8.35f, 5.30f, 8.88f);
 
         // The screen wall is recessed behind a broad, layered proscenium.
-        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -5.65f, 5.25f, -6.58f);
-        appendTheaterBox(shell, 5.65f, -1.84f, -6.88f, 8.35f, 5.25f, -6.58f);
-        appendTheaterBox(shell, -5.65f, 4.20f, -6.88f, 5.65f, 5.25f, -6.58f);
+        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -7.78f, 5.25f, -6.58f);
+        appendTheaterBox(shell, 7.78f, -1.84f, -6.88f, 8.35f, 5.25f, -6.58f);
+        appendTheaterBox(shell, -7.78f, 4.79f, -6.88f, 7.78f, 5.25f, -6.58f);
         }
         drawSolidGeometry(
             mvp, shell,
@@ -3276,10 +3278,10 @@ private:
                 architecturalTrim, -7.82f, 4.94f, z - 0.045f,
                 7.82f, 5.05f, z + 0.045f);
         }
-        appendTheaterBox(architecturalTrim, -5.62f, -1.66f, -6.55f, -5.42f, 4.25f, -6.18f);
-        appendTheaterBox(architecturalTrim, 5.42f, -1.66f, -6.55f, 5.62f, 4.25f, -6.18f);
-        appendTheaterBox(architecturalTrim, -5.62f, 4.20f, -6.55f, 5.62f, 4.43f, -6.18f);
-        appendTheaterBox(architecturalTrim, -5.68f, -1.65f, -5.72f, 5.68f, -1.47f, -5.35f);
+        appendTheaterBox(architecturalTrim, -7.80f, -1.68f, -6.55f, -7.60f, 4.83f, -6.18f);
+        appendTheaterBox(architecturalTrim, 7.60f, -1.68f, -6.55f, 7.80f, 4.83f, -6.18f);
+        appendTheaterBox(architecturalTrim, -7.80f, 4.75f, -6.55f, 7.80f, 4.98f, -6.18f);
+        appendTheaterBox(architecturalTrim, -7.82f, -1.69f, -5.72f, 7.82f, -1.49f, -5.35f);
         appendTheaterBox(architecturalTrim, -7.90f, -1.63f, 8.37f, -6.60f, 1.65f, 8.52f);
         appendTheaterBox(architecturalTrim, 6.60f, -1.63f, 8.37f, 7.90f, 1.65f, 8.52f);
         appendTheaterBox(architecturalTrim, -2.20f, 3.65f, 8.35f, 2.20f, 4.70f, 8.50f);
