@@ -73,7 +73,6 @@ std::atomic<float> gSceneBrightness{0.5f};
 // 0 = void, 1 = virtual theater, 2 = passthrough.
 std::atomic<int> gEnvironmentMode{0};
 std::atomic<float> gTheaterBrightness{0.35f};
-std::atomic<float> gTheaterCeilingExpansion{0.0f};
 std::atomic<float> gTheaterImageOffsetX{0.0f};
 std::atomic<float> gTheaterImageOffsetY{0.0f};
 std::atomic<float> gTheaterImageHalfHeight{1.0f};
@@ -127,11 +126,7 @@ constexpr float kTheaterScreenDistance = 6.2f;
 // Use nearly the complete front wall as the projection aperture. A narrow
 // proscenium border remains for clean overscan masking and spatial context.
 constexpr float kTheaterScreenHalfWidth = 7.6f;
-constexpr float kTheaterScreenBottom = -1.65f;
-constexpr float kTheaterBaseScreenTop = 4.75f;
-constexpr float kTheaterBaseCeilingTop = 5.25f;
-constexpr float kTheaterMaxScreenTop =
-    kTheaterScreenBottom + (kTheaterScreenHalfWidth * 2.0f / 1.43f);
+constexpr float kTheaterScreenHalfHeight = 3.2f;
 constexpr int kAdaptiveAnalysisWidth = 32;
 constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
@@ -193,21 +188,11 @@ Vec3 theaterSeatPosition() {
     const int column = std::clamp(gTheaterSeatColumn.load(), -1, 1);
     constexpr float rowZ[] = {-0.50f, 2.20f, 5.20f};
     constexpr float rowY[] = {0.25f, 0.86f, 1.55f};
-    constexpr float expandedRowZ[] = {0.40f, 0.90f, 1.40f};
-    constexpr float expandedRowY[] = {0.12f, 0.50f, 1.05f};
-    const float expansion = std::clamp(gTheaterCeilingExpansion.load(), 0.0f, 1.0f);
     return {
         static_cast<float>(column) * 1.06f,
-        rowY[row] + expandedRowY[row] * expansion,
-        rowZ[row] + expandedRowZ[row] * expansion,
+        rowY[row],
+        rowZ[row],
     };
-}
-
-float theaterSelectedSeatElevationDelta() {
-    constexpr float expandedRowY[] = {0.12f, 0.50f, 1.05f};
-    const int row = std::clamp(gTheaterSeatRow.load(), 0, 2);
-    return expandedRowY[row] *
-        std::clamp(gTheaterCeilingExpansion.load(), 0.0f, 1.0f);
 }
 
 Vec3 rotateTheaterYaw(const Vec3& value) {
@@ -231,49 +216,12 @@ Vec3 theaterWorldPoint(const Vec3& localPoint) {
 }
 
 ScreenBasis theaterScreenBasis() {
-    // Keep the movie at the same perceived vertical position while the room
-    // grows upward. The selected seat's extra rake is compensated here; only
-    // its greater distance from the screen remains visible to the viewer.
     return {
-        theaterWorldPoint({
-            0.0f,
-            1.55f + theaterSelectedSeatElevationDelta(),
-            -kTheaterScreenDistance,
-        }),
+        theaterWorldPoint({0.0f, 1.55f, -kTheaterScreenDistance}),
         rotateTheaterYaw({1.0f, 0.0f, 0.0f}),
         {0.0f, 1.0f, 0.0f},
         rotateTheaterYaw({0.0f, 0.0f, 1.0f}),
     };
-}
-
-ScreenBasis theaterApertureBasis() {
-    const float expansion = std::clamp(gTheaterCeilingExpansion.load(), 0.0f, 1.0f);
-    const float screenTop = kTheaterBaseScreenTop +
-        (kTheaterMaxScreenTop - kTheaterBaseScreenTop) * expansion;
-    return {
-        theaterWorldPoint({
-            0.0f,
-            (kTheaterScreenBottom + screenTop) * 0.5f,
-            -kTheaterScreenDistance,
-        }),
-        rotateTheaterYaw({1.0f, 0.0f, 0.0f}),
-        {0.0f, 1.0f, 0.0f},
-        rotateTheaterYaw({0.0f, 0.0f, 1.0f}),
-    };
-}
-
-float theaterScreenTop() {
-    const float expansion = std::clamp(gTheaterCeilingExpansion.load(), 0.0f, 1.0f);
-    return kTheaterBaseScreenTop +
-        (kTheaterMaxScreenTop - kTheaterBaseScreenTop) * expansion;
-}
-
-float theaterScreenHalfHeight() {
-    return (theaterScreenTop() - kTheaterScreenBottom) * 0.5f;
-}
-
-float theaterCeilingDelta() {
-    return theaterScreenTop() - kTheaterBaseScreenTop;
 }
 
 Vec3 screenPoint(const ScreenBasis& basis, float horizontal, float vertical, float forward = 0.0f) {
@@ -881,7 +829,6 @@ private:
     float cachedTheaterAnchorX_ = 0.0f;
     float cachedTheaterAnchorY_ = 0.0f;
     float cachedTheaterAnchorZ_ = 0.0f;
-    float cachedTheaterCeilingExpansion_ = 0.0f;
     std::vector<float> theaterShellGeometry_;
     std::vector<float> theaterFloorGeometry_;
     std::vector<float> theaterPanelGeometry_;
@@ -2013,7 +1960,7 @@ private:
                             theaterScreenBasis(),
                             kTheaterScreenHalfWidth,
                             kTheaterScreenHalfWidth,
-                            theaterScreenHalfHeight(),
+                            kTheaterScreenHalfHeight,
                             curvature,
                             0.04f,
                             &target,
@@ -2024,7 +1971,7 @@ private:
                     const float pointerArc =
                         (surfaceU * 2.0f - 1.0f) * kTheaterScreenHalfWidth;
                     const float pointerVertical =
-                        (1.0f - surfaceV * 2.0f) * theaterScreenHalfHeight();
+                        (1.0f - surfaceV * 2.0f) * kTheaterScreenHalfHeight;
                     theaterDragFilteredPointerArc_ +=
                         (pointerArc - theaterDragFilteredPointerArc_) * 0.38f;
                     theaterDragFilteredPointerVertical_ +=
@@ -2065,7 +2012,7 @@ private:
                     const float maxX = std::abs(
                         kTheaterScreenHalfWidth - imageHalfWidth);
                     const float maxY = std::abs(
-                        theaterScreenHalfHeight() - imageHalfHeight);
+                        kTheaterScreenHalfHeight - imageHalfHeight);
                     const float targetX = std::clamp(
                         theaterDragStartOffsetX_ +
                             theaterDragFilteredPointerArc_ -
@@ -2281,7 +2228,7 @@ private:
                             theaterScreenBasis(),
                             kTheaterScreenHalfWidth,
                             kTheaterScreenHalfWidth,
-                            theaterScreenHalfHeight(),
+                            kTheaterScreenHalfHeight,
                             gScreenCurvature.load(),
                             0.04f,
                             &surfaceHit,
@@ -2294,7 +2241,7 @@ private:
                     theaterDragStartPointerArc_ =
                         (surfaceU * 2.0f - 1.0f) * kTheaterScreenHalfWidth;
                     theaterDragStartPointerVertical_ =
-                        (1.0f - surfaceV * 2.0f) * theaterScreenHalfHeight();
+                        (1.0f - surfaceV * 2.0f) * kTheaterScreenHalfHeight;
                     theaterDragStartOffsetX_ = gTheaterImageOffsetX.load();
                     theaterDragStartOffsetY_ = gTheaterImageOffsetY.load();
                     theaterDragFilteredPointerArc_ = theaterDragStartPointerArc_;
@@ -2335,7 +2282,7 @@ private:
                         ? gTheaterImageHalfHeight.load()
                         : gScreenHalfHeight.load();
                     const float maximumSize = theaterActive
-                        ? theaterScreenHalfHeight() * 1.07f
+                        ? kTheaterScreenHalfHeight * 1.07f
                         : 1.55f;
                     const float newSize = std::clamp(
                         oldSize + stick.currentState.y * 0.012f,
@@ -2351,8 +2298,8 @@ private:
                             std::abs(kTheaterScreenHalfWidth - newHalfWidth)));
                         gTheaterImageOffsetY.store(std::clamp(
                             gTheaterImageOffsetY.load(),
-                            -std::abs(theaterScreenHalfHeight() - newSize),
-                            std::abs(theaterScreenHalfHeight() - newSize)));
+                            -std::abs(kTheaterScreenHalfHeight - newSize),
+                            std::abs(kTheaterScreenHalfHeight - newSize)));
                     } else {
                         gScreenHalfHeight.store(newSize);
                     }
@@ -3099,8 +3046,6 @@ private:
     }
 
     void drawTheaterScreenBacking(const Mat4& mvp, float curvature) {
-        const float screenHalfHeight = theaterScreenHalfHeight();
-        const ScreenBasis apertureBasis = theaterApertureBasis();
         std::vector<float> backing;
         backing.reserve(kScreenSegments * 6 * 5);
         for (int segment = 0; segment < kScreenSegments; ++segment) {
@@ -3110,18 +3055,18 @@ private:
                 static_cast<float>(segment + 1) / kScreenSegments * 2.0f - 1.0f;
             appendSolidQuad(
                 backing,
-                sharedCurvedScreenPoint(
-                    apertureBasis, kTheaterScreenHalfWidth, kTheaterScreenHalfWidth,
-                    n0, screenHalfHeight, curvature, -0.050f),
-                sharedCurvedScreenPoint(
-                    apertureBasis, kTheaterScreenHalfWidth, kTheaterScreenHalfWidth,
-                    n0, -screenHalfHeight, curvature, -0.050f),
-                sharedCurvedScreenPoint(
-                    apertureBasis, kTheaterScreenHalfWidth, kTheaterScreenHalfWidth,
-                    n1, -screenHalfHeight, curvature, -0.050f),
-                sharedCurvedScreenPoint(
-                    apertureBasis, kTheaterScreenHalfWidth, kTheaterScreenHalfWidth,
-                    n1, screenHalfHeight, curvature, -0.050f));
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n0,
+                    kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f),
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n0,
+                    -kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f),
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n1,
+                    -kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f),
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n1,
+                    kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f));
         }
         drawSolidGeometry(mvp, backing, 0.002f, 0.002f, 0.003f);
     }
@@ -3133,15 +3078,13 @@ private:
         const float anchorX = gTheaterAnchorX.load();
         const float anchorY = gTheaterAnchorY.load();
         const float anchorZ = gTheaterAnchorZ.load();
-        const float ceilingExpansion = gTheaterCeilingExpansion.load();
         if (theaterGeometryCacheValid_ &&
             cachedTheaterSeatRow_ == seatRow &&
             cachedTheaterSeatColumn_ == seatColumn &&
             cachedTheaterYaw_ == yaw &&
             cachedTheaterAnchorX_ == anchorX &&
             cachedTheaterAnchorY_ == anchorY &&
-            cachedTheaterAnchorZ_ == anchorZ &&
-            cachedTheaterCeilingExpansion_ == ceilingExpansion) {
+            cachedTheaterAnchorZ_ == anchorZ) {
             return;
         }
         cachedTheaterSeatRow_ = seatRow;
@@ -3150,7 +3093,6 @@ private:
         cachedTheaterAnchorX_ = anchorX;
         cachedTheaterAnchorY_ = anchorY;
         cachedTheaterAnchorZ_ = anchorZ;
-        cachedTheaterCeilingExpansion_ = ceilingExpansion;
         theaterGeometryCacheValid_ = true;
         theaterShellGeometry_.clear();
         theaterFloorGeometry_.clear();
@@ -3167,20 +3109,12 @@ private:
 
     void drawTheaterSeats(const Mat4& mvp, float brightness) {
         refreshTheaterGeometryCacheIfNeeded();
-        constexpr float baseRowPositions[] = {
+        constexpr float rowPositions[] = {
             -1.40f, -0.50f, 0.70f, 2.20f, 3.70f, 5.20f, 6.80f,
         };
-        constexpr float baseRowElevations[] = {
+        constexpr float rowElevations[] = {
             0.0f, 0.25f, 0.53f, 0.86f, 1.20f, 1.55f, 1.92f,
         };
-        constexpr float expandedRowPositions[] = {
-            0.20f, 0.40f, 0.65f, 0.90f, 1.15f, 1.40f, 1.60f,
-        };
-        constexpr float expandedRowElevations[] = {
-            0.0f, 0.12f, 0.28f, 0.50f, 0.76f, 1.05f, 1.40f,
-        };
-        const float ceilingExpansion = std::clamp(
-            gTheaterCeilingExpansion.load(), 0.0f, 1.0f);
         constexpr int selectablePhysicalRows[] = {1, 3, 5};
         const int selectedRow = std::clamp(gTheaterSeatRow.load(), 0, 2);
         const int selectedPhysicalRow = selectablePhysicalRows[selectedRow];
@@ -3194,10 +3128,8 @@ private:
         seatFrames.reserve(7 * 13 * 72 * 5);
         seatShadows.reserve(7 * 13 * 720 * 5);
         if (upholstery.empty()) for (int rowIndex = 0; rowIndex < 7; ++rowIndex) {
-            const float z = baseRowPositions[rowIndex] +
-                expandedRowPositions[rowIndex] * ceilingExpansion;
-            const float elevation = baseRowElevations[rowIndex] +
-                expandedRowElevations[rowIndex] * ceilingExpansion;
+            const float z = rowPositions[rowIndex];
+            const float elevation = rowElevations[rowIndex];
             for (int column = -6; column <= 6; ++column) {
                 if (rowIndex == selectedPhysicalRow && column == selectedColumn) continue;
                 const float x = static_cast<float>(column) * 1.06f;
@@ -3296,9 +3228,6 @@ private:
     void drawTheater(const Mat4& mvp, float curvature) {
         const float brightness = std::clamp(
             gTheaterBrightness.load(), 0.0f, 1.0f);
-        const float ceilingDelta = theaterCeilingDelta();
-        const float screenTop = theaterScreenTop();
-        const float ceilingTop = kTheaterBaseCeilingTop + ceilingDelta;
         refreshTheaterGeometryCacheIfNeeded();
         auto& shell = theaterShellGeometry_;
         auto& floor = theaterFloorGeometry_;
@@ -3318,15 +3247,15 @@ private:
         if (shell.empty()) {
         // A full-scale commercial auditorium: sixteen metres wide, fifteen
         // metres deep and seven metres from floor to ceiling at the rear.
-        appendTheaterBox(shell, -8.35f, -1.84f, -6.90f, -8.05f, ceilingTop, 8.85f);
-        appendTheaterBox(shell, 8.05f, -1.84f, -6.90f, 8.35f, ceilingTop, 8.85f);
-        appendTheaterBox(shell, -8.35f, -1.84f, 8.55f, 8.35f, ceilingTop, 8.88f);
-        appendTheaterBox(shell, -8.35f, 5.05f + ceilingDelta, -6.90f, 8.35f, 5.30f + ceilingDelta, 8.88f);
+        appendTheaterBox(shell, -8.35f, -1.84f, -6.90f, -8.05f, 5.25f, 8.85f);
+        appendTheaterBox(shell, 8.05f, -1.84f, -6.90f, 8.35f, 5.25f, 8.85f);
+        appendTheaterBox(shell, -8.35f, -1.84f, 8.55f, 8.35f, 5.25f, 8.88f);
+        appendTheaterBox(shell, -8.35f, 5.05f, -6.90f, 8.35f, 5.30f, 8.88f);
 
         // The screen wall is recessed behind a broad, layered proscenium.
-        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -7.78f, ceilingTop, -6.58f);
-        appendTheaterBox(shell, 7.78f, -1.84f, -6.88f, 8.35f, ceilingTop, -6.58f);
-        appendTheaterBox(shell, -7.78f, screenTop + 0.04f, -6.88f, 7.78f, ceilingTop, -6.58f);
+        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -7.78f, 5.25f, -6.58f);
+        appendTheaterBox(shell, 7.78f, -1.84f, -6.88f, 8.35f, 5.25f, -6.58f);
+        appendTheaterBox(shell, -7.78f, 4.79f, -6.88f, 7.78f, 5.25f, -6.58f);
         }
         drawSolidGeometry(
             mvp, shell,
@@ -3338,28 +3267,17 @@ private:
         // Seven-row stadium bowl with deep side aisles and an open stage apron.
         appendTheaterBox(floor, -8.05f, -1.84f, -6.58f, 8.05f, -1.66f, 8.55f);
         appendTheaterBox(floor, -7.90f, -1.66f, -6.35f, 7.90f, -1.50f, -5.55f);
-        constexpr float baseTierStarts[] = {
+        constexpr float tierStarts[] = {
             -0.95f, 0.10f, 1.45f, 2.95f, 4.45f, 6.00f,
         };
-        constexpr float baseTierTops[] = {
+        constexpr float tierTops[] = {
             -1.40f, -1.12f, -0.79f, -0.45f, -0.10f, 0.27f,
-        };
-        constexpr float expandedTierStarts[] = {
-            0.30f, 0.50f, 0.72f, 0.96f, 1.22f, 1.48f,
-        };
-        constexpr float expandedTierTops[] = {
-            0.08f, 0.22f, 0.42f, 0.68f, 0.98f, 1.32f,
         };
         for (int tier = 0; tier < 6; ++tier) {
             appendTheaterBox(
                 floor,
-                -7.65f, -1.67f,
-                baseTierStarts[tier] + expandedTierStarts[tier] *
-                    std::clamp(gTheaterCeilingExpansion.load(), 0.0f, 1.0f),
-                7.65f,
-                baseTierTops[tier] + expandedTierTops[tier] *
-                    std::clamp(gTheaterCeilingExpansion.load(), 0.0f, 1.0f),
-                8.48f);
+                -7.65f, -1.67f, tierStarts[tier],
+                7.65f, tierTops[tier], 8.48f);
         }
         }
         drawSolidGeometry(
@@ -3376,16 +3294,16 @@ private:
             const float inset = panelIndex % 2 == 0 ? 0.0f : 0.055f;
             appendTheaterBox(
                 panels, -8.03f + inset, -0.96f, z - 0.42f,
-                -7.90f + inset, 3.92f + ceilingDelta, z + 0.42f);
+                -7.90f + inset, 3.92f, z + 0.42f);
             appendTheaterBox(
                 panels, 7.90f - inset, -0.96f, z - 0.42f,
-                8.03f - inset, 3.92f + ceilingDelta, z + 0.42f);
+                8.03f - inset, 3.92f, z + 0.42f);
             appendTheaterBox(
                 wallTrim, -7.88f + inset, -1.04f, z + 0.45f,
-                -7.80f + inset, 4.02f + ceilingDelta, z + 0.53f);
+                -7.80f + inset, 4.02f, z + 0.53f);
             appendTheaterBox(
                 wallTrim, 7.80f - inset, -1.04f, z + 0.45f,
-                7.88f - inset, 4.02f + ceilingDelta, z + 0.53f);
+                7.88f - inset, 4.02f, z + 0.53f);
         }
         }
         drawSolidGeometry(
@@ -3403,21 +3321,21 @@ private:
         if (architecturalTrim.empty()) {
         for (float x = -7.2f; x <= 7.2f; x += 1.2f) {
             appendTheaterBox(
-                architecturalTrim, x - 0.045f, 4.94f + ceilingDelta, -6.45f,
-                x + 0.045f, 5.05f + ceilingDelta, 8.45f);
+                architecturalTrim, x - 0.045f, 4.94f, -6.45f,
+                x + 0.045f, 5.05f, 8.45f);
         }
         for (float z = -5.55f; z <= 7.75f; z += 1.10f) {
             appendTheaterBox(
-                architecturalTrim, -7.82f, 4.94f + ceilingDelta, z - 0.045f,
-                7.82f, 5.05f + ceilingDelta, z + 0.045f);
+                architecturalTrim, -7.82f, 4.94f, z - 0.045f,
+                7.82f, 5.05f, z + 0.045f);
         }
-        appendTheaterBox(architecturalTrim, -7.80f, -1.68f, -6.55f, -7.60f, screenTop + 0.08f, -6.18f);
-        appendTheaterBox(architecturalTrim, 7.60f, -1.68f, -6.55f, 7.80f, screenTop + 0.08f, -6.18f);
-        appendTheaterBox(architecturalTrim, -7.80f, screenTop, -6.55f, 7.80f, screenTop + 0.23f, -6.18f);
+        appendTheaterBox(architecturalTrim, -7.80f, -1.68f, -6.55f, -7.60f, 4.83f, -6.18f);
+        appendTheaterBox(architecturalTrim, 7.60f, -1.68f, -6.55f, 7.80f, 4.83f, -6.18f);
+        appendTheaterBox(architecturalTrim, -7.80f, 4.75f, -6.55f, 7.80f, 4.98f, -6.18f);
         appendTheaterBox(architecturalTrim, -7.82f, -1.69f, -5.72f, 7.82f, -1.49f, -5.35f);
         appendTheaterBox(architecturalTrim, -7.90f, -1.63f, 8.37f, -6.60f, 1.65f, 8.52f);
         appendTheaterBox(architecturalTrim, 6.60f, -1.63f, 8.37f, 7.90f, 1.65f, 8.52f);
-        appendTheaterBox(architecturalTrim, -2.20f, 3.65f + ceilingDelta, 8.35f, 2.20f, 4.70f + ceilingDelta, 8.50f);
+        appendTheaterBox(architecturalTrim, -2.20f, 3.65f, 8.35f, 2.20f, 4.70f, 8.50f);
         }
         drawSolidGeometry(
             mvp, architecturalTrim,
@@ -3458,7 +3376,7 @@ private:
             for (float z : {-4.8f, -1.8f, 1.2f, 4.2f, 7.2f}) {
                 appendTheaterHorizontalDisc(
                     warmLights,
-                    {x, 4.925f + ceilingDelta, z},
+                    {x, 4.925f, z},
                     0.075f,
                     12);
             }
@@ -4212,13 +4130,6 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPassthrough(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_dev_dreamplayer_PlayerActivity_nativeSetTheaterCeilingHeight(
-        JNIEnv*, jclass, jfloat expansion) {
-    gTheaterCeilingExpansion.store(
-        std::isfinite(expansion) ? std::clamp(expansion, 0.0f, 1.0f) : 0.0f);
-}
-
-extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetEnvironment(
         JNIEnv*,
         jclass,
@@ -4239,8 +4150,7 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetEnvironment(
             std::clamp(passthroughBrightness, 0.0f, 1.0f));
     }
     const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
-    const float screenHalfHeight = theaterScreenHalfHeight();
-    const float maximumHeight = screenHalfHeight * 1.07f;
+    const float maximumHeight = kTheaterScreenHalfHeight * 1.07f;
     const float safeHalfHeight = std::isfinite(theaterHalfHeight)
         ? std::clamp(theaterHalfHeight, 0.90f, maximumHeight)
         : 2.15f;
@@ -4248,7 +4158,7 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetEnvironment(
     const float maximumX = std::abs(
         kTheaterScreenHalfWidth - safeHalfWidth);
     const float maximumY = std::abs(
-        screenHalfHeight - safeHalfHeight);
+        kTheaterScreenHalfHeight - safeHalfHeight);
     gTheaterImageHalfHeight.store(safeHalfHeight);
     gTheaterImageOffsetX.store(
         std::isfinite(theaterOffsetX)
@@ -4303,15 +4213,14 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAspect(JNIEnv*, jclass, jfloat
     if (std::isfinite(aspect) && aspect > 0.1f) {
         const float safeAspect = std::clamp(aspect, 0.8f, 2.4f);
         gAspect.store(aspect);
-        const float screenHalfHeight = theaterScreenHalfHeight();
-        const float maximumHeight = screenHalfHeight * 1.07f;
+        const float maximumHeight = kTheaterScreenHalfHeight * 1.07f;
         const float halfHeight = std::clamp(
             gTheaterImageHalfHeight.load(), 0.90f, maximumHeight);
         const float halfWidth = halfHeight * safeAspect;
         const float maximumX = std::abs(
             kTheaterScreenHalfWidth - halfWidth);
         const float maximumY = std::abs(
-            screenHalfHeight - halfHeight);
+            kTheaterScreenHalfHeight - halfHeight);
         gTheaterImageHalfHeight.store(halfHeight);
         gTheaterImageOffsetX.store(std::clamp(
             gTheaterImageOffsetX.load(), -maximumX, maximumX));
