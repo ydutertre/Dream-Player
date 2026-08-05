@@ -67,6 +67,12 @@ std::atomic<float> gHdrMaxFallNits{0.0f};
 // 0 = legacy hard clip, 1 = luminance/hue-direction preserving compression.
 std::atomic<int> gGamutMappingMode{0};
 std::atomic<float> gSceneBrightness{0.5f};
+// 0 = void, 1 = virtual theater, 2 = passthrough.
+std::atomic<int> gEnvironmentMode{0};
+std::atomic<float> gTheaterBrightness{0.35f};
+std::atomic<float> gTheaterImageOffsetX{0.0f};
+std::atomic<float> gTheaterImageOffsetY{0.0f};
+std::atomic<float> gTheaterImageHalfHeight{1.0f};
 std::atomic<bool> gPassthroughRequested{false};
 std::atomic<float> gPassthroughBrightness{1.0f};
 std::atomic<bool> gPassthroughSupported{false};
@@ -106,6 +112,9 @@ constexpr int kMaximumSurfaceVertices =
     kImmersiveHorizontalSegments * kImmersiveVerticalSegments * 6;
 constexpr float kMaximumScreenEdgeAngle = 38.0f * kPi / 180.0f;
 constexpr float kMaximumOverlayEdgeAngle = 50.0f * kPi / 180.0f;
+constexpr float kTheaterScreenDistance = 3.4f;
+constexpr float kTheaterScreenHalfWidth = 3.05f;
+constexpr float kTheaterScreenHalfHeight = 1.62f;
 constexpr int kAdaptiveAnalysisWidth = 32;
 constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
@@ -160,6 +169,15 @@ ScreenBasis currentScreenBasis() {
     if (std::abs(dot(right, {0, 1, 0})) > 0.001f) right = {1, 0, 0};
     const Vec3 up = normalized(cross(right, outward), {0, 1, 0});
     return {center, right, up, outward * -1.0f};
+}
+
+ScreenBasis theaterScreenBasis() {
+    return {
+        {0.0f, 0.15f, -kTheaterScreenDistance},
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+    };
 }
 
 Vec3 screenPoint(const ScreenBasis& basis, float horizontal, float vertical, float forward = 0.0f) {
@@ -229,6 +247,25 @@ Vec3 sharedCurvedScreenPoint(
         radius * (1.0f - std::cos(angle)) + forwardOffset);
 }
 
+Vec3 theaterSurfacePoint(
+    float surfaceHalfWidth,
+    float normalizedHorizontal,
+    float vertical,
+    float curvature,
+    float horizontalArcOffset = 0.0f,
+    float verticalOffset = 0.0f,
+    float forwardOffset = 0.0f) {
+    return sharedCurvedScreenPoint(
+        theaterScreenBasis(),
+        kTheaterScreenHalfWidth,
+        surfaceHalfWidth,
+        normalizedHorizontal +
+            horizontalArcOffset / std::max(surfaceHalfWidth, 0.0001f),
+        vertical + verticalOffset,
+        curvature,
+        forwardOffset);
+}
+
 float overlayCurvatureReferenceHalfWidth(
     float videoHalfWidth, float overlayHalfWidth) {
     return std::max(
@@ -248,7 +285,9 @@ bool intersectRayWithCurvedScreen(
     float forwardOffset,
     Vec3* hit,
     float* u,
-    float* v) {
+    float* v,
+    float horizontalArcOffset = 0.0f,
+    float verticalOffset = 0.0f) {
     const Vec3 ray = normalized(direction);
     const Vec3 surfaceCenter = basis.center + basis.normal * forwardOffset;
     const Vec3 localOrigin = origin - surfaceCenter;
@@ -269,13 +308,14 @@ bool intersectRayWithCurvedScreen(
             originHorizontal + directionHorizontal * distance;
         const float vertical = originVertical + directionVertical * distance;
         if (
-            std::abs(horizontal) > surfaceHalfWidth ||
-            std::abs(vertical) > halfHeight) {
+            std::abs(horizontal - horizontalArcOffset) > surfaceHalfWidth ||
+            std::abs(vertical - verticalOffset) > halfHeight) {
             return false;
         }
         *hit = origin + ray * distance;
-        *u = (horizontal + surfaceHalfWidth) / (2.0f * surfaceHalfWidth);
-        *v = (halfHeight - vertical) / (2.0f * halfHeight);
+        *u = ((horizontal - horizontalArcOffset) + surfaceHalfWidth) /
+            (2.0f * surfaceHalfWidth);
+        *v = (halfHeight - (vertical - verticalOffset)) / (2.0f * halfHeight);
         return true;
     }
 
@@ -309,12 +349,13 @@ bool intersectRayWithCurvedScreen(
         const float forward =
             originForward + directionForward * distance;
         const float angle = std::atan2(horizontal, radius - forward);
+        const float centerAngle = horizontalArcOffset / radius;
         if (
-            std::abs(angle) > surfaceEdgeAngle ||
-            std::abs(vertical) > halfHeight) continue;
+            std::abs(angle - centerAngle) > surfaceEdgeAngle ||
+            std::abs(vertical - verticalOffset) > halfHeight) continue;
         *hit = origin + ray * distance;
-        *u = (angle / surfaceEdgeAngle + 1.0f) * 0.5f;
-        *v = (halfHeight - vertical) / (2.0f * halfHeight);
+        *u = ((angle - centerAngle) / surfaceEdgeAngle + 1.0f) * 0.5f;
+        *v = (halfHeight - (vertical - verticalOffset)) / (2.0f * halfHeight);
         return true;
     }
     return false;
@@ -711,6 +752,11 @@ private:
     Vec3 dragStartCenter_{};
     bool dragMoved_ = false;
     bool draggingImmersive_ = false;
+    bool draggingTheater_ = false;
+    float theaterDragStartPointerArc_ = 0.0f;
+    float theaterDragStartPointerVertical_ = 0.0f;
+    float theaterDragStartOffsetX_ = 0.0f;
+    float theaterDragStartOffsetY_ = 0.0f;
     float immersiveDragStartPointerYaw_ = 0.0f;
     float immersiveDragStartVideoYaw_ = 0.0f;
     bool shutdownComplete_ = false;
@@ -1682,6 +1728,7 @@ private:
                 const bool moved = dragMoved_;
                 draggingHand_ = -1;
                 draggingImmersive_ = false;
+                draggingTheater_ = false;
                 if (wasImmersiveDrag && moved) {
                     notifyImmersiveOrientation(
                         gImmersiveYawDegrees.load(),
@@ -1722,6 +1769,57 @@ private:
                     pointerHit_ = origin + direction * 2.0f;
                     return;
                 }
+                if (draggingTheater_) {
+                    Vec3 target{};
+                    float surfaceU = 0.0f;
+                    float surfaceV = 0.0f;
+                    const float curvature = gScreenCurvature.load();
+                    if (!intersectRayWithCurvedScreen(
+                            origin,
+                            direction,
+                            theaterScreenBasis(),
+                            kTheaterScreenHalfWidth,
+                            kTheaterScreenHalfWidth,
+                            kTheaterScreenHalfHeight,
+                            curvature,
+                            0.04f,
+                            &target,
+                            &surfaceU,
+                            &surfaceV)) {
+                        continue;
+                    }
+                    const float pointerArc =
+                        (surfaceU * 2.0f - 1.0f) * kTheaterScreenHalfWidth;
+                    const float pointerVertical =
+                        (1.0f - surfaceV * 2.0f) * kTheaterScreenHalfHeight;
+                    const float imageHalfHeight = gTheaterImageHalfHeight.load();
+                    const float imageHalfWidth = imageHalfHeight *
+                        std::clamp(gAspect.load(), 0.8f, 2.4f);
+                    const float maxX = std::max(
+                        0.0f, kTheaterScreenHalfWidth - imageHalfWidth);
+                    const float maxY = std::max(
+                        0.0f, kTheaterScreenHalfHeight - imageHalfHeight);
+                    const float newX = std::clamp(
+                        theaterDragStartOffsetX_ + pointerArc -
+                            theaterDragStartPointerArc_,
+                        -maxX,
+                        maxX);
+                    const float newY = std::clamp(
+                        theaterDragStartOffsetY_ + pointerVertical -
+                            theaterDragStartPointerVertical_,
+                        -maxY,
+                        maxY);
+                    if (std::abs(newX - theaterDragStartOffsetX_) > 0.025f ||
+                        std::abs(newY - theaterDragStartOffsetY_) > 0.025f) {
+                        dragMoved_ = true;
+                    }
+                    gTheaterImageOffsetX.store(newX);
+                    gTheaterImageOffsetY.store(newY);
+                    pointerVisible_ = true;
+                    pointerOrigin_ = origin;
+                    pointerHit_ = target;
+                    return;
+                }
                 Vec3 target{};
                 if (!intersectRayWithSphere(origin, direction, dragRadius_, &target)) continue;
                 const float targetYaw = std::atan2(target.x, -target.z);
@@ -1750,15 +1848,30 @@ private:
             }
 
             const bool immersiveProjection = gVideoProjection.load() != 0;
+            const bool theaterActive =
+                gEnvironmentMode.load() == 1 && !immersiveProjection;
             const bool immersivePlaybackUi =
                 gImmersivePlaybackUi.load();
             const ScreenBasis basis =
                 gMenuInteractive.load() && immersivePlaybackUi
                     ? anchoredImmersiveMenuBasis_
-                    : currentScreenBasis();
-            const float halfHeight = gScreenHalfHeight.load();
+                    : theaterActive
+                        ? theaterScreenBasis()
+                        : currentScreenBasis();
+            const float halfHeight = theaterActive
+                ? gTheaterImageHalfHeight.load()
+                : gScreenHalfHeight.load();
             const float videoHalfWidth =
                 halfHeight * std::clamp(gAspect.load(), 0.8f, 2.4f);
+            const float curvatureReferenceHalfWidth = theaterActive
+                ? kTheaterScreenHalfWidth
+                : videoHalfWidth;
+            const float horizontalOffset = theaterActive
+                ? gTheaterImageOffsetX.load()
+                : 0.0f;
+            const float verticalOffset = theaterActive
+                ? gTheaterImageOffsetY.load()
+                : 0.0f;
             Vec3 hit{};
             float u = 0.0f;
             float v = 0.0f;
@@ -1773,13 +1886,15 @@ private:
                     direction,
                     basis,
                     menuHalfWidth,
-                    menuReferenceHalfWidth,
+                    theaterActive ? kTheaterScreenHalfWidth : menuReferenceHalfWidth,
                     halfHeight,
                     gScreenCurvature.load(),
                     0.03f,
                     &hit,
                     &u,
-                    &v);
+                    &v,
+                    horizontalOffset,
+                    verticalOffset);
                 if (!inside) {
                     float videoU = 0.0f;
                     // Preserve picture clicks on portions of ultra-wide video that
@@ -1789,13 +1904,15 @@ private:
                         direction,
                         basis,
                         videoHalfWidth,
-                        videoHalfWidth,
+                        curvatureReferenceHalfWidth,
                         halfHeight,
                         gScreenCurvature.load(),
                         0.03f,
                         &hit,
                         &videoU,
-                        &v);
+                        &v,
+                        horizontalOffset,
+                        verticalOffset);
                     if (inside) u = videoU < 0.5f ? -0.01f : 1.01f;
                 }
             } else if (immersiveProjection) {
@@ -1809,13 +1926,15 @@ private:
                     direction,
                     basis,
                     videoHalfWidth,
-                    videoHalfWidth,
+                    curvatureReferenceHalfWidth,
                     halfHeight,
                     gScreenCurvature.load(),
                     0.03f,
                     &hit,
                     &u,
-                    &v);
+                    &v,
+                    horizontalOffset,
+                    verticalOffset);
             }
             if (inside) {
                 get.action = thumbstickAction_;
@@ -1883,6 +2002,38 @@ private:
             }
 
             if (pressed && inside) {
+                if (theaterActive) {
+                    Vec3 surfaceHit{};
+                    float surfaceU = 0.0f;
+                    float surfaceV = 0.0f;
+                    if (!intersectRayWithCurvedScreen(
+                            origin,
+                            direction,
+                            theaterScreenBasis(),
+                            kTheaterScreenHalfWidth,
+                            kTheaterScreenHalfWidth,
+                            kTheaterScreenHalfHeight,
+                            gScreenCurvature.load(),
+                            0.04f,
+                            &surfaceHit,
+                            &surfaceU,
+                            &surfaceV)) {
+                        continue;
+                    }
+                    draggingHand_ = hand;
+                    draggingTheater_ = true;
+                    theaterDragStartPointerArc_ =
+                        (surfaceU * 2.0f - 1.0f) * kTheaterScreenHalfWidth;
+                    theaterDragStartPointerVertical_ =
+                        (1.0f - surfaceV * 2.0f) * kTheaterScreenHalfHeight;
+                    theaterDragStartOffsetX_ = gTheaterImageOffsetX.load();
+                    theaterDragStartOffsetY_ = gTheaterImageOffsetY.load();
+                    dragMoved_ = false;
+                    pointerVisible_ = true;
+                    pointerOrigin_ = origin;
+                    pointerHit_ = hit;
+                    return;
+                }
                 dragStartCenter_ = basis.center;
                 dragRadius_ = std::clamp(length(basis.center), 0.5f, 8.0f);
                 Vec3 target{};
@@ -1908,9 +2059,34 @@ private:
                 XrActionStateVector2f stick{XR_TYPE_ACTION_STATE_VECTOR2F};
                 xrGetActionStateVector2f(session_, &get, &stick);
                 if (stick.isActive && std::abs(stick.currentState.y) > 0.18f) {
-                    const float oldSize = gScreenHalfHeight.load();
-                    const float newSize = std::clamp(oldSize + stick.currentState.y * 0.012f, 0.45f, 1.55f);
-                    gScreenHalfHeight.store(newSize);
+                    const float oldSize = theaterActive
+                        ? gTheaterImageHalfHeight.load()
+                        : gScreenHalfHeight.load();
+                    const float maximumSize = theaterActive
+                        ? std::min(
+                            1.45f,
+                            kTheaterScreenHalfWidth /
+                                std::clamp(gAspect.load(), 0.8f, 2.4f) * 0.98f)
+                        : 1.55f;
+                    const float newSize = std::clamp(
+                        oldSize + stick.currentState.y * 0.012f,
+                        0.45f,
+                        maximumSize);
+                    if (theaterActive) {
+                        gTheaterImageHalfHeight.store(newSize);
+                        const float newHalfWidth = newSize *
+                            std::clamp(gAspect.load(), 0.8f, 2.4f);
+                        gTheaterImageOffsetX.store(std::clamp(
+                            gTheaterImageOffsetX.load(),
+                            -std::max(0.0f, kTheaterScreenHalfWidth - newHalfWidth),
+                            std::max(0.0f, kTheaterScreenHalfWidth - newHalfWidth)));
+                        gTheaterImageOffsetY.store(std::clamp(
+                            gTheaterImageOffsetY.load(),
+                            -std::max(0.0f, kTheaterScreenHalfHeight - newSize),
+                            std::max(0.0f, kTheaterScreenHalfHeight - newSize)));
+                    } else {
+                        gScreenHalfHeight.store(newSize);
+                    }
                     pointerVisible_ = true;
                     pointerOrigin_ = origin;
                     pointerHit_ = hit;
@@ -2272,6 +2448,143 @@ private:
         checkXr(xrEndFrame(session_, &end), "xrEndFrame");
     }
 
+    void drawSolidGeometry(
+        const Mat4& mvp,
+        const std::vector<float>& vertices,
+        float red,
+        float green,
+        float blue,
+        float alpha = 1.0f) {
+        if (vertices.empty()) return;
+        glBindVertexArray(vertexArray_);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
+        glBufferSubData(
+            GL_ARRAY_BUFFER,
+            0,
+            vertices.size() * sizeof(float),
+            vertices.data());
+        glUseProgram(pointerProgram_);
+        glUniformMatrix4fv(
+            glGetUniformLocation(pointerProgram_, "uMvp"),
+            1,
+            GL_FALSE,
+            mvp.m);
+        glUniform4f(
+            glGetUniformLocation(pointerProgram_, "uColor"),
+            red,
+            green,
+            blue,
+            alpha);
+        glDrawArrays(
+            GL_TRIANGLES,
+            0,
+            static_cast<GLsizei>(vertices.size() / 5));
+    }
+
+    static void appendSolidQuad(
+        std::vector<float>& vertices,
+        const Vec3& topLeft,
+        const Vec3& bottomLeft,
+        const Vec3& bottomRight,
+        const Vec3& topRight) {
+        const auto add = [&vertices](const Vec3& point) {
+            vertices.insert(
+                vertices.end(),
+                {point.x, point.y, point.z, 0.0f, 0.0f});
+        };
+        add(topLeft);
+        add(bottomLeft);
+        add(bottomRight);
+        add(topLeft);
+        add(bottomRight);
+        add(topRight);
+    }
+
+    void drawTheater(const Mat4& mvp, float curvature) {
+        const float brightness = std::clamp(
+            gTheaterBrightness.load(), 0.0f, 1.0f);
+        std::vector<float> room;
+        room.reserve(6 * 5 * 8);
+        // A deliberately restrained auditorium: the geometry establishes a
+        // stable room and central seating position without spending precious
+        // fill rate on detailed meshes or textures.
+        appendSolidQuad(room,
+            {-5.2f, 2.8f, -3.75f}, {-5.2f, -1.65f, -3.75f},
+            {5.2f, -1.65f, -3.75f}, {5.2f, 2.8f, -3.75f});
+        drawSolidGeometry(
+            mvp, room,
+            0.018f + 0.035f * brightness,
+            0.014f + 0.025f * brightness,
+            0.021f + 0.040f * brightness);
+
+        room.clear();
+        appendSolidQuad(room,
+            {-5.2f, -1.65f, -3.75f}, {-5.2f, -1.65f, 4.0f},
+            {5.2f, -1.65f, 4.0f}, {5.2f, -1.65f, -3.75f});
+        appendSolidQuad(room,
+            {-5.2f, 2.8f, 4.0f}, {-5.2f, 2.8f, -3.75f},
+            {5.2f, 2.8f, -3.75f}, {5.2f, 2.8f, 4.0f});
+        drawSolidGeometry(
+            mvp, room,
+            0.012f + 0.030f * brightness,
+            0.011f + 0.020f * brightness,
+            0.017f + 0.025f * brightness);
+
+        room.clear();
+        appendSolidQuad(room,
+            {-5.2f, 2.8f, 4.0f}, {-5.2f, -1.65f, 4.0f},
+            {-5.2f, -1.65f, -3.75f}, {-5.2f, 2.8f, -3.75f});
+        appendSolidQuad(room,
+            {5.2f, 2.8f, -3.75f}, {5.2f, -1.65f, -3.75f},
+            {5.2f, -1.65f, 4.0f}, {5.2f, 2.8f, 4.0f});
+        drawSolidGeometry(
+            mvp, room,
+            0.015f + 0.040f * brightness,
+            0.012f + 0.018f * brightness,
+            0.022f + 0.045f * brightness);
+
+        // Low, warm aisle markers give the room scale without distracting
+        // from the picture.
+        room.clear();
+        appendSolidQuad(room,
+            {-4.75f, -1.48f, -3.5f}, {-4.75f, -1.57f, -3.5f},
+            {-4.75f, -1.57f, 2.7f}, {-4.75f, -1.48f, 2.7f});
+        appendSolidQuad(room,
+            {4.75f, -1.48f, 2.7f}, {4.75f, -1.57f, 2.7f},
+            {4.75f, -1.57f, -3.5f}, {4.75f, -1.48f, -3.5f});
+        drawSolidGeometry(
+            mvp, room,
+            0.26f * brightness,
+            0.085f * brightness,
+            0.025f * brightness);
+
+        // Draw the complete fixed theater screen, including its curved black
+        // backing. The video is subsequently drawn as a movable window on it.
+        room.clear();
+        room.reserve(kScreenSegments * 6 * 5);
+        for (int segment = 0; segment < kScreenSegments; ++segment) {
+            const float n0 =
+                static_cast<float>(segment) / kScreenSegments * 2.0f - 1.0f;
+            const float n1 =
+                static_cast<float>(segment + 1) / kScreenSegments * 2.0f - 1.0f;
+            appendSolidQuad(
+                room,
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n0,
+                    kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.025f),
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n0,
+                    -kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.025f),
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n1,
+                    -kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.025f),
+                theaterSurfacePoint(
+                    kTheaterScreenHalfWidth, n1,
+                    kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.025f));
+        }
+        drawSolidGeometry(mvp, room, 0.002f, 0.002f, 0.003f);
+    }
+
     void renderEye(uint32_t eye, const XrView& view, bool passthroughActive) {
         auto& chain = swapchains_[eye];
         uint32_t imageIndex = 0;
@@ -2289,6 +2602,14 @@ private:
             const float dimmingAlpha = 1.0f - std::clamp(
                 gPassthroughBrightness.load(), 0.0f, 1.0f);
             glClearColor(0.0f, 0.0f, 0.0f, dimmingAlpha);
+        } else if (gEnvironmentMode.load() == 1 && gVideoProjection.load() == 0) {
+            const float brightness = std::clamp(
+                gTheaterBrightness.load(), 0.0f, 1.0f);
+            glClearColor(
+                0.006f + 0.010f * brightness,
+                0.005f + 0.007f * brightness,
+                0.010f + 0.014f * brightness,
+                1.0f);
         } else {
             const float sceneBrightness = gSceneBrightness.load();
             glClearColor(
@@ -2301,14 +2622,22 @@ private:
         glDisable(GL_DEPTH_TEST);
 
         const Mat4 mvp = multiply(projection(view.fov), viewFromPose(view.pose));
+        const int projectionMode = gVideoProjection.load();
+        const bool theaterActive =
+            gEnvironmentMode.load() == 1 && projectionMode == 0;
+        const float curvature = gScreenCurvature.load();
+        if (theaterActive) drawTheater(mvp, curvature);
         const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
-        const float halfHeight = gScreenHalfHeight.load();
+        const float halfHeight = theaterActive
+            ? gTheaterImageHalfHeight.load()
+            : gScreenHalfHeight.load();
         const float halfWidth = halfHeight * aspect;
         const ScreenBasis basis =
             gMenuInteractive.load() && gImmersivePlaybackUi.load()
                 ? anchoredImmersiveMenuBasis_
-                : currentScreenBasis();
-        const float curvature = gScreenCurvature.load();
+                : theaterActive
+                    ? theaterScreenBasis()
+                    : currentScreenBasis();
         std::vector<float> videoVertices;
         videoVertices.reserve(kMaximumSurfaceVertices * 5);
         const auto appendVertex = [&videoVertices](
@@ -2319,7 +2648,6 @@ private:
             videoVertices.push_back(u);
             videoVertices.push_back(v);
         };
-        const int projectionMode = gVideoProjection.load();
         if (projectionMode == 0) {
             for (int segment = 0; segment < kScreenSegments; ++segment) {
                 const float u0 =
@@ -2330,14 +2658,26 @@ private:
                     static_cast<float>(kScreenSegments);
                 const float normalized0 = u0 * 2.0f - 1.0f;
                 const float normalized1 = u1 * 2.0f - 1.0f;
-                const Vec3 topLeft = curvedScreenPoint(
-                    basis, halfWidth, normalized0, halfHeight, curvature);
-                const Vec3 bottomLeft = curvedScreenPoint(
-                    basis, halfWidth, normalized0, -halfHeight, curvature);
-                const Vec3 bottomRight = curvedScreenPoint(
-                    basis, halfWidth, normalized1, -halfHeight, curvature);
-                const Vec3 topRight = curvedScreenPoint(
-                    basis, halfWidth, normalized1, halfHeight, curvature);
+                const auto videoPoint = [&](float normalized, float vertical) {
+                    return theaterActive
+                        ? theaterSurfacePoint(
+                            halfWidth,
+                            normalized,
+                            vertical,
+                            curvature,
+                            gTheaterImageOffsetX.load(),
+                            gTheaterImageOffsetY.load())
+                        : curvedScreenPoint(
+                            basis,
+                            halfWidth,
+                            normalized,
+                            vertical,
+                            curvature);
+                };
+                const Vec3 topLeft = videoPoint(normalized0, halfHeight);
+                const Vec3 bottomLeft = videoPoint(normalized0, -halfHeight);
+                const Vec3 bottomRight = videoPoint(normalized1, -halfHeight);
+                const Vec3 topRight = videoPoint(normalized1, halfHeight);
                 appendVertex(topLeft, u0, 1.0f);
                 appendVertex(bottomLeft, u0, 0.0f);
                 appendVertex(bottomRight, u1, 0.0f);
@@ -2670,6 +3010,24 @@ private:
                         : u1 * 2.0f - 1.0f;
                 const auto subtitlePoint =
                     [&](float normalizedHorizontal, float vertical) {
+                        if (theaterActive) {
+                            const float surfaceHalfWidth = isBitmapSubtitle
+                                ? halfWidth
+                                : subtitleHalfWidth;
+                            const float localHorizontal = isBitmapSubtitle
+                                ? normalizedHorizontal
+                                : normalizedHorizontal +
+                                    textHorizontalOffset /
+                                        std::max(subtitleHalfWidth, 0.0001f);
+                            return theaterSurfacePoint(
+                                surfaceHalfWidth,
+                                localHorizontal,
+                                vertical,
+                                curvature,
+                                gTheaterImageOffsetX.load(),
+                                gTheaterImageOffsetY.load(),
+                                subtitleForward);
+                        }
                         return isBitmapSubtitle
                             ? curvedScreenPoint(
                                 subtitleBasis,
@@ -2757,7 +3115,9 @@ private:
         const ScreenBasis basis =
             gMenuInteractive.load() && gImmersivePlaybackUi.load()
                 ? anchoredImmersiveMenuBasis_
-                : currentScreenBasis();
+                : gEnvironmentMode.load() == 1 && gVideoProjection.load() == 0
+                    ? theaterScreenBasis()
+                    : currentScreenBasis();
         const Vec3 lineEnd = pointerHit_ + basis.normal * 0.01f;
         const float line[] = {
             pointerOrigin_.x, pointerOrigin_.y, pointerOrigin_.z, 0, 0,
@@ -2908,6 +3268,61 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPassthrough(
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetEnvironment(
+        JNIEnv*,
+        jclass,
+        jint mode,
+        jfloat theaterBrightness,
+        jfloat passthroughBrightness,
+        jfloat theaterOffsetX,
+        jfloat theaterOffsetY,
+        jfloat theaterHalfHeight) {
+    const int safeMode = std::clamp(static_cast<int>(mode), 0, 2);
+    gEnvironmentMode.store(safeMode);
+    gPassthroughRequested.store(safeMode == 2);
+    if (std::isfinite(theaterBrightness)) {
+        gTheaterBrightness.store(std::clamp(theaterBrightness, 0.0f, 1.0f));
+    }
+    if (std::isfinite(passthroughBrightness)) {
+        gPassthroughBrightness.store(
+            std::clamp(passthroughBrightness, 0.0f, 1.0f));
+    }
+    const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
+    const float maximumHeight = std::min(
+        1.45f, kTheaterScreenHalfWidth / aspect * 0.98f);
+    const float safeHalfHeight = std::isfinite(theaterHalfHeight)
+        ? std::clamp(theaterHalfHeight, 0.45f, maximumHeight)
+        : 1.0f;
+    const float safeHalfWidth = safeHalfHeight * aspect;
+    const float maximumX = std::max(
+        0.0f, kTheaterScreenHalfWidth - safeHalfWidth);
+    const float maximumY = std::max(
+        0.0f, kTheaterScreenHalfHeight - safeHalfHeight);
+    gTheaterImageHalfHeight.store(safeHalfHeight);
+    gTheaterImageOffsetX.store(
+        std::isfinite(theaterOffsetX)
+            ? std::clamp(theaterOffsetX, -maximumX, maximumX)
+            : 0.0f);
+    gTheaterImageOffsetY.store(
+        std::isfinite(theaterOffsetY)
+            ? std::clamp(theaterOffsetY, -maximumY, maximumY)
+            : 0.0f);
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeGetTheaterScreenTransform(
+        JNIEnv* env, jclass) {
+    const jfloat values[] = {
+        gTheaterImageOffsetX.load(),
+        gTheaterImageOffsetY.load(),
+        gTheaterImageHalfHeight.load(),
+    };
+    jfloatArray result = env->NewFloatArray(3);
+    if (result) env->SetFloatArrayRegion(result, 0, 3, values);
+    return result;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeIsPassthroughSupported(JNIEnv*, jclass) {
     return gPassthroughSupported.load() ? JNI_TRUE : JNI_FALSE;
@@ -2920,7 +3335,24 @@ Java_dev_dreamplayer_PlayerActivity_nativeRequestStop(JNIEnv*, jclass) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAspect(JNIEnv*, jclass, jfloat aspect) {
-    if (std::isfinite(aspect) && aspect > 0.1f) gAspect.store(aspect);
+    if (std::isfinite(aspect) && aspect > 0.1f) {
+        const float safeAspect = std::clamp(aspect, 0.8f, 2.4f);
+        gAspect.store(aspect);
+        const float maximumHeight = std::min(
+            1.45f, kTheaterScreenHalfWidth / safeAspect * 0.98f);
+        const float halfHeight = std::clamp(
+            gTheaterImageHalfHeight.load(), 0.45f, maximumHeight);
+        const float halfWidth = halfHeight * safeAspect;
+        const float maximumX = std::max(
+            0.0f, kTheaterScreenHalfWidth - halfWidth);
+        const float maximumY = std::max(
+            0.0f, kTheaterScreenHalfHeight - halfHeight);
+        gTheaterImageHalfHeight.store(halfHeight);
+        gTheaterImageOffsetX.store(std::clamp(
+            gTheaterImageOffsetX.load(), -maximumX, maximumX));
+        gTheaterImageOffsetY.store(std::clamp(
+            gTheaterImageOffsetY.load(), -maximumY, maximumY));
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
