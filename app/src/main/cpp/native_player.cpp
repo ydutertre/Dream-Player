@@ -185,7 +185,7 @@ Vec3 theaterSeatPosition() {
     const int row = std::clamp(gTheaterSeatRow.load(), 0, 2);
     const int column = std::clamp(gTheaterSeatColumn.load(), -1, 1);
     constexpr float rowZ[] = {-0.50f, 2.20f, 5.20f};
-    constexpr float rowY[] = {0.18f, 0.62f, 1.10f};
+    constexpr float rowY[] = {0.25f, 0.86f, 1.55f};
     return {
         static_cast<float>(column) * 1.06f,
         rowY[row],
@@ -812,6 +812,8 @@ private:
     uint32_t adaptiveResetGeneration_ = 0;
     bool adaptiveHistoryValid_ = false;
     float adaptiveEffectiveTargetNits_ = 100.0f;
+    Vec3 theaterScreenLightColor_{1.0f, 0.92f, 0.82f};
+    float theaterScreenLightStrength_ = 0.0f;
     std::array<float, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight>
         previousAdaptiveLogLuma_{};
     std::array<uint8_t, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight * 4>
@@ -1537,6 +1539,9 @@ private:
             uniform vec3 uColor;
             uniform float uRoomBrightness;
             uniform float uEmissive;
+            uniform vec3 uScreenLightColor;
+            uniform float uScreenLightStrength;
+            uniform vec3 uScreenPosition;
             out vec4 fragColor;
             void main() {
                 vec3 normal = normalize(vNormal);
@@ -1550,7 +1555,17 @@ private:
                 float roomLevel = clamp(uRoomBrightness, 0.0, 1.0);
                 vec3 shaded = uColor * illumination * roomLevel;
                 vec3 emissive = uColor * (2.2 * roomLevel);
-                fragColor = vec4(mix(shaded, emissive, clamp(uEmissive, 0.0, 1.0)), 1.0);
+                vec3 toScreen = uScreenPosition - vPosition;
+                float screenDistance = length(toScreen);
+                vec3 screenDirection = toScreen / max(screenDistance, 0.001);
+                float screenFacing = max(dot(normal, screenDirection), 0.0);
+                float screenFalloff = 1.0 / (1.0 + 0.020 * screenDistance * screenDistance);
+                float screenSpill = uScreenLightStrength * screenFalloff *
+                    (0.08 + 0.92 * screenFacing);
+                vec3 screenLit = uScreenLightColor * uColor * screenSpill;
+                fragColor = vec4(
+                    mix(shaded, emissive, clamp(uEmissive, 0.0, 1.0)) + screenLit,
+                    1.0);
             }
         )glsl";
         const char* adaptiveAnalysisVertex = R"glsl(#version 300 es
@@ -1584,7 +1599,8 @@ private:
             void main() {
                 vec2 transformed =
                     (uTexTransform * vec4(vUv, 0.0, 1.0)).xy;
-                vec3 sourceNits = pqToNits(texture(uVideo, transformed).rgb);
+                vec3 sampleColor = texture(uVideo, transformed).rgb;
+                vec3 sourceNits = pqToNits(sampleColor);
                 vec3 luma = uPrimaries == 1
                     ? vec3(0.2627, 0.6780, 0.0593)
                     : vec3(0.2126, 0.7152, 0.0722);
@@ -1593,7 +1609,9 @@ private:
                     log2(1.0 + sourceLumaNits) / log2(10001.0),
                     0.0,
                     1.0);
-                fragColor = vec4(encoded, encoded, encoded, 1.0);
+                // Preserve the source colour for auditorium screen spill while
+                // retaining logarithmic PQ luminance in alpha for HDR analysis.
+                fragColor = vec4(sampleColor, encoded);
             }
         )glsl";
         videoProgram_ = makeProgram(vertex, videoFragment);
@@ -2275,12 +2293,20 @@ private:
 
     void analyzeAdaptiveToneMapping(int64_t videoTimestampNanos) {
         const float staticTargetNits = gToneMapPeakNits.load();
-        if (!adaptiveToneMappingActive()) {
+        const bool adaptiveActive = adaptiveToneMappingActive();
+        const bool theaterLightingActive =
+            gEnvironmentMode.load() == 1 &&
+            gVideoProjection.load() == 0 &&
+            gHasVideo.load();
+        if (!adaptiveActive) {
             if (adaptiveHistoryValid_ ||
                 gAdaptiveToneMapEffectiveNits.load() != staticTargetNits) {
                 resetAdaptiveAnalysis(staticTargetNits);
             }
-            return;
+            if (!theaterLightingActive) {
+                theaterScreenLightStrength_ = 0.0f;
+                return;
+            }
         }
 
         const uint32_t resetGeneration = gAdaptiveToneMapResetGeneration.load();
@@ -2290,6 +2316,10 @@ private:
         }
         if (videoTimestampNanos <= 0 ||
             videoTimestampNanos == lastAnalyzedVideoTimestampNanos_) {
+            return;
+        }
+        if (!adaptiveActive && lastAnalyzedVideoTimestampNanos_ > 0 &&
+            videoTimestampNanos - lastAnalyzedVideoTimestampNanos_ < 80'000'000) {
             return;
         }
 
@@ -2340,13 +2370,50 @@ private:
 
         constexpr size_t sampleCount =
             kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight;
+        Vec3 meanScreenColor{};
+        float meanScreenLuma = 0.0f;
+        for (size_t index = 0; index < sampleCount; ++index) {
+            const Vec3 sample{
+                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f,
+                static_cast<float>(adaptiveReadback_[index * 4 + 1]) / 255.0f,
+                static_cast<float>(adaptiveReadback_[index * 4 + 2]) / 255.0f,
+            };
+            meanScreenColor = meanScreenColor + sample;
+            meanScreenLuma += dot(sample, {0.2126f, 0.7152f, 0.0722f});
+        }
+        meanScreenColor = meanScreenColor * (1.0f / static_cast<float>(sampleCount));
+        meanScreenLuma /= static_cast<float>(sampleCount);
+        const float colorPeak = std::max(
+            std::max(meanScreenColor.x, meanScreenColor.y), meanScreenColor.z);
+        const Vec3 targetScreenColor = colorPeak > 0.015f
+            ? meanScreenColor * (1.0f / colorPeak)
+            : Vec3{1.0f, 0.92f, 0.82f};
+        const float targetScreenStrength = theaterLightingActive
+            ? std::clamp(
+                (meanScreenLuma - 0.035f) / 0.50f,
+                0.0f,
+                1.0f) * 1.35f
+            : 0.0f;
+        const float screenLightAlpha = lastAnalyzedVideoTimestampNanos_ == 0
+            ? 1.0f
+            : 0.10f;
+        theaterScreenLightColor_ = theaterScreenLightColor_ +
+            (targetScreenColor - theaterScreenLightColor_) * screenLightAlpha;
+        theaterScreenLightStrength_ +=
+            (targetScreenStrength - theaterScreenLightStrength_) * screenLightAlpha;
+
+        if (!adaptiveActive) {
+            lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
+            return;
+        }
+
         std::array<float, sampleCount> sourceNits{};
         std::array<float, 16> histogram{};
         float meanNits = 0.0f;
         float meanEncoded = 0.0f;
         for (size_t index = 0; index < sampleCount; ++index) {
             const float encoded =
-                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
+                static_cast<float>(adaptiveReadback_[index * 4 + 3]) / 255.0f;
             const float nits =
                 std::exp2(encoded * std::log2(10001.0f)) - 1.0f;
             sourceNits[index] = nits;
@@ -2428,7 +2495,7 @@ private:
             previousMean /= static_cast<float>(sampleCount);
             for (size_t index = 0; index < sampleCount; ++index) {
                 const float current =
-                    static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
+                    static_cast<float>(adaptiveReadback_[index * 4 + 3]) / 255.0f;
                 const float previous = previousAdaptiveLogLuma_[index];
                 structuralDifference += std::abs(
                     (current - meanEncoded) - (previous - previousMean));
@@ -2480,7 +2547,7 @@ private:
         gAdaptiveToneMapEffectiveNits.store(adaptiveEffectiveTargetNits_);
         for (size_t index = 0; index < sampleCount; ++index) {
             previousAdaptiveLogLuma_[index] =
-                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
+                static_cast<float>(adaptiveReadback_[index * 4 + 3]) / 255.0f;
         }
         adaptiveHistoryValid_ = true;
         lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
@@ -2638,6 +2705,20 @@ private:
         glUniform1f(
             glGetUniformLocation(theaterProgram_, "uEmissive"),
             emissive);
+        glUniform3f(
+            glGetUniformLocation(theaterProgram_, "uScreenLightColor"),
+            theaterScreenLightColor_.x,
+            theaterScreenLightColor_.y,
+            theaterScreenLightColor_.z);
+        glUniform1f(
+            glGetUniformLocation(theaterProgram_, "uScreenLightStrength"),
+            theaterScreenLightStrength_);
+        const Vec3 theaterScreenCenter = theaterScreenBasis().center;
+        glUniform3f(
+            glGetUniformLocation(theaterProgram_, "uScreenPosition"),
+            theaterScreenCenter.x,
+            theaterScreenCenter.y,
+            theaterScreenCenter.z);
         glDrawArrays(
             GL_TRIANGLES,
             0,
@@ -2979,7 +3060,7 @@ private:
             -1.40f, -0.50f, 0.70f, 2.20f, 3.70f, 5.20f, 6.80f,
         };
         constexpr float rowElevations[] = {
-            0.0f, 0.18f, 0.38f, 0.62f, 0.86f, 1.10f, 1.36f,
+            0.0f, 0.25f, 0.53f, 0.86f, 1.20f, 1.55f, 1.92f,
         };
         constexpr int selectablePhysicalRows[] = {1, 3, 5};
         const int selectedRow = std::clamp(gTheaterSeatRow.load(), 0, 2);
@@ -3013,8 +3094,10 @@ private:
                 appendTheaterEllipsoid(
                     seatShadows,
                     {x, elevation - 0.61f, z + 0.28f},
-                    {0.48f, 0.57f, 0.18f},
-                    0.13f);
+                    {0.50f, 0.61f, 0.20f},
+                    0.13f,
+                    16,
+                    10);
                 appendTheaterChamferedBox(
                     seatShadows,
                     {x, 0.0f, z - 0.18f},
@@ -3030,8 +3113,10 @@ private:
                 appendTheaterEllipsoid(
                     upholstery,
                     {x, elevation - 0.61f, z + 0.245f},
-                    {0.405f, 0.50f, 0.145f},
-                    0.13f);
+                    {0.43f, 0.54f, 0.16f},
+                    0.13f,
+                    16,
+                    10);
                 appendTheaterChamferedBox(
                     upholstery,
                     {x, 0.0f, z - 0.20f},
@@ -3133,7 +3218,7 @@ private:
             -0.95f, 0.10f, 1.45f, 2.95f, 4.45f, 6.00f,
         };
         constexpr float tierTops[] = {
-            -1.47f, -1.27f, -1.03f, -0.79f, -0.55f, -0.29f,
+            -1.40f, -1.12f, -0.79f, -0.45f, -0.10f, 0.27f,
         };
         for (int tier = 0; tier < 6; ++tier) {
             appendTheaterBox(
@@ -3208,7 +3293,7 @@ private:
         if (coolLights.empty()) {
         // Continuous aisle tread markers make the stadium rake legible.
         constexpr float stepZ[] = {-0.95f, 0.10f, 1.45f, 2.95f, 4.45f, 6.00f};
-        constexpr float stepY[] = {-1.465f, -1.265f, -1.025f, -0.785f, -0.545f, -0.285f};
+        constexpr float stepY[] = {-1.395f, -1.115f, -0.785f, -0.445f, -0.095f, 0.275f};
         for (int step = 0; step < 6; ++step) {
             appendTheaterBox(
                 coolLights, -7.78f, stepY[step], stepZ[step] - 0.045f,
