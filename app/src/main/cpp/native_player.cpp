@@ -35,6 +35,9 @@ std::atomic<float> gImmersiveYawDegrees{0.0f};
 std::atomic<float> gImmersivePitchDegrees{0.0f};
 std::atomic<float> gLatestHeadYawDegrees{0.0f};
 std::atomic<float> gLatestHeadPitchDegrees{0.0f};
+std::atomic<float> gLatestHeadX{0.0f};
+std::atomic<float> gLatestHeadY{0.0f};
+std::atomic<float> gLatestHeadZ{0.0f};
 std::atomic<uint64_t> gImmersiveMenuAnchorGeneration{1};
 // 0 = original samples, 1 = metadata-driven managed color.
 std::atomic<int> gPictureMode{1};
@@ -73,6 +76,12 @@ std::atomic<float> gTheaterBrightness{0.35f};
 std::atomic<float> gTheaterImageOffsetX{0.0f};
 std::atomic<float> gTheaterImageOffsetY{0.0f};
 std::atomic<float> gTheaterImageHalfHeight{1.0f};
+std::atomic<int> gTheaterSeatRow{1};
+std::atomic<int> gTheaterSeatColumn{0};
+std::atomic<float> gTheaterYawDegrees{0.0f};
+std::atomic<float> gTheaterAnchorX{0.0f};
+std::atomic<float> gTheaterAnchorY{0.0f};
+std::atomic<float> gTheaterAnchorZ{0.0f};
 std::atomic<bool> gPassthroughRequested{false};
 std::atomic<float> gPassthroughBrightness{1.0f};
 std::atomic<bool> gPassthroughSupported{false};
@@ -171,12 +180,39 @@ ScreenBasis currentScreenBasis() {
     return {center, right, up, outward * -1.0f};
 }
 
+Vec3 theaterSeatPosition() {
+    const int row = std::clamp(gTheaterSeatRow.load(), 0, 2);
+    const int column = std::clamp(gTheaterSeatColumn.load(), -1, 1);
+    constexpr float rowZ[] = {-0.85f, 0.15f, 1.20f};
+    return {static_cast<float>(column) * 1.18f, 0.0f, rowZ[row]};
+}
+
+Vec3 rotateTheaterYaw(const Vec3& value) {
+    const float yaw = gTheaterYawDegrees.load() * kPi / 180.0f;
+    const float sine = std::sin(yaw);
+    const float cosine = std::cos(yaw);
+    return {
+        cosine * value.x - sine * value.z,
+        value.y,
+        sine * value.x + cosine * value.z,
+    };
+}
+
+Vec3 theaterWorldPoint(const Vec3& localPoint) {
+    const Vec3 anchor{
+        gTheaterAnchorX.load(),
+        gTheaterAnchorY.load(),
+        gTheaterAnchorZ.load(),
+    };
+    return anchor + rotateTheaterYaw(localPoint - theaterSeatPosition());
+}
+
 ScreenBasis theaterScreenBasis() {
     return {
-        {0.0f, 0.15f, -kTheaterScreenDistance},
-        {1.0f, 0.0f, 0.0f},
+        theaterWorldPoint({0.0f, 0.15f, -kTheaterScreenDistance}),
+        rotateTheaterYaw({1.0f, 0.0f, 0.0f}),
         {0.0f, 1.0f, 0.0f},
-        {0.0f, 0.0f, 1.0f},
+        rotateTheaterYaw({0.0f, 0.0f, 1.0f}),
     };
 }
 
@@ -2347,6 +2383,9 @@ private:
             };
         }
         headCenter_ = position * (1.0f / static_cast<float>(viewCount));
+        gLatestHeadX.store(headCenter_.x);
+        gLatestHeadY.store(headCenter_.y);
+        gLatestHeadZ.store(headCenter_.z);
         const XrQuaternionf orientation = views_[0].pose.orientation;
         const Vec3 forward = normalized(
             rotateVector(orientation, {0.0f, 0.0f, -1.0f}));
@@ -2500,75 +2539,30 @@ private:
         add(topRight);
     }
 
-    void drawTheater(const Mat4& mvp, float curvature) {
-        const float brightness = std::clamp(
-            gTheaterBrightness.load(), 0.0f, 1.0f);
-        std::vector<float> room;
-        room.reserve(6 * 5 * 8);
-        // A deliberately restrained auditorium: the geometry establishes a
-        // stable room and central seating position without spending precious
-        // fill rate on detailed meshes or textures.
-        appendSolidQuad(room,
-            {-5.2f, 2.8f, -3.75f}, {-5.2f, -1.65f, -3.75f},
-            {5.2f, -1.65f, -3.75f}, {5.2f, 2.8f, -3.75f});
-        drawSolidGeometry(
-            mvp, room,
-            0.018f + 0.035f * brightness,
-            0.014f + 0.025f * brightness,
-            0.021f + 0.040f * brightness);
+    static void appendTheaterQuad(
+        std::vector<float>& vertices,
+        const Vec3& topLeft,
+        const Vec3& bottomLeft,
+        const Vec3& bottomRight,
+        const Vec3& topRight) {
+        appendSolidQuad(
+            vertices,
+            theaterWorldPoint(topLeft),
+            theaterWorldPoint(bottomLeft),
+            theaterWorldPoint(bottomRight),
+            theaterWorldPoint(topRight));
+    }
 
-        room.clear();
-        appendSolidQuad(room,
-            {-5.2f, -1.65f, -3.75f}, {-5.2f, -1.65f, 4.0f},
-            {5.2f, -1.65f, 4.0f}, {5.2f, -1.65f, -3.75f});
-        appendSolidQuad(room,
-            {-5.2f, 2.8f, 4.0f}, {-5.2f, 2.8f, -3.75f},
-            {5.2f, 2.8f, -3.75f}, {5.2f, 2.8f, 4.0f});
-        drawSolidGeometry(
-            mvp, room,
-            0.012f + 0.030f * brightness,
-            0.011f + 0.020f * brightness,
-            0.017f + 0.025f * brightness);
-
-        room.clear();
-        appendSolidQuad(room,
-            {-5.2f, 2.8f, 4.0f}, {-5.2f, -1.65f, 4.0f},
-            {-5.2f, -1.65f, -3.75f}, {-5.2f, 2.8f, -3.75f});
-        appendSolidQuad(room,
-            {5.2f, 2.8f, -3.75f}, {5.2f, -1.65f, -3.75f},
-            {5.2f, -1.65f, 4.0f}, {5.2f, 2.8f, 4.0f});
-        drawSolidGeometry(
-            mvp, room,
-            0.015f + 0.040f * brightness,
-            0.012f + 0.018f * brightness,
-            0.022f + 0.045f * brightness);
-
-        // Low, warm aisle markers give the room scale without distracting
-        // from the picture.
-        room.clear();
-        appendSolidQuad(room,
-            {-4.75f, -1.48f, -3.5f}, {-4.75f, -1.57f, -3.5f},
-            {-4.75f, -1.57f, 2.7f}, {-4.75f, -1.48f, 2.7f});
-        appendSolidQuad(room,
-            {4.75f, -1.48f, 2.7f}, {4.75f, -1.57f, 2.7f},
-            {4.75f, -1.57f, -3.5f}, {4.75f, -1.48f, -3.5f});
-        drawSolidGeometry(
-            mvp, room,
-            0.26f * brightness,
-            0.085f * brightness,
-            0.025f * brightness);
-
-        // Draw the complete fixed theater screen, including its curved black
-        // backing. The video is subsequently drawn as a movable window on it.
-        room.clear();
-        room.reserve(kScreenSegments * 6 * 5);
+    void drawTheaterScreenBacking(const Mat4& mvp, float curvature) {
+        std::vector<float> backing;
+        backing.reserve(kScreenSegments * 6 * 5);
         for (int segment = 0; segment < kScreenSegments; ++segment) {
             const float n0 =
                 static_cast<float>(segment) / kScreenSegments * 2.0f - 1.0f;
             const float n1 =
                 static_cast<float>(segment + 1) / kScreenSegments * 2.0f - 1.0f;
             appendSolidQuad(
-                room,
+                backing,
                 theaterSurfacePoint(
                     kTheaterScreenHalfWidth, n0,
                     kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.025f),
@@ -2582,7 +2576,149 @@ private:
                     kTheaterScreenHalfWidth, n1,
                     kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.025f));
         }
-        drawSolidGeometry(mvp, room, 0.002f, 0.002f, 0.003f);
+        drawSolidGeometry(mvp, backing, 0.002f, 0.002f, 0.003f);
+    }
+
+    void drawTheaterSeats(const Mat4& mvp, float brightness) {
+        constexpr float rowPositions[] = {-0.85f, 0.15f, 1.20f, 2.30f};
+        const int selectedRow = std::clamp(gTheaterSeatRow.load(), 0, 2);
+        const int selectedColumn = std::clamp(gTheaterSeatColumn.load(), -1, 1);
+        std::vector<float> upholstery;
+        std::vector<float> seatAccents;
+        std::vector<float> seatFrames;
+        upholstery.reserve(4 * 7 * 12 * 5);
+        seatAccents.reserve(4 * 7 * 6 * 5);
+        seatFrames.reserve(4 * 8 * 12 * 5);
+        for (int rowIndex = 3; rowIndex >= 0; --rowIndex) {
+            const float z = rowPositions[rowIndex];
+            for (int column = -3; column <= 3; ++column) {
+                if (rowIndex == selectedRow && column == selectedColumn) continue;
+                const float x = static_cast<float>(column) * 1.18f;
+                appendTheaterQuad(
+                    upholstery,
+                    {x - 0.43f, -0.20f, z + 0.30f},
+                    {x - 0.37f, -1.12f, z + 0.18f},
+                    {x + 0.37f, -1.12f, z + 0.18f},
+                    {x + 0.43f, -0.20f, z + 0.30f});
+                appendTheaterQuad(
+                    upholstery,
+                    {x - 0.39f, -0.24f, z + 0.31f},
+                    {x - 0.34f, -0.53f, z + 0.27f},
+                    {x + 0.34f, -0.53f, z + 0.27f},
+                    {x + 0.39f, -0.24f, z + 0.31f});
+                appendTheaterQuad(
+                    seatAccents,
+                    {x - 0.40f, -1.02f, z - 0.45f},
+                    {x - 0.36f, -1.25f, z + 0.04f},
+                    {x + 0.36f, -1.25f, z + 0.04f},
+                    {x + 0.40f, -1.02f, z - 0.45f});
+                for (float side : {-0.52f, 0.52f}) {
+                    appendTheaterQuad(
+                        seatFrames,
+                        {x + side - 0.055f, -0.73f, z - 0.42f},
+                        {x + side - 0.055f, -1.31f, z + 0.12f},
+                        {x + side + 0.055f, -1.31f, z + 0.12f},
+                        {x + side + 0.055f, -0.73f, z - 0.42f});
+                }
+            }
+        }
+        drawSolidGeometry(
+            mvp, upholstery,
+            0.12f + 0.13f * brightness,
+            0.018f + 0.025f * brightness,
+            0.030f + 0.035f * brightness);
+        drawSolidGeometry(
+            mvp, seatAccents,
+            0.065f + 0.075f * brightness,
+            0.010f + 0.018f * brightness,
+            0.020f + 0.028f * brightness);
+        drawSolidGeometry(
+            mvp, seatFrames,
+            0.018f + 0.025f * brightness,
+            0.012f + 0.014f * brightness,
+            0.018f + 0.022f * brightness);
+    }
+
+    void drawTheater(const Mat4& mvp, float curvature) {
+        const float brightness = std::clamp(
+            gTheaterBrightness.load(), 0.0f, 1.0f);
+        std::vector<float> room;
+        room.reserve(6 * 5 * 8);
+        // A deliberately restrained auditorium: the geometry establishes a
+        // stable room and central seating position without spending precious
+        // fill rate on detailed meshes or textures.
+        appendTheaterQuad(room,
+            {-5.2f, 2.8f, -3.75f}, {-5.2f, -1.65f, -3.75f},
+            {5.2f, -1.65f, -3.75f}, {5.2f, 2.8f, -3.75f});
+        drawSolidGeometry(
+            mvp, room,
+            0.018f + 0.035f * brightness,
+            0.014f + 0.025f * brightness,
+            0.021f + 0.040f * brightness);
+
+        room.clear();
+        appendTheaterQuad(room,
+            {-5.2f, -1.65f, -3.75f}, {-5.2f, -1.65f, 4.0f},
+            {5.2f, -1.65f, 4.0f}, {5.2f, -1.65f, -3.75f});
+        appendTheaterQuad(room,
+            {-5.2f, 2.8f, 4.0f}, {-5.2f, 2.8f, -3.75f},
+            {5.2f, 2.8f, -3.75f}, {5.2f, 2.8f, 4.0f});
+        drawSolidGeometry(
+            mvp, room,
+            0.012f + 0.030f * brightness,
+            0.011f + 0.020f * brightness,
+            0.017f + 0.025f * brightness);
+
+        room.clear();
+        appendTheaterQuad(room,
+            {-5.2f, 2.8f, 4.0f}, {-5.2f, -1.65f, 4.0f},
+            {-5.2f, -1.65f, -3.75f}, {-5.2f, 2.8f, -3.75f});
+        appendTheaterQuad(room,
+            {5.2f, 2.8f, -3.75f}, {5.2f, -1.65f, -3.75f},
+            {5.2f, -1.65f, 4.0f}, {5.2f, 2.8f, 4.0f});
+        drawSolidGeometry(
+            mvp, room,
+            0.015f + 0.040f * brightness,
+            0.012f + 0.018f * brightness,
+            0.022f + 0.045f * brightness);
+
+        // Low, warm aisle markers give the room scale without distracting
+        // from the picture.
+        room.clear();
+        appendTheaterQuad(room,
+            {-4.75f, -1.48f, -3.5f}, {-4.75f, -1.57f, -3.5f},
+            {-4.75f, -1.57f, 2.7f}, {-4.75f, -1.48f, 2.7f});
+        appendTheaterQuad(room,
+            {4.75f, -1.48f, 2.7f}, {4.75f, -1.57f, 2.7f},
+            {4.75f, -1.57f, -3.5f}, {4.75f, -1.48f, -3.5f});
+        drawSolidGeometry(
+            mvp, room,
+            0.26f * brightness,
+            0.085f * brightness,
+            0.025f * brightness);
+
+        // The screen is behind the seat rows, so draw it first in this
+        // painter-ordered renderer. Seats in front can then silhouette
+        // naturally against the lower edge without a depth attachment.
+        drawTheaterScreenBacking(mvp, curvature);
+
+        // Warm wall sconces and a dim proscenium wash add scale and prevent
+        // the room from reading as an empty box.
+        room.clear();
+        for (float z : {-2.3f, -0.5f, 1.3f, 3.1f}) {
+            appendTheaterQuad(room,
+                {-5.12f, 1.10f, z - 0.12f}, {-5.12f, 0.62f, z - 0.12f},
+                {-5.12f, 0.62f, z + 0.12f}, {-5.12f, 1.10f, z + 0.12f});
+            appendTheaterQuad(room,
+                {5.12f, 1.10f, z + 0.12f}, {5.12f, 0.62f, z + 0.12f},
+                {5.12f, 0.62f, z - 0.12f}, {5.12f, 1.10f, z - 0.12f});
+        }
+        drawSolidGeometry(
+            mvp, room,
+            0.42f * brightness,
+            0.15f * brightness,
+            0.045f * brightness);
+
     }
 
     void renderEye(uint32_t eye, const XrView& view, bool passthroughActive) {
@@ -2829,6 +2965,12 @@ private:
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
             glUniform1i(glGetUniformLocation(videoProgram_, "uVideo"), 0);
             glDrawArrays(GL_TRIANGLES, 0, videoVertexCount);
+        }
+
+        if (theaterActive) {
+            drawTheaterSeats(
+                mvp,
+                std::clamp(gTheaterBrightness.load(), 0.0f, 1.0f));
         }
 
         if (gSubtitleWidth.load() > 0 && gSubtitleHeight.load() > 0) {
@@ -3321,6 +3463,21 @@ Java_dev_dreamplayer_PlayerActivity_nativeGetTheaterScreenTransform(
     jfloatArray result = env->NewFloatArray(3);
     if (result) env->SetFloatArrayRegion(result, 0, 3, values);
     return result;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetTheaterSeat(
+        JNIEnv*, jclass, jint row, jint column) {
+    gTheaterSeatRow.store(std::clamp(static_cast<int>(row), 0, 2));
+    gTheaterSeatColumn.store(std::clamp(static_cast<int>(column), -1, 1));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeRecenterTheater(JNIEnv*, jclass) {
+    gTheaterYawDegrees.store(gLatestHeadYawDegrees.load());
+    gTheaterAnchorX.store(gLatestHeadX.load());
+    gTheaterAnchorY.store(gLatestHeadY.load());
+    gTheaterAnchorZ.store(gLatestHeadZ.load());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
