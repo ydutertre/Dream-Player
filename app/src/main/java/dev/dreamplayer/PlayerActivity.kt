@@ -6728,11 +6728,25 @@ class PlayerActivity : Activity(), Player.Listener {
                             (Color.blue(textSubtitleColor) * textSubtitleBrightness)
                                 .toInt().coerceIn(0, 255),
                         )
+                        val theaterViewingDistanceScale =
+                            if (environmentMode == EnvironmentMode.THEATER) {
+                                when (theaterSeatRow.coerceIn(0, 2)) {
+                                    1 -> 1.442f
+                                    2 -> 1.950f
+                                    else -> 1f
+                                }
+                            } else {
+                                1f
+                            }
                         text(
                             if (enabled) "Subtitle preview" else "Image subtitle appearance is embedded",
                             505f,
                             218f,
-                            if (enabled) 25f * textSubtitleScale else 21f,
+                            if (enabled) {
+                                25f * textSubtitleScale * theaterViewingDistanceScale
+                            } else {
+                                21f
+                            },
                             color = if (enabled) previewColor else colorTextMuted,
                         )
                         text("Color", 190f, 245f, 22f, Paint.Align.LEFT, colorTextMuted)

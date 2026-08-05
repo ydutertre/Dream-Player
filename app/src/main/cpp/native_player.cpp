@@ -814,8 +814,6 @@ private:
     uint32_t adaptiveResetGeneration_ = 0;
     bool adaptiveHistoryValid_ = false;
     float adaptiveEffectiveTargetNits_ = 100.0f;
-    Vec3 theaterScreenLightColor_{1.0f, 0.92f, 0.82f};
-    float theaterScreenLightStrength_ = 0.0f;
     std::array<float, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight>
         previousAdaptiveLogLuma_{};
     std::array<uint8_t, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight * 4>
@@ -1541,8 +1539,8 @@ private:
             uniform vec3 uColor;
             uniform float uRoomBrightness;
             uniform float uEmissive;
-            uniform vec3 uScreenLightColor;
-            uniform float uScreenLightStrength;
+            uniform sampler2D uScreenSample;
+            uniform float uScreenLightEnabled;
             uniform vec3 uScreenPosition;
             out vec4 fragColor;
             void main() {
@@ -1562,9 +1560,23 @@ private:
                 vec3 screenDirection = toScreen / max(screenDistance, 0.001);
                 float screenFacing = max(dot(normal, screenDirection), 0.0);
                 float screenFalloff = 1.0 / (1.0 + 0.020 * screenDistance * screenDistance);
-                float screenSpill = uScreenLightStrength * screenFalloff *
+                vec3 screenSample = (
+                    texture(uScreenSample, vec2(0.25, 0.25)).rgb +
+                    texture(uScreenSample, vec2(0.75, 0.25)).rgb +
+                    texture(uScreenSample, vec2(0.25, 0.75)).rgb +
+                    texture(uScreenSample, vec2(0.75, 0.75)).rgb +
+                    texture(uScreenSample, vec2(0.50, 0.50)).rgb) * 0.2;
+                float samplePeak = max(max(screenSample.r, screenSample.g), screenSample.b);
+                vec3 screenLightColor = samplePeak > 0.015
+                    ? screenSample / samplePeak
+                    : vec3(1.0, 0.92, 0.82);
+                float screenLuma = dot(screenSample, vec3(0.2126, 0.7152, 0.0722));
+                float screenLightStrength =
+                    clamp((screenLuma - 0.035) / 0.50, 0.0, 1.0) * 1.35 *
+                    uScreenLightEnabled;
+                float screenSpill = screenLightStrength * screenFalloff *
                     (0.08 + 0.92 * screenFacing);
-                vec3 screenLit = uScreenLightColor * uColor * screenSpill;
+                vec3 screenLit = screenLightColor * uColor * screenSpill;
                 fragColor = vec4(
                     mix(shaded, emissive, clamp(uEmissive, 0.0, 1.0)) + screenLit,
                     1.0);
@@ -2306,7 +2318,6 @@ private:
                 resetAdaptiveAnalysis(staticTargetNits);
             }
             if (!theaterLightingActive) {
-                theaterScreenLightStrength_ = 0.0f;
                 return;
             }
         }
@@ -2361,6 +2372,13 @@ private:
             glGetUniformLocation(adaptiveAnalysisProgram_, "uVideo"),
             0);
         glDrawArrays(GL_TRIANGLES, 0, 6);
+        if (!adaptiveActive) {
+            // The low-resolution texture is consumed directly by the theater
+            // shader. Avoiding a synchronous GPU-to-CPU readback here keeps
+            // movie motion smooth while retaining dynamic screen spill.
+            lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
+            return;
+        }
         glReadPixels(
             0,
             0,
@@ -2372,43 +2390,6 @@ private:
 
         constexpr size_t sampleCount =
             kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight;
-        Vec3 meanScreenColor{};
-        float meanScreenLuma = 0.0f;
-        for (size_t index = 0; index < sampleCount; ++index) {
-            const Vec3 sample{
-                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f,
-                static_cast<float>(adaptiveReadback_[index * 4 + 1]) / 255.0f,
-                static_cast<float>(adaptiveReadback_[index * 4 + 2]) / 255.0f,
-            };
-            meanScreenColor = meanScreenColor + sample;
-            meanScreenLuma += dot(sample, {0.2126f, 0.7152f, 0.0722f});
-        }
-        meanScreenColor = meanScreenColor * (1.0f / static_cast<float>(sampleCount));
-        meanScreenLuma /= static_cast<float>(sampleCount);
-        const float colorPeak = std::max(
-            std::max(meanScreenColor.x, meanScreenColor.y), meanScreenColor.z);
-        const Vec3 targetScreenColor = colorPeak > 0.015f
-            ? meanScreenColor * (1.0f / colorPeak)
-            : Vec3{1.0f, 0.92f, 0.82f};
-        const float targetScreenStrength = theaterLightingActive
-            ? std::clamp(
-                (meanScreenLuma - 0.035f) / 0.50f,
-                0.0f,
-                1.0f) * 1.35f
-            : 0.0f;
-        const float screenLightAlpha = lastAnalyzedVideoTimestampNanos_ == 0
-            ? 1.0f
-            : 0.10f;
-        theaterScreenLightColor_ = theaterScreenLightColor_ +
-            (targetScreenColor - theaterScreenLightColor_) * screenLightAlpha;
-        theaterScreenLightStrength_ +=
-            (targetScreenStrength - theaterScreenLightStrength_) * screenLightAlpha;
-
-        if (!adaptiveActive) {
-            lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
-            return;
-        }
-
         std::array<float, sampleCount> sourceNits{};
         std::array<float, 16> histogram{};
         float meanNits = 0.0f;
@@ -2707,14 +2688,14 @@ private:
         glUniform1f(
             glGetUniformLocation(theaterProgram_, "uEmissive"),
             emissive);
-        glUniform3f(
-            glGetUniformLocation(theaterProgram_, "uScreenLightColor"),
-            theaterScreenLightColor_.x,
-            theaterScreenLightColor_.y,
-            theaterScreenLightColor_.z);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, adaptiveAnalysisTexture_);
+        glUniform1i(
+            glGetUniformLocation(theaterProgram_, "uScreenSample"),
+            1);
         glUniform1f(
-            glGetUniformLocation(theaterProgram_, "uScreenLightStrength"),
-            theaterScreenLightStrength_);
+            glGetUniformLocation(theaterProgram_, "uScreenLightEnabled"),
+            gHasVideo.load() ? 1.0f : 0.0f);
         const Vec3 theaterScreenCenter = theaterScreenBasis().center;
         glUniform3f(
             glGetUniformLocation(theaterProgram_, "uScreenPosition"),
@@ -2725,6 +2706,7 @@ private:
             GL_TRIANGLES,
             0,
             static_cast<GLsizei>(vertices.size() / 5));
+        glActiveTexture(GL_TEXTURE0);
     }
 
     void ensureDepthBuffer(int width, int height) {
@@ -3733,7 +3715,21 @@ private:
             } else {
                 const float textScale =
                     std::clamp(gTextSubtitleScale.load(), 0.6f, 1.8f);
-                const float textHalfHeight = 0.15f * textScale;
+                float viewingDistanceScale = 1.0f;
+                if (theaterActive) {
+                    constexpr float kFrontRowScreenDistance = 5.846f;
+                    const float currentScreenDistance = length(
+                        theaterScreenBasis().center - headCenter_);
+                    viewingDistanceScale = std::clamp(
+                        currentScreenDistance / kFrontRowScreenDistance,
+                        1.0f,
+                        2.15f);
+                }
+                // Match the 25 px appearance preview rendered into the 1024 px
+                // menu texture. The subtitle bitmap's 68 px glyphs occupy
+                // roughly 21.25% of its quad, yielding this WYSIWYG factor.
+                const float textHalfHeight =
+                    0.115f * halfHeight * textScale * viewingDistanceScale;
                 const float minimumCenter = -halfHeight + textHalfHeight + 0.01f;
                 const float maximumCenter = halfHeight - textHalfHeight - 0.01f;
                 const float verticalPosition = std::clamp(
