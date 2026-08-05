@@ -184,7 +184,12 @@ Vec3 theaterSeatPosition() {
     const int row = std::clamp(gTheaterSeatRow.load(), 0, 2);
     const int column = std::clamp(gTheaterSeatColumn.load(), -1, 1);
     constexpr float rowZ[] = {-0.85f, 0.15f, 1.20f};
-    return {static_cast<float>(column) * 1.18f, 0.0f, rowZ[row]};
+    constexpr float rowY[] = {0.0f, 0.16f, 0.32f};
+    return {
+        static_cast<float>(column) * 1.06f,
+        rowY[row],
+        rowZ[row],
+    };
 }
 
 Vec3 rotateTheaterYaw(const Vec3& value) {
@@ -745,6 +750,9 @@ private:
     std::vector<XrView> views_;
     std::vector<Swapchain> swapchains_;
     GLuint framebuffer_ = 0;
+    GLuint depthRenderbuffer_ = 0;
+    int depthBufferWidth_ = 0;
+    int depthBufferHeight_ = 0;
     GLuint adaptiveAnalysisFramebuffer_ = 0;
     GLuint adaptiveAnalysisTexture_ = 0;
     GLuint videoTexture_ = 0;
@@ -1526,6 +1534,7 @@ private:
         subtitleProgram_ = makeProgram(vertex, subtitleFragment);
         pointerProgram_ = makeProgram(vertex, pointerFragment);
         glGenFramebuffers(1, &framebuffer_);
+        glGenRenderbuffers(1, &depthRenderbuffer_);
         glGenFramebuffers(1, &adaptiveAnalysisFramebuffer_);
         glGenTextures(1, &adaptiveAnalysisTexture_);
         glBindTexture(GL_TEXTURE_2D, adaptiveAnalysisTexture_);
@@ -2520,6 +2529,25 @@ private:
             static_cast<GLsizei>(vertices.size() / 5));
     }
 
+    void ensureDepthBuffer(int width, int height) {
+        if (!depthRenderbuffer_) return;
+        glBindRenderbuffer(GL_RENDERBUFFER, depthRenderbuffer_);
+        if (depthBufferWidth_ != width || depthBufferHeight_ != height) {
+            glRenderbufferStorage(
+                GL_RENDERBUFFER,
+                GL_DEPTH_COMPONENT16,
+                width,
+                height);
+            depthBufferWidth_ = width;
+            depthBufferHeight_ = height;
+        }
+        glFramebufferRenderbuffer(
+            GL_FRAMEBUFFER,
+            GL_DEPTH_ATTACHMENT,
+            GL_RENDERBUFFER,
+            depthRenderbuffer_);
+    }
+
     static void appendSolidQuad(
         std::vector<float>& vertices,
         const Vec3& topLeft,
@@ -2553,6 +2581,94 @@ private:
             theaterWorldPoint(topRight));
     }
 
+    static void appendTheaterBox(
+        std::vector<float>& vertices,
+        float left,
+        float bottom,
+        float front,
+        float right,
+        float top,
+        float back) {
+        appendTheaterQuad(vertices,
+            {left, top, front}, {left, bottom, front},
+            {right, bottom, front}, {right, top, front});
+        appendTheaterQuad(vertices,
+            {right, top, back}, {right, bottom, back},
+            {left, bottom, back}, {left, top, back});
+        appendTheaterQuad(vertices,
+            {left, top, back}, {left, bottom, back},
+            {left, bottom, front}, {left, top, front});
+        appendTheaterQuad(vertices,
+            {right, top, front}, {right, bottom, front},
+            {right, bottom, back}, {right, top, back});
+        appendTheaterQuad(vertices,
+            {left, top, back}, {left, top, front},
+            {right, top, front}, {right, top, back});
+        appendTheaterQuad(vertices,
+            {left, bottom, front}, {left, bottom, back},
+            {right, bottom, back}, {right, bottom, front});
+    }
+
+    static void appendTheaterWedge(
+        std::vector<float>& vertices,
+        float left,
+        float right,
+        float bottom,
+        float top,
+        float bottomFront,
+        float bottomBack,
+        float topFront,
+        float topBack) {
+        appendTheaterQuad(vertices,
+            {left, top, topFront}, {left, bottom, bottomFront},
+            {right, bottom, bottomFront}, {right, top, topFront});
+        appendTheaterQuad(vertices,
+            {right, top, topBack}, {right, bottom, bottomBack},
+            {left, bottom, bottomBack}, {left, top, topBack});
+        appendTheaterQuad(vertices,
+            {left, top, topBack}, {left, bottom, bottomBack},
+            {left, bottom, bottomFront}, {left, top, topFront});
+        appendTheaterQuad(vertices,
+            {right, top, topFront}, {right, bottom, bottomFront},
+            {right, bottom, bottomBack}, {right, top, topBack});
+        appendTheaterQuad(vertices,
+            {left, top, topBack}, {left, top, topFront},
+            {right, top, topFront}, {right, top, topBack});
+        appendTheaterQuad(vertices,
+            {left, bottom, bottomFront}, {left, bottom, bottomBack},
+            {right, bottom, bottomBack}, {right, bottom, bottomFront});
+    }
+
+    static void appendTheaterHorizontalDisc(
+        std::vector<float>& vertices,
+        const Vec3& center,
+        float radius,
+        int segments = 12) {
+        for (int segment = 0; segment < segments; ++segment) {
+            const float angle0 = 2.0f * kPi * segment / segments;
+            const float angle1 = 2.0f * kPi * (segment + 1) / segments;
+            const Vec3 p0{
+                center.x + std::cos(angle0) * radius,
+                center.y,
+                center.z + std::sin(angle0) * radius,
+            };
+            const Vec3 p1{
+                center.x + std::cos(angle1) * radius,
+                center.y,
+                center.z + std::sin(angle1) * radius,
+            };
+            const auto add = [&vertices](const Vec3& point) {
+                const Vec3 world = theaterWorldPoint(point);
+                vertices.insert(vertices.end(), {
+                    world.x, world.y, world.z, 0.0f, 0.0f,
+                });
+            };
+            add(center);
+            add(p0);
+            add(p1);
+        }
+    }
+
     void drawTheaterScreenBacking(const Mat4& mvp, float curvature) {
         std::vector<float> backing;
         backing.reserve(kScreenSegments * 6 * 5);
@@ -2581,144 +2697,263 @@ private:
 
     void drawTheaterSeats(const Mat4& mvp, float brightness) {
         constexpr float rowPositions[] = {-0.85f, 0.15f, 1.20f, 2.30f};
+        constexpr float rowElevations[] = {0.0f, 0.16f, 0.32f, 0.50f};
         const int selectedRow = std::clamp(gTheaterSeatRow.load(), 0, 2);
         const int selectedColumn = std::clamp(gTheaterSeatColumn.load(), -1, 1);
         std::vector<float> upholstery;
-        std::vector<float> seatAccents;
+        std::vector<float> cushionHighlights;
         std::vector<float> seatFrames;
-        upholstery.reserve(4 * 7 * 12 * 5);
-        seatAccents.reserve(4 * 7 * 6 * 5);
-        seatFrames.reserve(4 * 8 * 12 * 5);
-        for (int rowIndex = 3; rowIndex >= 0; --rowIndex) {
+        std::vector<float> seatShadows;
+        upholstery.reserve(4 * 9 * 54 * 5);
+        cushionHighlights.reserve(4 * 9 * 48 * 5);
+        seatFrames.reserve(4 * 9 * 54 * 5);
+        seatShadows.reserve(4 * 9 * 42 * 5);
+        for (int rowIndex = 0; rowIndex < 4; ++rowIndex) {
             const float z = rowPositions[rowIndex];
-            for (int column = -3; column <= 3; ++column) {
+            const float elevation = rowElevations[rowIndex];
+            for (int column = -4; column <= 4; ++column) {
                 if (rowIndex == selectedRow && column == selectedColumn) continue;
-                const float x = static_cast<float>(column) * 1.18f;
-                appendTheaterQuad(
+                const float x = static_cast<float>(column) * 1.06f;
+                const auto box = [x, z, elevation](
+                    std::vector<float>& target,
+                    float left, float bottom, float front,
+                    float right, float top, float back) {
+                    appendTheaterBox(
+                        target,
+                        x + left, elevation + bottom, z + front,
+                        x + right, elevation + top, z + back);
+                };
+                const auto wedge = [x, z, elevation](
+                    std::vector<float>& target,
+                    float left, float right, float bottom, float top,
+                    float bottomFront, float bottomBack,
+                    float topFront, float topBack) {
+                    appendTheaterWedge(
+                        target,
+                        x + left, x + right,
+                        elevation + bottom, elevation + top,
+                        z + bottomFront, z + bottomBack,
+                        z + topFront, z + topBack);
+                };
+
+                // Rigid rear shell and under-seat structure.
+                wedge(
+                    seatShadows,
+                    -0.46f, 0.46f, -1.14f, -0.10f,
+                    0.12f, 0.38f, 0.23f, 0.43f);
+                box(
+                    seatShadows,
+                    -0.46f, -1.18f, -0.48f,
+                    0.46f, -1.02f, 0.18f);
+
+                // Deep back cushion with separate side bolsters. These are
+                // real closed volumes, not camera-facing cards.
+                wedge(
                     upholstery,
-                    {x - 0.43f, -0.20f, z + 0.30f},
-                    {x - 0.37f, -1.12f, z + 0.18f},
-                    {x + 0.37f, -1.12f, z + 0.18f},
-                    {x + 0.43f, -0.20f, z + 0.30f});
-                appendTheaterQuad(
+                    -0.36f, 0.36f, -1.08f, -0.17f,
+                    0.055f, 0.18f, 0.14f, 0.29f);
+                wedge(
+                    cushionHighlights,
+                    -0.43f, -0.32f, -1.07f, -0.19f,
+                    0.07f, 0.20f, 0.15f, 0.31f);
+                wedge(
+                    cushionHighlights,
+                    0.32f, 0.43f, -1.07f, -0.19f,
+                    0.07f, 0.20f, 0.15f, 0.31f);
+
+                // Thick seat cushion and a darker front apron.
+                box(
                     upholstery,
-                    {x - 0.39f, -0.24f, z + 0.31f},
-                    {x - 0.34f, -0.53f, z + 0.27f},
-                    {x + 0.34f, -0.53f, z + 0.27f},
-                    {x + 0.39f, -0.24f, z + 0.31f});
-                appendTheaterQuad(
-                    seatAccents,
-                    {x - 0.40f, -1.02f, z - 0.45f},
-                    {x - 0.36f, -1.25f, z + 0.04f},
-                    {x + 0.36f, -1.25f, z + 0.04f},
-                    {x + 0.40f, -1.02f, z - 0.45f});
-                for (float side : {-0.52f, 0.52f}) {
-                    appendTheaterQuad(
+                    -0.39f, -1.05f, -0.43f,
+                    0.39f, -0.87f, 0.08f);
+                box(
+                    cushionHighlights,
+                    -0.35f, -0.91f, -0.39f,
+                    0.35f, -0.855f, 0.045f);
+                box(
+                    seatShadows,
+                    -0.40f, -1.15f, -0.48f,
+                    0.40f, -1.03f, -0.37f);
+
+                // Substantial armrests, floor pedestal and stabilizing foot.
+                for (float side : {-0.48f, 0.48f}) {
+                    box(
                         seatFrames,
-                        {x + side - 0.055f, -0.73f, z - 0.42f},
-                        {x + side - 0.055f, -1.31f, z + 0.12f},
-                        {x + side + 0.055f, -1.31f, z + 0.12f},
-                        {x + side + 0.055f, -0.73f, z - 0.42f});
+                        side - 0.075f, -1.05f, -0.43f,
+                        side + 0.075f, -0.78f, 0.28f);
                 }
+                box(
+                    seatFrames,
+                    -0.13f, -1.59f, -0.02f,
+                    0.13f, -1.14f, 0.18f);
+                box(
+                    seatFrames,
+                    -0.29f, -1.63f, -0.13f,
+                    0.29f, -1.56f, 0.27f);
+                appendTheaterHorizontalDisc(
+                    seatShadows,
+                    {x + 0.48f, elevation - 0.773f, z - 0.28f},
+                    0.052f);
             }
         }
         drawSolidGeometry(
             mvp, upholstery,
-            0.12f + 0.13f * brightness,
-            0.018f + 0.025f * brightness,
-            0.030f + 0.035f * brightness);
+            0.105f + 0.15f * brightness,
+            0.010f + 0.028f * brightness,
+            0.020f + 0.038f * brightness);
         drawSolidGeometry(
-            mvp, seatAccents,
-            0.065f + 0.075f * brightness,
-            0.010f + 0.018f * brightness,
-            0.020f + 0.028f * brightness);
+            mvp, cushionHighlights,
+            0.15f + 0.18f * brightness,
+            0.018f + 0.038f * brightness,
+            0.032f + 0.050f * brightness);
         drawSolidGeometry(
             mvp, seatFrames,
-            0.018f + 0.025f * brightness,
-            0.012f + 0.014f * brightness,
-            0.018f + 0.022f * brightness);
+            0.018f + 0.030f * brightness,
+            0.014f + 0.020f * brightness,
+            0.020f + 0.028f * brightness);
+        drawSolidGeometry(
+            mvp, seatShadows,
+            0.014f + 0.020f * brightness,
+            0.006f + 0.010f * brightness,
+            0.010f + 0.014f * brightness);
     }
 
     void drawTheater(const Mat4& mvp, float curvature) {
         const float brightness = std::clamp(
             gTheaterBrightness.load(), 0.0f, 1.0f);
-        std::vector<float> room;
-        room.reserve(6 * 5 * 8);
-        // A deliberately restrained auditorium: the geometry establishes a
-        // stable room and central seating position without spending precious
-        // fill rate on detailed meshes or textures.
-        appendTheaterQuad(room,
-            {-5.2f, 2.8f, -3.75f}, {-5.2f, -1.65f, -3.75f},
-            {5.2f, -1.65f, -3.75f}, {5.2f, 2.8f, -3.75f});
+        std::vector<float> shell;
+        std::vector<float> floor;
+        std::vector<float> panels;
+        std::vector<float> trim;
+        std::vector<float> lights;
+        shell.reserve(420 * 5);
+        floor.reserve(360 * 5);
+        panels.reserve(720 * 5);
+        trim.reserve(480 * 5);
+        lights.reserve(360 * 5);
+
+        // Closed auditorium shell. Slightly tapered front side sections and a
+        // layered proscenium prevent the room from reading as a simple box.
+        appendTheaterBox(shell, -5.65f, -1.82f, -4.05f, -5.42f, 3.10f, 4.40f);
+        appendTheaterBox(shell, 5.42f, -1.82f, -4.05f, 5.65f, 3.10f, 4.40f);
+        appendTheaterBox(shell, -5.65f, -1.82f, 4.18f, 5.65f, 3.10f, 4.42f);
+        appendTheaterBox(shell, -5.65f, 2.96f, -4.05f, 5.65f, 3.14f, 4.42f);
+        appendTheaterBox(shell, -5.65f, -1.82f, -4.02f, -3.34f, 3.10f, -3.72f);
+        appendTheaterBox(shell, 3.34f, -1.82f, -4.02f, 5.65f, 3.10f, -3.72f);
+        appendTheaterBox(shell, -3.34f, 1.90f, -4.02f, 3.34f, 3.10f, -3.72f);
         drawSolidGeometry(
-            mvp, room,
-            0.018f + 0.035f * brightness,
-            0.014f + 0.025f * brightness,
-            0.021f + 0.040f * brightness);
+            mvp, shell,
+            0.010f + 0.020f * brightness,
+            0.009f + 0.014f * brightness,
+            0.016f + 0.026f * brightness);
 
-        room.clear();
-        appendTheaterQuad(room,
-            {-5.2f, -1.65f, -3.75f}, {-5.2f, -1.65f, 4.0f},
-            {5.2f, -1.65f, 4.0f}, {5.2f, -1.65f, -3.75f});
-        appendTheaterQuad(room,
-            {-5.2f, 2.8f, 4.0f}, {-5.2f, 2.8f, -3.75f},
-            {5.2f, 2.8f, -3.75f}, {5.2f, 2.8f, 4.0f});
-        drawSolidGeometry(
-            mvp, room,
-            0.012f + 0.030f * brightness,
-            0.011f + 0.020f * brightness,
-            0.017f + 0.025f * brightness);
-
-        room.clear();
-        appendTheaterQuad(room,
-            {-5.2f, 2.8f, 4.0f}, {-5.2f, -1.65f, 4.0f},
-            {-5.2f, -1.65f, -3.75f}, {-5.2f, 2.8f, -3.75f});
-        appendTheaterQuad(room,
-            {5.2f, 2.8f, -3.75f}, {5.2f, -1.65f, -3.75f},
-            {5.2f, -1.65f, 4.0f}, {5.2f, 2.8f, 4.0f});
-        drawSolidGeometry(
-            mvp, room,
-            0.015f + 0.040f * brightness,
-            0.012f + 0.018f * brightness,
-            0.022f + 0.045f * brightness);
-
-        // Low, warm aisle markers give the room scale without distracting
-        // from the picture.
-        room.clear();
-        appendTheaterQuad(room,
-            {-4.75f, -1.48f, -3.5f}, {-4.75f, -1.57f, -3.5f},
-            {-4.75f, -1.57f, 2.7f}, {-4.75f, -1.48f, 2.7f});
-        appendTheaterQuad(room,
-            {4.75f, -1.48f, 2.7f}, {4.75f, -1.57f, 2.7f},
-            {4.75f, -1.57f, -3.5f}, {4.75f, -1.48f, -3.5f});
-        drawSolidGeometry(
-            mvp, room,
-            0.26f * brightness,
-            0.085f * brightness,
-            0.025f * brightness);
-
-        // The screen is behind the seat rows, so draw it first in this
-        // painter-ordered renderer. Seats in front can then silhouette
-        // naturally against the lower edge without a depth attachment.
-        drawTheaterScreenBacking(mvp, curvature);
-
-        // Warm wall sconces and a dim proscenium wash add scale and prevent
-        // the room from reading as an empty box.
-        room.clear();
-        for (float z : {-2.3f, -0.5f, 1.3f, 3.1f}) {
-            appendTheaterQuad(room,
-                {-5.12f, 1.10f, z - 0.12f}, {-5.12f, 0.62f, z - 0.12f},
-                {-5.12f, 0.62f, z + 0.12f}, {-5.12f, 1.10f, z + 0.12f});
-            appendTheaterQuad(room,
-                {5.12f, 1.10f, z + 0.12f}, {5.12f, 0.62f, z + 0.12f},
-                {5.12f, 0.62f, z - 0.12f}, {5.12f, 1.10f, z - 0.12f});
+        // Stadium decks: every row is a real raised platform. Seat selection
+        // moves the complete auditorium relative to the viewer's chosen row.
+        appendTheaterBox(floor, -5.42f, -1.82f, -3.72f, 5.42f, -1.65f, 4.18f);
+        constexpr float tierStarts[] = {-0.38f, 0.67f, 1.77f};
+        constexpr float tierTops[] = {-1.49f, -1.33f, -1.15f};
+        for (int tier = 0; tier < 3; ++tier) {
+            appendTheaterBox(
+                floor,
+                -5.05f, -1.66f, tierStarts[tier],
+                5.05f, tierTops[tier], 4.12f);
         }
         drawSolidGeometry(
-            mvp, room,
-            0.42f * brightness,
-            0.15f * brightness,
-            0.045f * brightness);
+            mvp, floor,
+            0.014f + 0.025f * brightness,
+            0.013f + 0.018f * brightness,
+            0.019f + 0.028f * brightness);
 
+        // Repeating acoustic panels and vertical ribs give the long walls a
+        // believable cinema scale while remaining extremely low-poly.
+        for (float z = -2.85f; z <= 3.45f; z += 0.90f) {
+            appendTheaterBox(
+                panels, -5.40f, -0.82f, z - 0.34f,
+                -5.30f, 2.38f, z + 0.34f);
+            appendTheaterBox(
+                panels, 5.30f, -0.82f, z - 0.34f,
+                5.40f, 2.38f, z + 0.34f);
+            appendTheaterBox(
+                trim, -5.29f, -0.90f, z + 0.37f,
+                -5.22f, 2.48f, z + 0.43f);
+            appendTheaterBox(
+                trim, 5.22f, -0.90f, z + 0.37f,
+                5.29f, 2.48f, z + 0.43f);
+        }
+        drawSolidGeometry(
+            mvp, panels,
+            0.030f + 0.050f * brightness,
+            0.012f + 0.020f * brightness,
+            0.023f + 0.040f * brightness);
+        drawSolidGeometry(
+            mvp, trim,
+            0.020f + 0.032f * brightness,
+            0.018f + 0.024f * brightness,
+            0.030f + 0.045f * brightness);
+
+        // Coffered ceiling strips, rear doors and a substantial proscenium.
+        trim.clear();
+        for (float x = -4.8f; x <= 4.8f; x += 1.2f) {
+            appendTheaterBox(
+                trim, x - 0.035f, 2.88f, -3.70f,
+                x + 0.035f, 2.96f, 4.12f);
+        }
+        for (float z = -2.9f; z <= 3.5f; z += 1.05f) {
+            appendTheaterBox(
+                trim, -5.18f, 2.88f, z - 0.035f,
+                5.18f, 2.96f, z + 0.035f);
+        }
+        appendTheaterBox(trim, -3.30f, -1.66f, -3.68f, -3.12f, 1.94f, -3.42f);
+        appendTheaterBox(trim, 3.12f, -1.66f, -3.68f, 3.30f, 1.94f, -3.42f);
+        appendTheaterBox(trim, -3.30f, 1.72f, -3.68f, 3.30f, 1.94f, -3.42f);
+        appendTheaterBox(trim, -5.30f, -1.64f, 4.05f, -4.22f, 1.35f, 4.16f);
+        appendTheaterBox(trim, 4.22f, -1.64f, 4.05f, 5.30f, 1.35f, 4.16f);
+        drawSolidGeometry(
+            mvp, trim,
+            0.022f + 0.034f * brightness,
+            0.019f + 0.024f * brightness,
+            0.028f + 0.040f * brightness);
+
+        // Cool step markers echo a modern premium auditorium; warm wall and
+        // ceiling practicals retain enough spatial reference for comfort.
+        constexpr float stepZ[] = {-0.38f, 0.67f, 1.77f};
+        constexpr float stepY[] = {-1.485f, -1.325f, -1.145f};
+        for (int step = 0; step < 3; ++step) {
+            appendTheaterBox(
+                lights, -5.10f, stepY[step], stepZ[step] - 0.035f,
+                -4.66f, stepY[step] + 0.035f, stepZ[step] + 0.025f);
+            appendTheaterBox(
+                lights, 4.66f, stepY[step], stepZ[step] - 0.035f,
+                5.10f, stepY[step] + 0.035f, stepZ[step] + 0.025f);
+        }
+        drawSolidGeometry(
+            mvp, lights,
+            0.025f * brightness,
+            0.12f * brightness,
+            0.42f * brightness);
+
+        lights.clear();
+        for (float z : {-2.45f, -0.65f, 1.15f, 2.95f}) {
+            appendTheaterBox(
+                lights, -5.27f, 0.62f, z - 0.09f,
+                -5.17f, 1.08f, z + 0.09f);
+            appendTheaterBox(
+                lights, 5.17f, 0.62f, z - 0.09f,
+                5.27f, 1.08f, z + 0.09f);
+        }
+        for (float x : {-3.6f, -1.8f, 0.0f, 1.8f, 3.6f}) {
+            appendTheaterBox(
+                lights, x - 0.055f, 2.865f, -0.15f,
+                x + 0.055f, 2.94f, 0.05f);
+        }
+        drawSolidGeometry(
+            mvp, lights,
+            0.38f * brightness,
+            0.13f * brightness,
+            0.035f * brightness);
+
+        // A proper depth attachment now handles all auditorium intersections.
+        drawTheaterScreenBacking(mvp, curvature);
     }
 
     void renderEye(uint32_t eye, const XrView& view, bool passthroughActive) {
@@ -2733,6 +2968,7 @@ private:
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                chain.images[imageIndex].image, 0);
+        ensureDepthBuffer(chain.width, chain.height);
         glViewport(0, 0, chain.width, chain.height);
         if (passthroughActive) {
             const float dimmingAlpha = 1.0f - std::clamp(
@@ -2754,7 +2990,8 @@ private:
                 0.035f * sceneBrightness,
                 1.0f);
         }
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClearDepthf(1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
 
         const Mat4 mvp = multiply(projection(view.fov), viewFromPose(view.pose));
@@ -2762,7 +2999,13 @@ private:
         const bool theaterActive =
             gEnvironmentMode.load() == 1 && projectionMode == 0;
         const float curvature = gScreenCurvature.load();
-        if (theaterActive) drawTheater(mvp, curvature);
+        if (theaterActive) {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
+            drawTheater(mvp, curvature);
+            glDisable(GL_DEPTH_TEST);
+        }
         const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
         const float halfHeight = theaterActive
             ? gTheaterImageHalfHeight.load()
@@ -2968,9 +3211,13 @@ private:
         }
 
         if (theaterActive) {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
             drawTheaterSeats(
                 mvp,
                 std::clamp(gTheaterBrightness.load(), 0.0f, 1.0f));
+            glDisable(GL_DEPTH_TEST);
         }
 
         if (gSubtitleWidth.load() > 0 && gSubtitleHeight.load() > 0) {
@@ -3349,6 +3596,7 @@ private:
         if (videoTexture_) glDeleteTextures(1, &videoTexture_);
         if (subtitleTexture_) glDeleteTextures(1, &subtitleTexture_);
         if (adaptiveAnalysisTexture_) glDeleteTextures(1, &adaptiveAnalysisTexture_);
+        if (depthRenderbuffer_) glDeleteRenderbuffers(1, &depthRenderbuffer_);
         if (framebuffer_) glDeleteFramebuffers(1, &framebuffer_);
         if (adaptiveAnalysisFramebuffer_) glDeleteFramebuffers(
             1, &adaptiveAnalysisFramebuffer_);
@@ -3357,6 +3605,8 @@ private:
         videoProgram_ = adaptiveAnalysisProgram_ =
             subtitleProgram_ = pointerProgram_ = 0;
         videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ = 0;
+        depthRenderbuffer_ = 0;
+        depthBufferWidth_ = depthBufferHeight_ = 0;
         framebuffer_ = adaptiveAnalysisFramebuffer_ =
             vertexBuffer_ = vertexArray_ = 0;
         egl_.destroy();
