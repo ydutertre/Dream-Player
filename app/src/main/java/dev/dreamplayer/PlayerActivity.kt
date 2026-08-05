@@ -538,6 +538,44 @@ class PlayerActivity : Activity(), Player.Listener {
         sftpProfiles = sftpProfileStore.load()
         mediaStateStore = MediaStateStore(this)
         val picturePreferences = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+        if (!picturePreferences.getBoolean(PREF_THEATER_LARGE_AUDITORIUM_MIGRATED, false)) {
+            val migration = picturePreferences.edit()
+            if (picturePreferences.contains(PREF_THEATER_IMAGE_HALF_HEIGHT)) {
+                migration.putFloat(
+                    PREF_THEATER_IMAGE_HALF_HEIGHT,
+                    (picturePreferences.getFloat(
+                        PREF_THEATER_IMAGE_HALF_HEIGHT,
+                        1f,
+                    ) * THEATER_LARGE_AUDITORIUM_SCALE).coerceIn(
+                        THEATER_IMAGE_HALF_HEIGHT_MIN,
+                        THEATER_IMAGE_HALF_HEIGHT_MAX,
+                    ),
+                )
+            }
+            if (picturePreferences.contains(PREF_THEATER_IMAGE_OFFSET_X)) {
+                migration.putFloat(
+                    PREF_THEATER_IMAGE_OFFSET_X,
+                    (picturePreferences.getFloat(PREF_THEATER_IMAGE_OFFSET_X, 0f) *
+                        THEATER_LARGE_AUDITORIUM_SCALE).coerceIn(
+                        -THEATER_MAX_OFFSET,
+                        THEATER_MAX_OFFSET,
+                    ),
+                )
+            }
+            if (picturePreferences.contains(PREF_THEATER_IMAGE_OFFSET_Y)) {
+                migration.putFloat(
+                    PREF_THEATER_IMAGE_OFFSET_Y,
+                    (picturePreferences.getFloat(PREF_THEATER_IMAGE_OFFSET_Y, 0f) *
+                        THEATER_LARGE_AUDITORIUM_SCALE).coerceIn(
+                        -THEATER_MAX_OFFSET,
+                        THEATER_MAX_OFFSET,
+                    ),
+                )
+            }
+            migration
+                .putBoolean(PREF_THEATER_LARGE_AUDITORIUM_MIGRATED, true)
+                .apply()
+        }
         sceneBrightness = picturePreferences
             .getFloat(PREF_SCENE_BRIGHTNESS, DEFAULT_SCENE_BRIGHTNESS)
             .sanitized(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, DEFAULT_SCENE_BRIGHTNESS)
@@ -8358,6 +8396,8 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_THEATER_IMAGE_HALF_HEIGHT = "theater-image-half-height"
         private const val PREF_THEATER_SEAT_ROW = "theater-seat-row"
         private const val PREF_THEATER_SEAT_COLUMN = "theater-seat-column"
+        private const val PREF_THEATER_LARGE_AUDITORIUM_MIGRATED =
+            "theater-large-auditorium-migrated"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
         private const val PREF_ADAPTIVE_TONE_MAP_MIN_NITS = "adaptive-tone-map-min-nits"
@@ -8380,7 +8420,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val DEFAULT_PICTURE_VIBRANCE = 0f
         private const val DEFAULT_SCENE_BRIGHTNESS = 0.5f
         private const val DEFAULT_THEATER_BRIGHTNESS = 0.35f
-        private const val DEFAULT_THEATER_IMAGE_HALF_HEIGHT = 1f
+        private const val DEFAULT_THEATER_IMAGE_HALF_HEIGHT = 2.15f
         private const val DEFAULT_THEATER_SEAT_ROW = 1
         private const val DEFAULT_THEATER_SEAT_COLUMN = 0
         private const val DEFAULT_PASSTHROUGH_BRIGHTNESS = 1f
@@ -8426,11 +8466,12 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PICTURE_VIBRANCE_MAX = 1f
         private const val SCENE_BRIGHTNESS_MIN = 0f
         private const val SCENE_BRIGHTNESS_MAX = 1f
-        private const val THEATER_MAX_OFFSET = 3.1f
-        private const val THEATER_IMAGE_HALF_HEIGHT_MIN = 0.45f
-        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 1.45f
-        private const val THEATER_HORIZONTAL_OFFSET_RANGE = 1.35f
-        private const val THEATER_VERTICAL_OFFSET_RANGE = 0.55f
+        private const val THEATER_LARGE_AUDITORIUM_SCALE = 2.15f
+        private const val THEATER_MAX_OFFSET = 5.4f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MIN = 0.90f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 2.85f
+        private const val THEATER_HORIZONTAL_OFFSET_RANGE = 2.40f
+        private const val THEATER_VERTICAL_OFFSET_RANGE = 1.15f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
         private const val TONE_MAP_PEAK_NITS_MAX = 5_000f
         private const val ADAPTIVE_TONE_MAP_NITS_MIN = 100f
