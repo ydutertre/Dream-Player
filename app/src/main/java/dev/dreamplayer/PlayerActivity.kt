@@ -8469,7 +8469,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val THEATER_LARGE_AUDITORIUM_SCALE = 2.15f
         private const val THEATER_MAX_OFFSET = 5.4f
         private const val THEATER_IMAGE_HALF_HEIGHT_MIN = 0.90f
-        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 2.85f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 3.10f
         private const val THEATER_HORIZONTAL_OFFSET_RANGE = 2.40f
         private const val THEATER_VERTICAL_OFFSET_RANGE = 1.15f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
