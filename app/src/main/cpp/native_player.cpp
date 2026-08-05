@@ -123,8 +123,10 @@ constexpr int kMaximumGeometryVertices = 131072;
 constexpr float kMaximumScreenEdgeAngle = 38.0f * kPi / 180.0f;
 constexpr float kMaximumOverlayEdgeAngle = 50.0f * kPi / 180.0f;
 constexpr float kTheaterScreenDistance = 6.2f;
-constexpr float kTheaterScreenHalfWidth = 5.4f;
-constexpr float kTheaterScreenHalfHeight = 2.9f;
+// Use nearly the complete front wall as the projection aperture. A narrow
+// proscenium border remains for clean overscan masking and spatial context.
+constexpr float kTheaterScreenHalfWidth = 7.6f;
+constexpr float kTheaterScreenHalfHeight = 3.2f;
 constexpr int kAdaptiveAnalysisWidth = 32;
 constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
@@ -215,7 +217,7 @@ Vec3 theaterWorldPoint(const Vec3& localPoint) {
 
 ScreenBasis theaterScreenBasis() {
     return {
-        theaterWorldPoint({0.0f, 1.25f, -kTheaterScreenDistance}),
+        theaterWorldPoint({0.0f, 1.55f, -kTheaterScreenDistance}),
         rotateTheaterYaw({1.0f, 0.0f, 0.0f}),
         {0.0f, 1.0f, 0.0f},
         rotateTheaterYaw({0.0f, 0.0f, 1.0f}),
@@ -756,6 +758,8 @@ private:
     int depthBufferHeight_ = 0;
     GLuint adaptiveAnalysisFramebuffer_ = 0;
     GLuint adaptiveAnalysisTexture_ = 0;
+    GLuint screenLightFramebuffer_ = 0;
+    GLuint screenLightTexture_ = 0;
     GLuint videoTexture_ = 0;
     GLuint subtitleTexture_ = 0;
     int subtitleTextureWidth_ = 0;
@@ -809,11 +813,11 @@ private:
     float immersiveDragStartVideoYaw_ = 0.0f;
     bool shutdownComplete_ = false;
     int64_t lastAnalyzedVideoTimestampNanos_ = 0;
+    int64_t lastScreenLightTimestampNanos_ = 0;
+    bool screenLightHistoryValid_ = false;
     uint32_t adaptiveResetGeneration_ = 0;
     bool adaptiveHistoryValid_ = false;
     float adaptiveEffectiveTargetNits_ = 100.0f;
-    Vec3 theaterScreenLightColor_{1.0f, 0.92f, 0.82f};
-    float theaterScreenLightStrength_ = 0.0f;
     std::array<float, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight>
         previousAdaptiveLogLuma_{};
     std::array<uint8_t, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight * 4>
@@ -836,6 +840,7 @@ private:
     std::vector<float> theaterCushionHighlightGeometry_;
     std::vector<float> theaterSeatFrameGeometry_;
     std::vector<float> theaterSeatShadowGeometry_;
+    std::vector<float> videoVerticesScratch_;
 
     void initializeOpenXr() {
         PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
@@ -1539,8 +1544,8 @@ private:
             uniform vec3 uColor;
             uniform float uRoomBrightness;
             uniform float uEmissive;
-            uniform vec3 uScreenLightColor;
-            uniform float uScreenLightStrength;
+            uniform sampler2D uScreenSample;
+            uniform float uScreenLightEnabled;
             uniform vec3 uScreenPosition;
             out vec4 fragColor;
             void main() {
@@ -1560,9 +1565,16 @@ private:
                 vec3 screenDirection = toScreen / max(screenDistance, 0.001);
                 float screenFacing = max(dot(normal, screenDirection), 0.0);
                 float screenFalloff = 1.0 / (1.0 + 0.020 * screenDistance * screenDistance);
-                float screenSpill = uScreenLightStrength * screenFalloff *
+                // LOD 5 is the 1x1 mip: a true whole-frame average rather than
+                // a handful of points that moving actors can cross and flicker.
+                float screenLuma = textureLod(
+                    uScreenSample, vec2(0.5, 0.5), 5.0).a;
+                float screenLightStrength =
+                    clamp((screenLuma - 0.035) / 0.50, 0.0, 1.0) * 1.35 *
+                    uScreenLightEnabled;
+                float screenSpill = screenLightStrength * screenFalloff *
                     (0.08 + 0.92 * screenFacing);
-                vec3 screenLit = uScreenLightColor * uColor * screenSpill;
+                vec3 screenLit = vec3(1.0, 0.94, 0.86) * uColor * screenSpill;
                 fragColor = vec4(
                     mix(shaded, emissive, clamp(uEmissive, 0.0, 1.0)) + screenLit,
                     1.0);
@@ -1584,6 +1596,7 @@ private:
             uniform samplerExternalOES uVideo;
             uniform mat4 uTexTransform;
             uniform int uPrimaries;
+            uniform int uOutputMode;
             out vec4 fragColor;
             vec3 pqToNits(vec3 value) {
                 const float m1 = 2610.0 / 16384.0;
@@ -1611,7 +1624,10 @@ private:
                     1.0);
                 // Preserve the source colour for auditorium screen spill while
                 // retaining logarithmic PQ luminance in alpha for HDR analysis.
-                fragColor = vec4(sampleColor, encoded);
+                float displayLuma = max(dot(sampleColor, luma), 0.0);
+                fragColor = vec4(
+                    sampleColor,
+                    uOutputMode == 1 ? displayLuma : encoded);
             }
         )glsl";
         videoProgram_ = makeProgram(vertex, videoFragment);
@@ -1649,6 +1665,38 @@ private:
         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
             throw std::runtime_error("Adaptive tone-map analysis framebuffer is incomplete");
         }
+        glGenFramebuffers(1, &screenLightFramebuffer_);
+        glGenTextures(1, &screenLightTexture_);
+        glBindTexture(GL_TEXTURE_2D, screenLightTexture_);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA8,
+            kAdaptiveAnalysisWidth,
+            kAdaptiveAnalysisHeight,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, screenLightFramebuffer_);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D,
+            screenLightTexture_,
+            0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            throw std::runtime_error("Theater screen-light framebuffer is incomplete");
+        }
+        glViewport(0, 0, kAdaptiveAnalysisWidth, kAdaptiveAnalysisHeight);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindTexture(GL_TEXTURE_2D, screenLightTexture_);
+        glGenerateMipmap(GL_TEXTURE_2D);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glGenVertexArrays(1, &vertexArray_);
         glGenBuffers(1, &vertexBuffer_);
@@ -2304,7 +2352,6 @@ private:
                 resetAdaptiveAnalysis(staticTargetNits);
             }
             if (!theaterLightingActive) {
-                theaterScreenLightStrength_ = 0.0f;
                 return;
             }
         }
@@ -2314,14 +2361,19 @@ private:
             adaptiveResetGeneration_ = resetGeneration;
             resetAdaptiveAnalysis(staticTargetNits);
         }
-        if (videoTimestampNanos <= 0 ||
-            videoTimestampNanos == lastAnalyzedVideoTimestampNanos_) {
-            return;
-        }
-        if (!adaptiveActive && lastAnalyzedVideoTimestampNanos_ > 0 &&
-            videoTimestampNanos - lastAnalyzedVideoTimestampNanos_ < 80'000'000) {
-            return;
-        }
+        if (videoTimestampNanos <= 0) return;
+        constexpr int64_t kAnalysisIntervalNanos = 50'000'000;
+        const bool screenLightingDue = theaterLightingActive &&
+            (!screenLightHistoryValid_ || lastScreenLightTimestampNanos_ <= 0 ||
+                videoTimestampNanos <= lastScreenLightTimestampNanos_ ||
+                videoTimestampNanos - lastScreenLightTimestampNanos_ >=
+                    kAnalysisIntervalNanos);
+        const bool adaptiveAnalysisDue = adaptiveActive &&
+            (lastAnalyzedVideoTimestampNanos_ <= 0 ||
+                videoTimestampNanos <= lastAnalyzedVideoTimestampNanos_ ||
+                videoTimestampNanos - lastAnalyzedVideoTimestampNanos_ >=
+                    kAnalysisIntervalNanos);
+        if (!screenLightingDue && !adaptiveAnalysisDue) return;
 
         constexpr std::array<float, 6 * 5> analysisVertices = {
             -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
@@ -2331,7 +2383,6 @@ private:
              1.0f,  1.0f, 0.0f, 1.0f, 1.0f,
             -1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
         };
-        glBindFramebuffer(GL_FRAMEBUFFER, adaptiveAnalysisFramebuffer_);
         glViewport(0, 0, kAdaptiveAnalysisWidth, kAdaptiveAnalysisHeight);
         glDisable(GL_DEPTH_TEST);
         glUseProgram(adaptiveAnalysisProgram_);
@@ -2358,6 +2409,44 @@ private:
         glUniform1i(
             glGetUniformLocation(adaptiveAnalysisProgram_, "uVideo"),
             0);
+        if (screenLightingDue) {
+            glBindFramebuffer(GL_FRAMEBUFFER, screenLightFramebuffer_);
+            glUniform1i(
+                glGetUniformLocation(adaptiveAnalysisProgram_, "uOutputMode"),
+                1);
+            float temporalAlpha = 1.0f;
+            if (screenLightHistoryValid_ && lastScreenLightTimestampNanos_ > 0 &&
+                videoTimestampNanos > lastScreenLightTimestampNanos_ &&
+                videoTimestampNanos - lastScreenLightTimestampNanos_ < 500'000'000) {
+                const float elapsedSeconds = std::clamp(
+                    static_cast<float>(
+                        videoTimestampNanos - lastScreenLightTimestampNanos_) /
+                        1'000'000'000.0f,
+                    0.0f,
+                    0.25f);
+                temporalAlpha = 1.0f - std::exp(-elapsedSeconds / 0.70f);
+            }
+            if (temporalAlpha < 0.999f) {
+                glEnable(GL_BLEND);
+                glBlendEquation(GL_FUNC_ADD);
+                glBlendColor(0.0f, 0.0f, 0.0f, temporalAlpha);
+                glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
+            } else {
+                glDisable(GL_BLEND);
+            }
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glDisable(GL_BLEND);
+            glBindTexture(GL_TEXTURE_2D, screenLightTexture_);
+            glGenerateMipmap(GL_TEXTURE_2D);
+            screenLightHistoryValid_ = true;
+            lastScreenLightTimestampNanos_ = videoTimestampNanos;
+        }
+        if (!adaptiveAnalysisDue) return;
+        glBindFramebuffer(GL_FRAMEBUFFER, adaptiveAnalysisFramebuffer_);
+        glUniform1i(
+            glGetUniformLocation(adaptiveAnalysisProgram_, "uOutputMode"),
+            0);
+        glDisable(GL_BLEND);
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glReadPixels(
             0,
@@ -2370,43 +2459,6 @@ private:
 
         constexpr size_t sampleCount =
             kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight;
-        Vec3 meanScreenColor{};
-        float meanScreenLuma = 0.0f;
-        for (size_t index = 0; index < sampleCount; ++index) {
-            const Vec3 sample{
-                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f,
-                static_cast<float>(adaptiveReadback_[index * 4 + 1]) / 255.0f,
-                static_cast<float>(adaptiveReadback_[index * 4 + 2]) / 255.0f,
-            };
-            meanScreenColor = meanScreenColor + sample;
-            meanScreenLuma += dot(sample, {0.2126f, 0.7152f, 0.0722f});
-        }
-        meanScreenColor = meanScreenColor * (1.0f / static_cast<float>(sampleCount));
-        meanScreenLuma /= static_cast<float>(sampleCount);
-        const float colorPeak = std::max(
-            std::max(meanScreenColor.x, meanScreenColor.y), meanScreenColor.z);
-        const Vec3 targetScreenColor = colorPeak > 0.015f
-            ? meanScreenColor * (1.0f / colorPeak)
-            : Vec3{1.0f, 0.92f, 0.82f};
-        const float targetScreenStrength = theaterLightingActive
-            ? std::clamp(
-                (meanScreenLuma - 0.035f) / 0.50f,
-                0.0f,
-                1.0f) * 1.35f
-            : 0.0f;
-        const float screenLightAlpha = lastAnalyzedVideoTimestampNanos_ == 0
-            ? 1.0f
-            : 0.10f;
-        theaterScreenLightColor_ = theaterScreenLightColor_ +
-            (targetScreenColor - theaterScreenLightColor_) * screenLightAlpha;
-        theaterScreenLightStrength_ +=
-            (targetScreenStrength - theaterScreenLightStrength_) * screenLightAlpha;
-
-        if (!adaptiveActive) {
-            lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
-            return;
-        }
-
         std::array<float, sampleCount> sourceNits{};
         std::array<float, 16> histogram{};
         float meanNits = 0.0f;
@@ -2705,14 +2757,14 @@ private:
         glUniform1f(
             glGetUniformLocation(theaterProgram_, "uEmissive"),
             emissive);
-        glUniform3f(
-            glGetUniformLocation(theaterProgram_, "uScreenLightColor"),
-            theaterScreenLightColor_.x,
-            theaterScreenLightColor_.y,
-            theaterScreenLightColor_.z);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, screenLightTexture_);
+        glUniform1i(
+            glGetUniformLocation(theaterProgram_, "uScreenSample"),
+            1);
         glUniform1f(
-            glGetUniformLocation(theaterProgram_, "uScreenLightStrength"),
-            theaterScreenLightStrength_);
+            glGetUniformLocation(theaterProgram_, "uScreenLightEnabled"),
+            gHasVideo.load() ? 1.0f : 0.0f);
         const Vec3 theaterScreenCenter = theaterScreenBasis().center;
         glUniform3f(
             glGetUniformLocation(theaterProgram_, "uScreenPosition"),
@@ -2723,6 +2775,7 @@ private:
             GL_TRIANGLES,
             0,
             static_cast<GLsizei>(vertices.size() / 5));
+        glActiveTexture(GL_TEXTURE0);
     }
 
     void ensureDepthBuffer(int width, int height) {
@@ -3200,9 +3253,9 @@ private:
         appendTheaterBox(shell, -8.35f, 5.05f, -6.90f, 8.35f, 5.30f, 8.88f);
 
         // The screen wall is recessed behind a broad, layered proscenium.
-        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -5.65f, 5.25f, -6.58f);
-        appendTheaterBox(shell, 5.65f, -1.84f, -6.88f, 8.35f, 5.25f, -6.58f);
-        appendTheaterBox(shell, -5.65f, 4.20f, -6.88f, 5.65f, 5.25f, -6.58f);
+        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -7.78f, 5.25f, -6.58f);
+        appendTheaterBox(shell, 7.78f, -1.84f, -6.88f, 8.35f, 5.25f, -6.58f);
+        appendTheaterBox(shell, -7.78f, 4.79f, -6.88f, 7.78f, 5.25f, -6.58f);
         }
         drawSolidGeometry(
             mvp, shell,
@@ -3276,10 +3329,10 @@ private:
                 architecturalTrim, -7.82f, 4.94f, z - 0.045f,
                 7.82f, 5.05f, z + 0.045f);
         }
-        appendTheaterBox(architecturalTrim, -5.62f, -1.66f, -6.55f, -5.42f, 4.25f, -6.18f);
-        appendTheaterBox(architecturalTrim, 5.42f, -1.66f, -6.55f, 5.62f, 4.25f, -6.18f);
-        appendTheaterBox(architecturalTrim, -5.62f, 4.20f, -6.55f, 5.62f, 4.43f, -6.18f);
-        appendTheaterBox(architecturalTrim, -5.68f, -1.65f, -5.72f, 5.68f, -1.47f, -5.35f);
+        appendTheaterBox(architecturalTrim, -7.80f, -1.68f, -6.55f, -7.60f, 4.83f, -6.18f);
+        appendTheaterBox(architecturalTrim, 7.60f, -1.68f, -6.55f, 7.80f, 4.83f, -6.18f);
+        appendTheaterBox(architecturalTrim, -7.80f, 4.75f, -6.55f, 7.80f, 4.98f, -6.18f);
+        appendTheaterBox(architecturalTrim, -7.82f, -1.69f, -5.72f, 7.82f, -1.49f, -5.35f);
         appendTheaterBox(architecturalTrim, -7.90f, -1.63f, 8.37f, -6.60f, 1.65f, 8.52f);
         appendTheaterBox(architecturalTrim, 6.60f, -1.63f, 8.37f, 7.90f, 1.65f, 8.52f);
         appendTheaterBox(architecturalTrim, -2.20f, 3.65f, 8.35f, 2.20f, 4.70f, 8.50f);
@@ -3401,7 +3454,8 @@ private:
                 : theaterActive
                     ? theaterScreenBasis()
                     : currentScreenBasis();
-        std::vector<float> videoVertices;
+        auto& videoVertices = videoVerticesScratch_;
+        videoVertices.clear();
         videoVertices.reserve(kMaximumSurfaceVertices * 5);
         const auto appendVertex = [&videoVertices](
                                       const Vec3& point, float u, float v) {
@@ -3731,7 +3785,21 @@ private:
             } else {
                 const float textScale =
                     std::clamp(gTextSubtitleScale.load(), 0.6f, 1.8f);
-                const float textHalfHeight = 0.15f * textScale;
+                float viewingDistanceScale = 1.0f;
+                if (theaterActive) {
+                    constexpr float kFrontRowScreenDistance = 5.846f;
+                    const float currentScreenDistance = length(
+                        theaterScreenBasis().center - headCenter_);
+                    viewingDistanceScale = std::clamp(
+                        currentScreenDistance / kFrontRowScreenDistance,
+                        1.0f,
+                        2.15f);
+                }
+                // Match the 25 px appearance preview rendered into the 1024 px
+                // menu texture. The subtitle bitmap's 68 px glyphs occupy
+                // roughly 21.25% of its quad, yielding this WYSIWYG factor.
+                const float textHalfHeight =
+                    0.115f * halfHeight * textScale * viewingDistanceScale;
                 const float minimumCenter = -halfHeight + textHalfHeight + 0.01f;
                 const float maximumCenter = halfHeight - textHalfHeight - 0.01f;
                 const float verticalPosition = std::clamp(
@@ -3993,18 +4061,22 @@ private:
         if (videoTexture_) glDeleteTextures(1, &videoTexture_);
         if (subtitleTexture_) glDeleteTextures(1, &subtitleTexture_);
         if (adaptiveAnalysisTexture_) glDeleteTextures(1, &adaptiveAnalysisTexture_);
+        if (screenLightTexture_) glDeleteTextures(1, &screenLightTexture_);
         if (depthRenderbuffer_) glDeleteRenderbuffers(1, &depthRenderbuffer_);
         if (framebuffer_) glDeleteFramebuffers(1, &framebuffer_);
         if (adaptiveAnalysisFramebuffer_) glDeleteFramebuffers(
             1, &adaptiveAnalysisFramebuffer_);
+        if (screenLightFramebuffer_) glDeleteFramebuffers(
+            1, &screenLightFramebuffer_);
         if (vertexBuffer_) glDeleteBuffers(1, &vertexBuffer_);
         if (vertexArray_) glDeleteVertexArrays(1, &vertexArray_);
         videoProgram_ = adaptiveAnalysisProgram_ =
             subtitleProgram_ = pointerProgram_ = theaterProgram_ = 0;
-        videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ = 0;
+        videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ =
+            screenLightTexture_ = 0;
         depthRenderbuffer_ = 0;
         depthBufferWidth_ = depthBufferHeight_ = 0;
-        framebuffer_ = adaptiveAnalysisFramebuffer_ =
+        framebuffer_ = adaptiveAnalysisFramebuffer_ = screenLightFramebuffer_ =
             vertexBuffer_ = vertexArray_ = 0;
         egl_.destroy();
     }

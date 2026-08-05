@@ -6728,11 +6728,25 @@ class PlayerActivity : Activity(), Player.Listener {
                             (Color.blue(textSubtitleColor) * textSubtitleBrightness)
                                 .toInt().coerceIn(0, 255),
                         )
+                        val theaterViewingDistanceScale =
+                            if (environmentMode == EnvironmentMode.THEATER) {
+                                when (theaterSeatRow.coerceIn(0, 2)) {
+                                    1 -> 1.442f
+                                    2 -> 1.950f
+                                    else -> 1f
+                                }
+                            } else {
+                                1f
+                            }
                         text(
                             if (enabled) "Subtitle preview" else "Image subtitle appearance is embedded",
                             505f,
                             218f,
-                            if (enabled) 25f * textSubtitleScale else 21f,
+                            if (enabled) {
+                                25f * textSubtitleScale * theaterViewingDistanceScale
+                            } else {
+                                21f
+                            },
                             color = if (enabled) previewColor else colorTextMuted,
                         )
                         text("Color", 190f, 245f, 22f, Paint.Align.LEFT, colorTextMuted)
@@ -8467,9 +8481,9 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val SCENE_BRIGHTNESS_MIN = 0f
         private const val SCENE_BRIGHTNESS_MAX = 1f
         private const val THEATER_LARGE_AUDITORIUM_SCALE = 2.15f
-        private const val THEATER_MAX_OFFSET = 5.4f
+        private const val THEATER_MAX_OFFSET = 7.6f
         private const val THEATER_IMAGE_HALF_HEIGHT_MIN = 0.90f
-        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 3.10f
+        private const val THEATER_IMAGE_HALF_HEIGHT_MAX = 3.42f
         private const val THEATER_HORIZONTAL_OFFSET_RANGE = 2.40f
         private const val THEATER_VERTICAL_OFFSET_RANGE = 1.15f
         private const val TONE_MAP_PEAK_NITS_MIN = 50f
