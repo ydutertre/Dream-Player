@@ -35,9 +35,6 @@ std::atomic<float> gImmersiveYawDegrees{0.0f};
 std::atomic<float> gImmersivePitchDegrees{0.0f};
 std::atomic<float> gLatestHeadYawDegrees{0.0f};
 std::atomic<float> gLatestHeadPitchDegrees{0.0f};
-std::atomic<float> gLatestHeadX{0.0f};
-std::atomic<float> gLatestHeadY{0.0f};
-std::atomic<float> gLatestHeadZ{0.0f};
 std::atomic<uint64_t> gImmersiveMenuAnchorGeneration{1};
 // 0 = original samples, 1 = metadata-driven managed color.
 std::atomic<int> gPictureMode{1};
@@ -70,18 +67,6 @@ std::atomic<float> gHdrMaxFallNits{0.0f};
 // 0 = legacy hard clip, 1 = luminance/hue-direction preserving compression.
 std::atomic<int> gGamutMappingMode{0};
 std::atomic<float> gSceneBrightness{0.5f};
-// 0 = void, 1 = virtual theater, 2 = passthrough.
-std::atomic<int> gEnvironmentMode{0};
-std::atomic<float> gTheaterBrightness{0.35f};
-std::atomic<float> gTheaterImageOffsetX{0.0f};
-std::atomic<float> gTheaterImageOffsetY{0.0f};
-std::atomic<float> gTheaterImageHalfHeight{1.0f};
-std::atomic<int> gTheaterSeatRow{1};
-std::atomic<int> gTheaterSeatColumn{0};
-std::atomic<float> gTheaterYawDegrees{0.0f};
-std::atomic<float> gTheaterAnchorX{0.0f};
-std::atomic<float> gTheaterAnchorY{0.0f};
-std::atomic<float> gTheaterAnchorZ{0.0f};
 std::atomic<bool> gPassthroughRequested{false};
 std::atomic<float> gPassthroughBrightness{1.0f};
 std::atomic<bool> gPassthroughSupported{false};
@@ -119,12 +104,8 @@ constexpr int kImmersiveHorizontalSegments = 96;
 constexpr int kImmersiveVerticalSegments = 48;
 constexpr int kMaximumSurfaceVertices =
     kImmersiveHorizontalSegments * kImmersiveVerticalSegments * 6;
-constexpr int kMaximumGeometryVertices = 131072;
 constexpr float kMaximumScreenEdgeAngle = 38.0f * kPi / 180.0f;
 constexpr float kMaximumOverlayEdgeAngle = 50.0f * kPi / 180.0f;
-constexpr float kTheaterScreenDistance = 6.2f;
-constexpr float kTheaterScreenHalfWidth = 5.4f;
-constexpr float kTheaterScreenHalfHeight = 2.9f;
 constexpr int kAdaptiveAnalysisWidth = 32;
 constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
@@ -179,47 +160,6 @@ ScreenBasis currentScreenBasis() {
     if (std::abs(dot(right, {0, 1, 0})) > 0.001f) right = {1, 0, 0};
     const Vec3 up = normalized(cross(right, outward), {0, 1, 0});
     return {center, right, up, outward * -1.0f};
-}
-
-Vec3 theaterSeatPosition() {
-    const int row = std::clamp(gTheaterSeatRow.load(), 0, 2);
-    const int column = std::clamp(gTheaterSeatColumn.load(), -1, 1);
-    constexpr float rowZ[] = {-0.50f, 2.20f, 5.20f};
-    constexpr float rowY[] = {0.25f, 0.86f, 1.55f};
-    return {
-        static_cast<float>(column) * 1.06f,
-        rowY[row],
-        rowZ[row],
-    };
-}
-
-Vec3 rotateTheaterYaw(const Vec3& value) {
-    const float yaw = gTheaterYawDegrees.load() * kPi / 180.0f;
-    const float sine = std::sin(yaw);
-    const float cosine = std::cos(yaw);
-    return {
-        cosine * value.x - sine * value.z,
-        value.y,
-        sine * value.x + cosine * value.z,
-    };
-}
-
-Vec3 theaterWorldPoint(const Vec3& localPoint) {
-    const Vec3 anchor{
-        gTheaterAnchorX.load(),
-        gTheaterAnchorY.load(),
-        gTheaterAnchorZ.load(),
-    };
-    return anchor + rotateTheaterYaw(localPoint - theaterSeatPosition());
-}
-
-ScreenBasis theaterScreenBasis() {
-    return {
-        theaterWorldPoint({0.0f, 1.25f, -kTheaterScreenDistance}),
-        rotateTheaterYaw({1.0f, 0.0f, 0.0f}),
-        {0.0f, 1.0f, 0.0f},
-        rotateTheaterYaw({0.0f, 0.0f, 1.0f}),
-    };
 }
 
 Vec3 screenPoint(const ScreenBasis& basis, float horizontal, float vertical, float forward = 0.0f) {
@@ -289,25 +229,6 @@ Vec3 sharedCurvedScreenPoint(
         radius * (1.0f - std::cos(angle)) + forwardOffset);
 }
 
-Vec3 theaterSurfacePoint(
-    float surfaceHalfWidth,
-    float normalizedHorizontal,
-    float vertical,
-    float curvature,
-    float horizontalArcOffset = 0.0f,
-    float verticalOffset = 0.0f,
-    float forwardOffset = 0.0f) {
-    return sharedCurvedScreenPoint(
-        theaterScreenBasis(),
-        kTheaterScreenHalfWidth,
-        surfaceHalfWidth,
-        normalizedHorizontal +
-            horizontalArcOffset / std::max(surfaceHalfWidth, 0.0001f),
-        vertical + verticalOffset,
-        curvature,
-        forwardOffset);
-}
-
 float overlayCurvatureReferenceHalfWidth(
     float videoHalfWidth, float overlayHalfWidth) {
     return std::max(
@@ -327,9 +248,7 @@ bool intersectRayWithCurvedScreen(
     float forwardOffset,
     Vec3* hit,
     float* u,
-    float* v,
-    float horizontalArcOffset = 0.0f,
-    float verticalOffset = 0.0f) {
+    float* v) {
     const Vec3 ray = normalized(direction);
     const Vec3 surfaceCenter = basis.center + basis.normal * forwardOffset;
     const Vec3 localOrigin = origin - surfaceCenter;
@@ -350,14 +269,13 @@ bool intersectRayWithCurvedScreen(
             originHorizontal + directionHorizontal * distance;
         const float vertical = originVertical + directionVertical * distance;
         if (
-            std::abs(horizontal - horizontalArcOffset) > surfaceHalfWidth ||
-            std::abs(vertical - verticalOffset) > halfHeight) {
+            std::abs(horizontal) > surfaceHalfWidth ||
+            std::abs(vertical) > halfHeight) {
             return false;
         }
         *hit = origin + ray * distance;
-        *u = ((horizontal - horizontalArcOffset) + surfaceHalfWidth) /
-            (2.0f * surfaceHalfWidth);
-        *v = (halfHeight - (vertical - verticalOffset)) / (2.0f * halfHeight);
+        *u = (horizontal + surfaceHalfWidth) / (2.0f * surfaceHalfWidth);
+        *v = (halfHeight - vertical) / (2.0f * halfHeight);
         return true;
     }
 
@@ -391,13 +309,12 @@ bool intersectRayWithCurvedScreen(
         const float forward =
             originForward + directionForward * distance;
         const float angle = std::atan2(horizontal, radius - forward);
-        const float centerAngle = horizontalArcOffset / radius;
         if (
-            std::abs(angle - centerAngle) > surfaceEdgeAngle ||
-            std::abs(vertical - verticalOffset) > halfHeight) continue;
+            std::abs(angle) > surfaceEdgeAngle ||
+            std::abs(vertical) > halfHeight) continue;
         *hit = origin + ray * distance;
-        *u = ((angle - centerAngle) / surfaceEdgeAngle + 1.0f) * 0.5f;
-        *v = (halfHeight - (vertical - verticalOffset)) / (2.0f * halfHeight);
+        *u = (angle / surfaceEdgeAngle + 1.0f) * 0.5f;
+        *v = (halfHeight - vertical) / (2.0f * halfHeight);
         return true;
     }
     return false;
@@ -751,9 +668,6 @@ private:
     std::vector<XrView> views_;
     std::vector<Swapchain> swapchains_;
     GLuint framebuffer_ = 0;
-    GLuint depthRenderbuffer_ = 0;
-    int depthBufferWidth_ = 0;
-    int depthBufferHeight_ = 0;
     GLuint adaptiveAnalysisFramebuffer_ = 0;
     GLuint adaptiveAnalysisTexture_ = 0;
     GLuint videoTexture_ = 0;
@@ -764,7 +678,6 @@ private:
     GLuint adaptiveAnalysisProgram_ = 0;
     GLuint subtitleProgram_ = 0;
     GLuint pointerProgram_ = 0;
-    GLuint theaterProgram_ = 0;
     GLuint vertexBuffer_ = 0;
     GLuint vertexArray_ = 0;
     float textureTransform_[16]{};
@@ -798,13 +711,6 @@ private:
     Vec3 dragStartCenter_{};
     bool dragMoved_ = false;
     bool draggingImmersive_ = false;
-    bool draggingTheater_ = false;
-    float theaterDragStartPointerArc_ = 0.0f;
-    float theaterDragStartPointerVertical_ = 0.0f;
-    float theaterDragStartOffsetX_ = 0.0f;
-    float theaterDragStartOffsetY_ = 0.0f;
-    float theaterDragFilteredPointerArc_ = 0.0f;
-    float theaterDragFilteredPointerVertical_ = 0.0f;
     float immersiveDragStartPointerYaw_ = 0.0f;
     float immersiveDragStartVideoYaw_ = 0.0f;
     bool shutdownComplete_ = false;
@@ -812,30 +718,10 @@ private:
     uint32_t adaptiveResetGeneration_ = 0;
     bool adaptiveHistoryValid_ = false;
     float adaptiveEffectiveTargetNits_ = 100.0f;
-    Vec3 theaterScreenLightColor_{1.0f, 0.92f, 0.82f};
-    float theaterScreenLightStrength_ = 0.0f;
     std::array<float, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight>
         previousAdaptiveLogLuma_{};
     std::array<uint8_t, kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight * 4>
         adaptiveReadback_{};
-    bool theaterGeometryCacheValid_ = false;
-    int cachedTheaterSeatRow_ = 0;
-    int cachedTheaterSeatColumn_ = 0;
-    float cachedTheaterYaw_ = 0.0f;
-    float cachedTheaterAnchorX_ = 0.0f;
-    float cachedTheaterAnchorY_ = 0.0f;
-    float cachedTheaterAnchorZ_ = 0.0f;
-    std::vector<float> theaterShellGeometry_;
-    std::vector<float> theaterFloorGeometry_;
-    std::vector<float> theaterPanelGeometry_;
-    std::vector<float> theaterWallTrimGeometry_;
-    std::vector<float> theaterArchitecturalTrimGeometry_;
-    std::vector<float> theaterCoolLightGeometry_;
-    std::vector<float> theaterWarmLightGeometry_;
-    std::vector<float> theaterUpholsteryGeometry_;
-    std::vector<float> theaterCushionHighlightGeometry_;
-    std::vector<float> theaterSeatFrameGeometry_;
-    std::vector<float> theaterSeatShadowGeometry_;
 
     void initializeOpenXr() {
         PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
@@ -1509,65 +1395,6 @@ private:
             out vec4 fragColor;
             void main() { fragColor = uColor; }
         )glsl";
-        const char* theaterVertex = R"glsl(#version 300 es
-            layout(location=0) in vec3 aPosition;
-            layout(location=1) in vec2 aEncodedNormal;
-            uniform mat4 uMvp;
-            out highp vec3 vPosition;
-            out mediump vec3 vNormal;
-            vec3 decodeNormal(vec2 encoded) {
-                vec3 normal = vec3(
-                    encoded.x,
-                    encoded.y,
-                    1.0 - abs(encoded.x) - abs(encoded.y));
-                float fold = clamp(-normal.z, 0.0, 1.0);
-                normal.xy += vec2(
-                    normal.x >= 0.0 ? -fold : fold,
-                    normal.y >= 0.0 ? -fold : fold);
-                return normalize(normal);
-            }
-            void main() {
-                vPosition = aPosition;
-                vNormal = decodeNormal(aEncodedNormal);
-                gl_Position = uMvp * vec4(aPosition, 1.0);
-            }
-        )glsl";
-        const char* theaterFragment = R"glsl(#version 300 es
-            precision highp float;
-            in highp vec3 vPosition;
-            in mediump vec3 vNormal;
-            uniform vec3 uColor;
-            uniform float uRoomBrightness;
-            uniform float uEmissive;
-            uniform vec3 uScreenLightColor;
-            uniform float uScreenLightStrength;
-            uniform vec3 uScreenPosition;
-            out vec4 fragColor;
-            void main() {
-                vec3 normal = normalize(vNormal);
-                if (!gl_FrontFacing) normal = -normal;
-                float overhead = max(normal.y, 0.0);
-                float verticalShape = abs(normal.z) * 0.65 + abs(normal.x) * 0.35;
-                float floorBounce = max(-normal.y, 0.0);
-                float illumination =
-                    0.24 + 0.42 * overhead + 0.20 * verticalShape +
-                    0.06 * floorBounce;
-                float roomLevel = clamp(uRoomBrightness, 0.0, 1.0);
-                vec3 shaded = uColor * illumination * roomLevel;
-                vec3 emissive = uColor * (2.2 * roomLevel);
-                vec3 toScreen = uScreenPosition - vPosition;
-                float screenDistance = length(toScreen);
-                vec3 screenDirection = toScreen / max(screenDistance, 0.001);
-                float screenFacing = max(dot(normal, screenDirection), 0.0);
-                float screenFalloff = 1.0 / (1.0 + 0.020 * screenDistance * screenDistance);
-                float screenSpill = uScreenLightStrength * screenFalloff *
-                    (0.08 + 0.92 * screenFacing);
-                vec3 screenLit = uScreenLightColor * uColor * screenSpill;
-                fragColor = vec4(
-                    mix(shaded, emissive, clamp(uEmissive, 0.0, 1.0)) + screenLit,
-                    1.0);
-            }
-        )glsl";
         const char* adaptiveAnalysisVertex = R"glsl(#version 300 es
             layout(location=0) in vec3 aPosition;
             layout(location=1) in vec2 aUv;
@@ -1599,8 +1426,7 @@ private:
             void main() {
                 vec2 transformed =
                     (uTexTransform * vec4(vUv, 0.0, 1.0)).xy;
-                vec3 sampleColor = texture(uVideo, transformed).rgb;
-                vec3 sourceNits = pqToNits(sampleColor);
+                vec3 sourceNits = pqToNits(texture(uVideo, transformed).rgb);
                 vec3 luma = uPrimaries == 1
                     ? vec3(0.2627, 0.6780, 0.0593)
                     : vec3(0.2126, 0.7152, 0.0722);
@@ -1609,9 +1435,7 @@ private:
                     log2(1.0 + sourceLumaNits) / log2(10001.0),
                     0.0,
                     1.0);
-                // Preserve the source colour for auditorium screen spill while
-                // retaining logarithmic PQ luminance in alpha for HDR analysis.
-                fragColor = vec4(sampleColor, encoded);
+                fragColor = vec4(encoded, encoded, encoded, 1.0);
             }
         )glsl";
         videoProgram_ = makeProgram(vertex, videoFragment);
@@ -1619,9 +1443,7 @@ private:
             makeProgram(adaptiveAnalysisVertex, adaptiveAnalysisFragment);
         subtitleProgram_ = makeProgram(vertex, subtitleFragment);
         pointerProgram_ = makeProgram(vertex, pointerFragment);
-        theaterProgram_ = makeProgram(theaterVertex, theaterFragment);
         glGenFramebuffers(1, &framebuffer_);
-        glGenRenderbuffers(1, &depthRenderbuffer_);
         glGenFramebuffers(1, &adaptiveAnalysisFramebuffer_);
         glGenTextures(1, &adaptiveAnalysisTexture_);
         glBindTexture(GL_TEXTURE_2D, adaptiveAnalysisTexture_);
@@ -1656,7 +1478,7 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
         glBufferData(
             GL_ARRAY_BUFFER,
-            sizeof(float) * kMaximumGeometryVertices * 5,
+            sizeof(float) * kMaximumSurfaceVertices * 5,
             nullptr,
             GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(0);
@@ -1860,7 +1682,6 @@ private:
                 const bool moved = dragMoved_;
                 draggingHand_ = -1;
                 draggingImmersive_ = false;
-                draggingTheater_ = false;
                 if (wasImmersiveDrag && moved) {
                     notifyImmersiveOrientation(
                         gImmersiveYawDegrees.load(),
@@ -1901,93 +1722,6 @@ private:
                     pointerHit_ = origin + direction * 2.0f;
                     return;
                 }
-                if (draggingTheater_) {
-                    Vec3 target{};
-                    float surfaceU = 0.0f;
-                    float surfaceV = 0.0f;
-                    const float curvature = gScreenCurvature.load();
-                    if (!intersectRayWithCurvedScreen(
-                            origin,
-                            direction,
-                            theaterScreenBasis(),
-                            kTheaterScreenHalfWidth,
-                            kTheaterScreenHalfWidth,
-                            kTheaterScreenHalfHeight,
-                            curvature,
-                            0.04f,
-                            &target,
-                            &surfaceU,
-                            &surfaceV)) {
-                        continue;
-                    }
-                    const float pointerArc =
-                        (surfaceU * 2.0f - 1.0f) * kTheaterScreenHalfWidth;
-                    const float pointerVertical =
-                        (1.0f - surfaceV * 2.0f) * kTheaterScreenHalfHeight;
-                    theaterDragFilteredPointerArc_ +=
-                        (pointerArc - theaterDragFilteredPointerArc_) * 0.38f;
-                    theaterDragFilteredPointerVertical_ +=
-                        (pointerVertical - theaterDragFilteredPointerVertical_) * 0.38f;
-                    const float pointerDeltaX =
-                        theaterDragFilteredPointerArc_ - theaterDragStartPointerArc_;
-                    const float pointerDeltaY =
-                        theaterDragFilteredPointerVertical_ -
-                        theaterDragStartPointerVertical_;
-                    if (!dragMoved_) {
-                        constexpr float kTheaterDragActivationDistance = 0.11f;
-                        if (pointerDeltaX * pointerDeltaX +
-                                pointerDeltaY * pointerDeltaY <=
-                            kTheaterDragActivationDistance *
-                                kTheaterDragActivationDistance) {
-                            pointerVisible_ = true;
-                            pointerOrigin_ = origin;
-                            pointerHit_ = target;
-                            return;
-                        }
-                        // Consume the click/drag dead zone instead of allowing
-                        // the projected image to jump as dragging begins.
-                        dragMoved_ = true;
-                        theaterDragStartPointerArc_ =
-                            theaterDragFilteredPointerArc_;
-                        theaterDragStartPointerVertical_ =
-                            theaterDragFilteredPointerVertical_;
-                        theaterDragStartOffsetX_ = gTheaterImageOffsetX.load();
-                        theaterDragStartOffsetY_ = gTheaterImageOffsetY.load();
-                        pointerVisible_ = true;
-                        pointerOrigin_ = origin;
-                        pointerHit_ = target;
-                        return;
-                    }
-                    const float imageHalfHeight = gTheaterImageHalfHeight.load();
-                    const float imageHalfWidth = imageHalfHeight *
-                        std::clamp(gAspect.load(), 0.8f, 2.4f);
-                    const float maxX = std::abs(
-                        kTheaterScreenHalfWidth - imageHalfWidth);
-                    const float maxY = std::abs(
-                        kTheaterScreenHalfHeight - imageHalfHeight);
-                    const float targetX = std::clamp(
-                        theaterDragStartOffsetX_ +
-                            theaterDragFilteredPointerArc_ -
-                            theaterDragStartPointerArc_,
-                        -maxX,
-                        maxX);
-                    const float targetY = std::clamp(
-                        theaterDragStartOffsetY_ +
-                            theaterDragFilteredPointerVertical_ -
-                            theaterDragStartPointerVertical_,
-                        -maxY,
-                        maxY);
-                    const float newX = gTheaterImageOffsetX.load() +
-                        (targetX - gTheaterImageOffsetX.load()) * 0.46f;
-                    const float newY = gTheaterImageOffsetY.load() +
-                        (targetY - gTheaterImageOffsetY.load()) * 0.46f;
-                    gTheaterImageOffsetX.store(newX);
-                    gTheaterImageOffsetY.store(newY);
-                    pointerVisible_ = true;
-                    pointerOrigin_ = origin;
-                    pointerHit_ = target;
-                    return;
-                }
                 Vec3 target{};
                 if (!intersectRayWithSphere(origin, direction, dragRadius_, &target)) continue;
                 const float targetYaw = std::atan2(target.x, -target.z);
@@ -2016,30 +1750,15 @@ private:
             }
 
             const bool immersiveProjection = gVideoProjection.load() != 0;
-            const bool theaterActive =
-                gEnvironmentMode.load() == 1 && !immersiveProjection;
             const bool immersivePlaybackUi =
                 gImmersivePlaybackUi.load();
             const ScreenBasis basis =
                 gMenuInteractive.load() && immersivePlaybackUi
                     ? anchoredImmersiveMenuBasis_
-                    : theaterActive
-                        ? theaterScreenBasis()
-                        : currentScreenBasis();
-            const float halfHeight = theaterActive
-                ? gTheaterImageHalfHeight.load()
-                : gScreenHalfHeight.load();
+                    : currentScreenBasis();
+            const float halfHeight = gScreenHalfHeight.load();
             const float videoHalfWidth =
                 halfHeight * std::clamp(gAspect.load(), 0.8f, 2.4f);
-            const float curvatureReferenceHalfWidth = theaterActive
-                ? kTheaterScreenHalfWidth
-                : videoHalfWidth;
-            const float horizontalOffset = theaterActive
-                ? gTheaterImageOffsetX.load()
-                : 0.0f;
-            const float verticalOffset = theaterActive
-                ? gTheaterImageOffsetY.load()
-                : 0.0f;
             Vec3 hit{};
             float u = 0.0f;
             float v = 0.0f;
@@ -2054,15 +1773,13 @@ private:
                     direction,
                     basis,
                     menuHalfWidth,
-                    theaterActive ? kTheaterScreenHalfWidth : menuReferenceHalfWidth,
+                    menuReferenceHalfWidth,
                     halfHeight,
                     gScreenCurvature.load(),
                     0.03f,
                     &hit,
                     &u,
-                    &v,
-                    horizontalOffset,
-                    verticalOffset);
+                    &v);
                 if (!inside) {
                     float videoU = 0.0f;
                     // Preserve picture clicks on portions of ultra-wide video that
@@ -2072,15 +1789,13 @@ private:
                         direction,
                         basis,
                         videoHalfWidth,
-                        curvatureReferenceHalfWidth,
+                        videoHalfWidth,
                         halfHeight,
                         gScreenCurvature.load(),
                         0.03f,
                         &hit,
                         &videoU,
-                        &v,
-                        horizontalOffset,
-                        verticalOffset);
+                        &v);
                     if (inside) u = videoU < 0.5f ? -0.01f : 1.01f;
                 }
             } else if (immersiveProjection) {
@@ -2094,15 +1809,13 @@ private:
                     direction,
                     basis,
                     videoHalfWidth,
-                    curvatureReferenceHalfWidth,
+                    videoHalfWidth,
                     halfHeight,
                     gScreenCurvature.load(),
                     0.03f,
                     &hit,
                     &u,
-                    &v,
-                    horizontalOffset,
-                    verticalOffset);
+                    &v);
             }
             if (inside) {
                 get.action = thumbstickAction_;
@@ -2170,41 +1883,6 @@ private:
             }
 
             if (pressed && inside) {
-                if (theaterActive) {
-                    Vec3 surfaceHit{};
-                    float surfaceU = 0.0f;
-                    float surfaceV = 0.0f;
-                    if (!intersectRayWithCurvedScreen(
-                            origin,
-                            direction,
-                            theaterScreenBasis(),
-                            kTheaterScreenHalfWidth,
-                            kTheaterScreenHalfWidth,
-                            kTheaterScreenHalfHeight,
-                            gScreenCurvature.load(),
-                            0.04f,
-                            &surfaceHit,
-                            &surfaceU,
-                            &surfaceV)) {
-                        continue;
-                    }
-                    draggingHand_ = hand;
-                    draggingTheater_ = true;
-                    theaterDragStartPointerArc_ =
-                        (surfaceU * 2.0f - 1.0f) * kTheaterScreenHalfWidth;
-                    theaterDragStartPointerVertical_ =
-                        (1.0f - surfaceV * 2.0f) * kTheaterScreenHalfHeight;
-                    theaterDragStartOffsetX_ = gTheaterImageOffsetX.load();
-                    theaterDragStartOffsetY_ = gTheaterImageOffsetY.load();
-                    theaterDragFilteredPointerArc_ = theaterDragStartPointerArc_;
-                    theaterDragFilteredPointerVertical_ =
-                        theaterDragStartPointerVertical_;
-                    dragMoved_ = false;
-                    pointerVisible_ = true;
-                    pointerOrigin_ = origin;
-                    pointerHit_ = hit;
-                    return;
-                }
                 dragStartCenter_ = basis.center;
                 dragRadius_ = std::clamp(length(basis.center), 0.5f, 8.0f);
                 Vec3 target{};
@@ -2230,31 +1908,9 @@ private:
                 XrActionStateVector2f stick{XR_TYPE_ACTION_STATE_VECTOR2F};
                 xrGetActionStateVector2f(session_, &get, &stick);
                 if (stick.isActive && std::abs(stick.currentState.y) > 0.18f) {
-                    const float oldSize = theaterActive
-                        ? gTheaterImageHalfHeight.load()
-                        : gScreenHalfHeight.load();
-                    const float maximumSize = theaterActive
-                        ? kTheaterScreenHalfHeight * 1.07f
-                        : 1.55f;
-                    const float newSize = std::clamp(
-                        oldSize + stick.currentState.y * 0.012f,
-                        theaterActive ? 0.90f : 0.45f,
-                        maximumSize);
-                    if (theaterActive) {
-                        gTheaterImageHalfHeight.store(newSize);
-                        const float newHalfWidth = newSize *
-                            std::clamp(gAspect.load(), 0.8f, 2.4f);
-                        gTheaterImageOffsetX.store(std::clamp(
-                            gTheaterImageOffsetX.load(),
-                            -std::abs(kTheaterScreenHalfWidth - newHalfWidth),
-                            std::abs(kTheaterScreenHalfWidth - newHalfWidth)));
-                        gTheaterImageOffsetY.store(std::clamp(
-                            gTheaterImageOffsetY.load(),
-                            -std::abs(kTheaterScreenHalfHeight - newSize),
-                            std::abs(kTheaterScreenHalfHeight - newSize)));
-                    } else {
-                        gScreenHalfHeight.store(newSize);
-                    }
+                    const float oldSize = gScreenHalfHeight.load();
+                    const float newSize = std::clamp(oldSize + stick.currentState.y * 0.012f, 0.45f, 1.55f);
+                    gScreenHalfHeight.store(newSize);
                     pointerVisible_ = true;
                     pointerOrigin_ = origin;
                     pointerHit_ = hit;
@@ -2293,20 +1949,12 @@ private:
 
     void analyzeAdaptiveToneMapping(int64_t videoTimestampNanos) {
         const float staticTargetNits = gToneMapPeakNits.load();
-        const bool adaptiveActive = adaptiveToneMappingActive();
-        const bool theaterLightingActive =
-            gEnvironmentMode.load() == 1 &&
-            gVideoProjection.load() == 0 &&
-            gHasVideo.load();
-        if (!adaptiveActive) {
+        if (!adaptiveToneMappingActive()) {
             if (adaptiveHistoryValid_ ||
                 gAdaptiveToneMapEffectiveNits.load() != staticTargetNits) {
                 resetAdaptiveAnalysis(staticTargetNits);
             }
-            if (!theaterLightingActive) {
-                theaterScreenLightStrength_ = 0.0f;
-                return;
-            }
+            return;
         }
 
         const uint32_t resetGeneration = gAdaptiveToneMapResetGeneration.load();
@@ -2316,10 +1964,6 @@ private:
         }
         if (videoTimestampNanos <= 0 ||
             videoTimestampNanos == lastAnalyzedVideoTimestampNanos_) {
-            return;
-        }
-        if (!adaptiveActive && lastAnalyzedVideoTimestampNanos_ > 0 &&
-            videoTimestampNanos - lastAnalyzedVideoTimestampNanos_ < 80'000'000) {
             return;
         }
 
@@ -2370,50 +2014,13 @@ private:
 
         constexpr size_t sampleCount =
             kAdaptiveAnalysisWidth * kAdaptiveAnalysisHeight;
-        Vec3 meanScreenColor{};
-        float meanScreenLuma = 0.0f;
-        for (size_t index = 0; index < sampleCount; ++index) {
-            const Vec3 sample{
-                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f,
-                static_cast<float>(adaptiveReadback_[index * 4 + 1]) / 255.0f,
-                static_cast<float>(adaptiveReadback_[index * 4 + 2]) / 255.0f,
-            };
-            meanScreenColor = meanScreenColor + sample;
-            meanScreenLuma += dot(sample, {0.2126f, 0.7152f, 0.0722f});
-        }
-        meanScreenColor = meanScreenColor * (1.0f / static_cast<float>(sampleCount));
-        meanScreenLuma /= static_cast<float>(sampleCount);
-        const float colorPeak = std::max(
-            std::max(meanScreenColor.x, meanScreenColor.y), meanScreenColor.z);
-        const Vec3 targetScreenColor = colorPeak > 0.015f
-            ? meanScreenColor * (1.0f / colorPeak)
-            : Vec3{1.0f, 0.92f, 0.82f};
-        const float targetScreenStrength = theaterLightingActive
-            ? std::clamp(
-                (meanScreenLuma - 0.035f) / 0.50f,
-                0.0f,
-                1.0f) * 1.35f
-            : 0.0f;
-        const float screenLightAlpha = lastAnalyzedVideoTimestampNanos_ == 0
-            ? 1.0f
-            : 0.10f;
-        theaterScreenLightColor_ = theaterScreenLightColor_ +
-            (targetScreenColor - theaterScreenLightColor_) * screenLightAlpha;
-        theaterScreenLightStrength_ +=
-            (targetScreenStrength - theaterScreenLightStrength_) * screenLightAlpha;
-
-        if (!adaptiveActive) {
-            lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
-            return;
-        }
-
         std::array<float, sampleCount> sourceNits{};
         std::array<float, 16> histogram{};
         float meanNits = 0.0f;
         float meanEncoded = 0.0f;
         for (size_t index = 0; index < sampleCount; ++index) {
             const float encoded =
-                static_cast<float>(adaptiveReadback_[index * 4 + 3]) / 255.0f;
+                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
             const float nits =
                 std::exp2(encoded * std::log2(10001.0f)) - 1.0f;
             sourceNits[index] = nits;
@@ -2495,7 +2102,7 @@ private:
             previousMean /= static_cast<float>(sampleCount);
             for (size_t index = 0; index < sampleCount; ++index) {
                 const float current =
-                    static_cast<float>(adaptiveReadback_[index * 4 + 3]) / 255.0f;
+                    static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
                 const float previous = previousAdaptiveLogLuma_[index];
                 structuralDifference += std::abs(
                     (current - meanEncoded) - (previous - previousMean));
@@ -2547,7 +2154,7 @@ private:
         gAdaptiveToneMapEffectiveNits.store(adaptiveEffectiveTargetNits_);
         for (size_t index = 0; index < sampleCount; ++index) {
             previousAdaptiveLogLuma_[index] =
-                static_cast<float>(adaptiveReadback_[index * 4 + 3]) / 255.0f;
+                static_cast<float>(adaptiveReadback_[index * 4]) / 255.0f;
         }
         adaptiveHistoryValid_ = true;
         lastAnalyzedVideoTimestampNanos_ = videoTimestampNanos;
@@ -2564,9 +2171,6 @@ private:
             };
         }
         headCenter_ = position * (1.0f / static_cast<float>(viewCount));
-        gLatestHeadX.store(headCenter_.x);
-        gLatestHeadY.store(headCenter_.y);
-        gLatestHeadZ.store(headCenter_.z);
         const XrQuaternionf orientation = views_[0].pose.orientation;
         const Vec3 forward = normalized(
             rotateVector(orientation, {0.0f, 0.0f, -1.0f}));
@@ -2668,678 +2272,6 @@ private:
         checkXr(xrEndFrame(session_, &end), "xrEndFrame");
     }
 
-    void drawSolidGeometry(
-        const Mat4& mvp,
-        const std::vector<float>& vertices,
-        float red,
-        float green,
-        float blue,
-        float emissive = 0.0f) {
-        if (vertices.empty()) return;
-        const size_t vertexCount = vertices.size() / 5;
-        if (vertexCount > static_cast<size_t>(kMaximumGeometryVertices)) {
-            LOGE("Theater geometry overflow: %zu vertices", vertexCount);
-            return;
-        }
-        glBindVertexArray(vertexArray_);
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer_);
-        glBufferSubData(
-            GL_ARRAY_BUFFER,
-            0,
-            vertices.size() * sizeof(float),
-            vertices.data());
-        glUseProgram(theaterProgram_);
-        glUniformMatrix4fv(
-            glGetUniformLocation(theaterProgram_, "uMvp"),
-            1,
-            GL_FALSE,
-            mvp.m);
-        glUniform3f(
-            glGetUniformLocation(theaterProgram_, "uColor"),
-            red,
-            green,
-            blue);
-        glUniform1f(
-            glGetUniformLocation(theaterProgram_, "uRoomBrightness"),
-            std::clamp(gTheaterBrightness.load(), 0.0f, 1.0f));
-        glUniform1f(
-            glGetUniformLocation(theaterProgram_, "uEmissive"),
-            emissive);
-        glUniform3f(
-            glGetUniformLocation(theaterProgram_, "uScreenLightColor"),
-            theaterScreenLightColor_.x,
-            theaterScreenLightColor_.y,
-            theaterScreenLightColor_.z);
-        glUniform1f(
-            glGetUniformLocation(theaterProgram_, "uScreenLightStrength"),
-            theaterScreenLightStrength_);
-        const Vec3 theaterScreenCenter = theaterScreenBasis().center;
-        glUniform3f(
-            glGetUniformLocation(theaterProgram_, "uScreenPosition"),
-            theaterScreenCenter.x,
-            theaterScreenCenter.y,
-            theaterScreenCenter.z);
-        glDrawArrays(
-            GL_TRIANGLES,
-            0,
-            static_cast<GLsizei>(vertices.size() / 5));
-    }
-
-    void ensureDepthBuffer(int width, int height) {
-        if (!depthRenderbuffer_) return;
-        glBindRenderbuffer(GL_RENDERBUFFER, depthRenderbuffer_);
-        if (depthBufferWidth_ != width || depthBufferHeight_ != height) {
-            glRenderbufferStorage(
-                GL_RENDERBUFFER,
-                GL_DEPTH_COMPONENT16,
-                width,
-                height);
-            depthBufferWidth_ = width;
-            depthBufferHeight_ = height;
-        }
-        glFramebufferRenderbuffer(
-            GL_FRAMEBUFFER,
-            GL_DEPTH_ATTACHMENT,
-            GL_RENDERBUFFER,
-            depthRenderbuffer_);
-    }
-
-    static void appendSolidQuad(
-        std::vector<float>& vertices,
-        const Vec3& topLeft,
-        const Vec3& bottomLeft,
-        const Vec3& bottomRight,
-        const Vec3& topRight) {
-        const auto add = [&vertices](const Vec3& point) {
-            vertices.insert(
-                vertices.end(),
-                {point.x, point.y, point.z, 0.0f, 0.0f});
-        };
-        add(topLeft);
-        add(bottomLeft);
-        add(bottomRight);
-        add(topLeft);
-        add(bottomRight);
-        add(topRight);
-    }
-
-    static void appendTheaterVertex(
-        std::vector<float>& vertices,
-        const Vec3& localPoint,
-        const Vec3& localNormal) {
-        const Vec3 worldNormal = normalized(rotateTheaterYaw(localNormal));
-        const float inverseL1 = 1.0f /
-            std::max(
-                std::abs(worldNormal.x) + std::abs(worldNormal.y) +
-                    std::abs(worldNormal.z),
-                0.00001f);
-        float encodedX = worldNormal.x * inverseL1;
-        float encodedY = worldNormal.y * inverseL1;
-        if (worldNormal.z < 0.0f) {
-            const float oldX = encodedX;
-            encodedX = (1.0f - std::abs(encodedY)) *
-                (oldX >= 0.0f ? 1.0f : -1.0f);
-            encodedY = (1.0f - std::abs(oldX)) *
-                (encodedY >= 0.0f ? 1.0f : -1.0f);
-        }
-        const Vec3 world = theaterWorldPoint(localPoint);
-        vertices.insert(vertices.end(), {
-            world.x, world.y, world.z, encodedX, encodedY,
-        });
-    }
-
-    static void appendTheaterQuad(
-        std::vector<float>& vertices,
-        const Vec3& topLeft,
-        const Vec3& bottomLeft,
-        const Vec3& bottomRight,
-        const Vec3& topRight) {
-        const Vec3 localNormal = normalized(
-            cross(topRight - topLeft, bottomLeft - topLeft),
-            {0.0f, 0.0f, 1.0f});
-        appendTheaterVertex(vertices, topLeft, localNormal);
-        appendTheaterVertex(vertices, bottomLeft, localNormal);
-        appendTheaterVertex(vertices, bottomRight, localNormal);
-        appendTheaterVertex(vertices, topLeft, localNormal);
-        appendTheaterVertex(vertices, bottomRight, localNormal);
-        appendTheaterVertex(vertices, topRight, localNormal);
-    }
-
-    static void appendTheaterBox(
-        std::vector<float>& vertices,
-        float left,
-        float bottom,
-        float front,
-        float right,
-        float top,
-        float back) {
-        appendTheaterQuad(vertices,
-            {left, top, front}, {left, bottom, front},
-            {right, bottom, front}, {right, top, front});
-        appendTheaterQuad(vertices,
-            {right, top, back}, {right, bottom, back},
-            {left, bottom, back}, {left, top, back});
-        appendTheaterQuad(vertices,
-            {left, top, back}, {left, bottom, back},
-            {left, bottom, front}, {left, top, front});
-        appendTheaterQuad(vertices,
-            {right, top, front}, {right, bottom, front},
-            {right, bottom, back}, {right, top, back});
-        appendTheaterQuad(vertices,
-            {left, top, back}, {left, top, front},
-            {right, top, front}, {right, top, back});
-        appendTheaterQuad(vertices,
-            {left, bottom, front}, {left, bottom, back},
-            {right, bottom, back}, {right, bottom, front});
-    }
-
-    static void appendTheaterWedge(
-        std::vector<float>& vertices,
-        float left,
-        float right,
-        float bottom,
-        float top,
-        float bottomFront,
-        float bottomBack,
-        float topFront,
-        float topBack) {
-        appendTheaterQuad(vertices,
-            {left, top, topFront}, {left, bottom, bottomFront},
-            {right, bottom, bottomFront}, {right, top, topFront});
-        appendTheaterQuad(vertices,
-            {right, top, topBack}, {right, bottom, bottomBack},
-            {left, bottom, bottomBack}, {left, top, topBack});
-        appendTheaterQuad(vertices,
-            {left, top, topBack}, {left, bottom, bottomBack},
-            {left, bottom, bottomFront}, {left, top, topFront});
-        appendTheaterQuad(vertices,
-            {right, top, topFront}, {right, bottom, bottomFront},
-            {right, bottom, bottomBack}, {right, top, topBack});
-        appendTheaterQuad(vertices,
-            {left, top, topBack}, {left, top, topFront},
-            {right, top, topFront}, {right, top, topBack});
-        appendTheaterQuad(vertices,
-            {left, bottom, bottomFront}, {left, bottom, bottomBack},
-            {right, bottom, bottomBack}, {right, bottom, bottomFront});
-    }
-
-    static void appendTheaterHorizontalDisc(
-        std::vector<float>& vertices,
-        const Vec3& center,
-        float radius,
-        int segments = 12) {
-        for (int segment = 0; segment < segments; ++segment) {
-            const float angle0 = 2.0f * kPi * segment / segments;
-            const float angle1 = 2.0f * kPi * (segment + 1) / segments;
-            const Vec3 p0{
-                center.x + std::cos(angle0) * radius,
-                center.y,
-                center.z + std::sin(angle0) * radius,
-            };
-            const Vec3 p1{
-                center.x + std::cos(angle1) * radius,
-                center.y,
-                center.z + std::sin(angle1) * radius,
-            };
-            appendTheaterVertex(vertices, center, {0.0f, 1.0f, 0.0f});
-            appendTheaterVertex(vertices, p0, {0.0f, 1.0f, 0.0f});
-            appendTheaterVertex(vertices, p1, {0.0f, 1.0f, 0.0f});
-        }
-    }
-
-    static void appendTheaterEllipsoid(
-        std::vector<float>& vertices,
-        const Vec3& center,
-        const Vec3& radii,
-        float tiltRadians = 0.0f,
-        int horizontalSegments = 12,
-        int verticalSegments = 7) {
-        const float sine = std::sin(tiltRadians);
-        const float cosine = std::cos(tiltRadians);
-        struct SurfaceVertex {
-            Vec3 point;
-            Vec3 normal;
-        };
-        const auto point = [&](float longitude, float latitude) {
-            const float latitudeCosine = std::cos(latitude);
-            const float localX = radii.x * latitudeCosine * std::cos(longitude);
-            const float localY = radii.y * std::sin(latitude);
-            const float localZ = radii.z * latitudeCosine * std::sin(longitude);
-            const Vec3 unrotatedNormal = normalized({
-                localX / std::max(radii.x * radii.x, 0.00001f),
-                localY / std::max(radii.y * radii.y, 0.00001f),
-                localZ / std::max(radii.z * radii.z, 0.00001f),
-            });
-            return SurfaceVertex{
-                {
-                    center.x + localX,
-                    center.y + cosine * localY - sine * localZ,
-                    center.z + sine * localY + cosine * localZ,
-                },
-                normalized({
-                    unrotatedNormal.x,
-                    cosine * unrotatedNormal.y - sine * unrotatedNormal.z,
-                    sine * unrotatedNormal.y + cosine * unrotatedNormal.z,
-                }),
-            };
-        };
-        const auto add = [&vertices](const SurfaceVertex& vertex) {
-            appendTheaterVertex(vertices, vertex.point, vertex.normal);
-        };
-        for (int latitudeIndex = 0;
-             latitudeIndex < verticalSegments;
-             ++latitudeIndex) {
-            const float latitude0 =
-                -0.5f * kPi + kPi * latitudeIndex / verticalSegments;
-            const float latitude1 =
-                -0.5f * kPi + kPi * (latitudeIndex + 1) / verticalSegments;
-            for (int longitudeIndex = 0;
-                 longitudeIndex < horizontalSegments;
-                 ++longitudeIndex) {
-                const float longitude0 =
-                    2.0f * kPi * longitudeIndex / horizontalSegments;
-                const float longitude1 =
-                    2.0f * kPi * (longitudeIndex + 1) / horizontalSegments;
-                const SurfaceVertex p00 = point(longitude0, latitude0);
-                const SurfaceVertex p01 = point(longitude1, latitude0);
-                const SurfaceVertex p10 = point(longitude0, latitude1);
-                const SurfaceVertex p11 = point(longitude1, latitude1);
-                add(p00);
-                add(p10);
-                add(p11);
-                add(p00);
-                add(p11);
-                add(p01);
-            }
-        }
-    }
-
-    static void appendTheaterChamferedBox(
-        std::vector<float>& vertices,
-        const Vec3& center,
-        float halfWidth,
-        float bottom,
-        float top,
-        float halfDepth,
-        float chamfer) {
-        const float safeChamfer = std::clamp(
-            chamfer, 0.0f, std::min(halfWidth, halfDepth) * 0.45f);
-        const std::array<Vec3, 8> lower{{
-            {center.x - halfWidth + safeChamfer, bottom, center.z - halfDepth},
-            {center.x + halfWidth - safeChamfer, bottom, center.z - halfDepth},
-            {center.x + halfWidth, bottom, center.z - halfDepth + safeChamfer},
-            {center.x + halfWidth, bottom, center.z + halfDepth - safeChamfer},
-            {center.x + halfWidth - safeChamfer, bottom, center.z + halfDepth},
-            {center.x - halfWidth + safeChamfer, bottom, center.z + halfDepth},
-            {center.x - halfWidth, bottom, center.z + halfDepth - safeChamfer},
-            {center.x - halfWidth, bottom, center.z - halfDepth + safeChamfer},
-        }};
-        std::array<Vec3, 8> upper = lower;
-        for (auto& point : upper) point.y = top;
-        const Vec3 topCenter{center.x, top, center.z};
-        const Vec3 bottomCenter{center.x, bottom, center.z};
-        for (int index = 0; index < 8; ++index) {
-            const int next = (index + 1) % 8;
-            appendTheaterVertex(vertices, topCenter, {0.0f, 1.0f, 0.0f});
-            appendTheaterVertex(vertices, upper[index], {0.0f, 1.0f, 0.0f});
-            appendTheaterVertex(vertices, upper[next], {0.0f, 1.0f, 0.0f});
-            appendTheaterVertex(vertices, bottomCenter, {0.0f, -1.0f, 0.0f});
-            appendTheaterVertex(vertices, lower[next], {0.0f, -1.0f, 0.0f});
-            appendTheaterVertex(vertices, lower[index], {0.0f, -1.0f, 0.0f});
-            appendTheaterQuad(
-                vertices,
-                upper[index], lower[index], lower[next], upper[next]);
-        }
-    }
-
-    void drawTheaterScreenBacking(const Mat4& mvp, float curvature) {
-        std::vector<float> backing;
-        backing.reserve(kScreenSegments * 6 * 5);
-        for (int segment = 0; segment < kScreenSegments; ++segment) {
-            const float n0 =
-                static_cast<float>(segment) / kScreenSegments * 2.0f - 1.0f;
-            const float n1 =
-                static_cast<float>(segment + 1) / kScreenSegments * 2.0f - 1.0f;
-            appendSolidQuad(
-                backing,
-                theaterSurfacePoint(
-                    kTheaterScreenHalfWidth, n0,
-                    kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f),
-                theaterSurfacePoint(
-                    kTheaterScreenHalfWidth, n0,
-                    -kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f),
-                theaterSurfacePoint(
-                    kTheaterScreenHalfWidth, n1,
-                    -kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f),
-                theaterSurfacePoint(
-                    kTheaterScreenHalfWidth, n1,
-                    kTheaterScreenHalfHeight, curvature, 0.0f, 0.0f, -0.050f));
-        }
-        drawSolidGeometry(mvp, backing, 0.002f, 0.002f, 0.003f);
-    }
-
-    void refreshTheaterGeometryCacheIfNeeded() {
-        const int seatRow = gTheaterSeatRow.load();
-        const int seatColumn = gTheaterSeatColumn.load();
-        const float yaw = gTheaterYawDegrees.load();
-        const float anchorX = gTheaterAnchorX.load();
-        const float anchorY = gTheaterAnchorY.load();
-        const float anchorZ = gTheaterAnchorZ.load();
-        if (theaterGeometryCacheValid_ &&
-            cachedTheaterSeatRow_ == seatRow &&
-            cachedTheaterSeatColumn_ == seatColumn &&
-            cachedTheaterYaw_ == yaw &&
-            cachedTheaterAnchorX_ == anchorX &&
-            cachedTheaterAnchorY_ == anchorY &&
-            cachedTheaterAnchorZ_ == anchorZ) {
-            return;
-        }
-        cachedTheaterSeatRow_ = seatRow;
-        cachedTheaterSeatColumn_ = seatColumn;
-        cachedTheaterYaw_ = yaw;
-        cachedTheaterAnchorX_ = anchorX;
-        cachedTheaterAnchorY_ = anchorY;
-        cachedTheaterAnchorZ_ = anchorZ;
-        theaterGeometryCacheValid_ = true;
-        theaterShellGeometry_.clear();
-        theaterFloorGeometry_.clear();
-        theaterPanelGeometry_.clear();
-        theaterWallTrimGeometry_.clear();
-        theaterArchitecturalTrimGeometry_.clear();
-        theaterCoolLightGeometry_.clear();
-        theaterWarmLightGeometry_.clear();
-        theaterUpholsteryGeometry_.clear();
-        theaterCushionHighlightGeometry_.clear();
-        theaterSeatFrameGeometry_.clear();
-        theaterSeatShadowGeometry_.clear();
-    }
-
-    void drawTheaterSeats(const Mat4& mvp, float brightness) {
-        refreshTheaterGeometryCacheIfNeeded();
-        constexpr float rowPositions[] = {
-            -1.40f, -0.50f, 0.70f, 2.20f, 3.70f, 5.20f, 6.80f,
-        };
-        constexpr float rowElevations[] = {
-            0.0f, 0.25f, 0.53f, 0.86f, 1.20f, 1.55f, 1.92f,
-        };
-        constexpr int selectablePhysicalRows[] = {1, 3, 5};
-        const int selectedRow = std::clamp(gTheaterSeatRow.load(), 0, 2);
-        const int selectedPhysicalRow = selectablePhysicalRows[selectedRow];
-        const int selectedColumn = std::clamp(gTheaterSeatColumn.load(), -1, 1);
-        auto& upholstery = theaterUpholsteryGeometry_;
-        auto& cushionHighlights = theaterCushionHighlightGeometry_;
-        auto& seatFrames = theaterSeatFrameGeometry_;
-        auto& seatShadows = theaterSeatShadowGeometry_;
-        upholstery.reserve(7 * 13 * 720 * 5);
-        cushionHighlights.reserve(7 * 13 * 720 * 5);
-        seatFrames.reserve(7 * 13 * 72 * 5);
-        seatShadows.reserve(7 * 13 * 720 * 5);
-        if (upholstery.empty()) for (int rowIndex = 0; rowIndex < 7; ++rowIndex) {
-            const float z = rowPositions[rowIndex];
-            const float elevation = rowElevations[rowIndex];
-            for (int column = -6; column <= 6; ++column) {
-                if (rowIndex == selectedPhysicalRow && column == selectedColumn) continue;
-                const float x = static_cast<float>(column) * 1.06f;
-                const auto box = [x, z, elevation](
-                    std::vector<float>& target,
-                    float left, float bottom, float front,
-                    float right, float top, float back) {
-                    appendTheaterBox(
-                        target,
-                        x + left, elevation + bottom, z + front,
-                        x + right, elevation + top, z + back);
-                };
-
-                // Sculpted closed shells establish the chair silhouette.
-                appendTheaterEllipsoid(
-                    seatShadows,
-                    {x, elevation - 0.61f, z + 0.28f},
-                    {0.50f, 0.61f, 0.20f},
-                    0.13f,
-                    16,
-                    10);
-                appendTheaterChamferedBox(
-                    seatShadows,
-                    {x, 0.0f, z - 0.18f},
-                    0.47f,
-                    elevation - 1.12f,
-                    elevation - 0.91f,
-                    0.39f,
-                    0.075f);
-
-                // Plush inset cushions retain a smooth profile under the
-                // theater lighting while staying well within the mobile GPU
-                // budget. The back has a gentle cinema-seat recline.
-                appendTheaterEllipsoid(
-                    upholstery,
-                    {x, elevation - 0.61f, z + 0.245f},
-                    {0.43f, 0.54f, 0.16f},
-                    0.13f,
-                    16,
-                    10);
-                appendTheaterChamferedBox(
-                    upholstery,
-                    {x, 0.0f, z - 0.20f},
-                    0.405f,
-                    elevation - 1.075f,
-                    elevation - 0.895f,
-                    0.345f,
-                    0.065f);
-
-                // Rounded padded armrests replace the former rectangular
-                // rails. Their highlights make the seat read at cinema light
-                // levels without requiring large texture maps.
-                for (float side : {-0.49f, 0.49f}) {
-                    appendTheaterEllipsoid(
-                        cushionHighlights,
-                        {x + side, elevation - 0.86f, z - 0.10f},
-                        {0.105f, 0.13f, 0.37f});
-                }
-                box(
-                    seatFrames,
-                    -0.12f, -1.59f, -0.02f,
-                    0.12f, -1.13f, 0.17f);
-                box(
-                    seatFrames,
-                    -0.28f, -1.63f, -0.13f,
-                    0.28f, -1.56f, 0.26f);
-                appendTheaterHorizontalDisc(
-                    seatShadows,
-                    {x + 0.49f, elevation - 0.755f, z - 0.29f},
-                    0.056f,
-                    14);
-            }
-        }
-        drawSolidGeometry(
-            mvp, upholstery,
-            0.18f + 0.17f * brightness,
-            0.012f + 0.030f * brightness,
-            0.026f + 0.045f * brightness);
-        drawSolidGeometry(
-            mvp, cushionHighlights,
-            0.115f + 0.14f * brightness,
-            0.014f + 0.030f * brightness,
-            0.026f + 0.040f * brightness);
-        drawSolidGeometry(
-            mvp, seatFrames,
-            0.018f + 0.030f * brightness,
-            0.014f + 0.020f * brightness,
-            0.020f + 0.028f * brightness);
-        drawSolidGeometry(
-            mvp, seatShadows,
-            0.014f + 0.020f * brightness,
-            0.006f + 0.010f * brightness,
-            0.010f + 0.014f * brightness);
-    }
-
-    void drawTheater(const Mat4& mvp, float curvature) {
-        const float brightness = std::clamp(
-            gTheaterBrightness.load(), 0.0f, 1.0f);
-        refreshTheaterGeometryCacheIfNeeded();
-        auto& shell = theaterShellGeometry_;
-        auto& floor = theaterFloorGeometry_;
-        auto& panels = theaterPanelGeometry_;
-        auto& wallTrim = theaterWallTrimGeometry_;
-        auto& architecturalTrim = theaterArchitecturalTrimGeometry_;
-        auto& coolLights = theaterCoolLightGeometry_;
-        auto& warmLights = theaterWarmLightGeometry_;
-        shell.reserve(840 * 5);
-        floor.reserve(720 * 5);
-        panels.reserve(2200 * 5);
-        wallTrim.reserve(900 * 5);
-        architecturalTrim.reserve(1800 * 5);
-        coolLights.reserve(600 * 5);
-        warmLights.reserve(1200 * 5);
-
-        if (shell.empty()) {
-        // A full-scale commercial auditorium: sixteen metres wide, fifteen
-        // metres deep and seven metres from floor to ceiling at the rear.
-        appendTheaterBox(shell, -8.35f, -1.84f, -6.90f, -8.05f, 5.25f, 8.85f);
-        appendTheaterBox(shell, 8.05f, -1.84f, -6.90f, 8.35f, 5.25f, 8.85f);
-        appendTheaterBox(shell, -8.35f, -1.84f, 8.55f, 8.35f, 5.25f, 8.88f);
-        appendTheaterBox(shell, -8.35f, 5.05f, -6.90f, 8.35f, 5.30f, 8.88f);
-
-        // The screen wall is recessed behind a broad, layered proscenium.
-        appendTheaterBox(shell, -8.35f, -1.84f, -6.88f, -5.65f, 5.25f, -6.58f);
-        appendTheaterBox(shell, 5.65f, -1.84f, -6.88f, 8.35f, 5.25f, -6.58f);
-        appendTheaterBox(shell, -5.65f, 4.20f, -6.88f, 5.65f, 5.25f, -6.58f);
-        }
-        drawSolidGeometry(
-            mvp, shell,
-            0.012f + 0.022f * brightness,
-            0.011f + 0.016f * brightness,
-            0.020f + 0.030f * brightness);
-
-        if (floor.empty()) {
-        // Seven-row stadium bowl with deep side aisles and an open stage apron.
-        appendTheaterBox(floor, -8.05f, -1.84f, -6.58f, 8.05f, -1.66f, 8.55f);
-        appendTheaterBox(floor, -7.90f, -1.66f, -6.35f, 7.90f, -1.50f, -5.55f);
-        constexpr float tierStarts[] = {
-            -0.95f, 0.10f, 1.45f, 2.95f, 4.45f, 6.00f,
-        };
-        constexpr float tierTops[] = {
-            -1.40f, -1.12f, -0.79f, -0.45f, -0.10f, 0.27f,
-        };
-        for (int tier = 0; tier < 6; ++tier) {
-            appendTheaterBox(
-                floor,
-                -7.65f, -1.67f, tierStarts[tier],
-                7.65f, tierTops[tier], 8.48f);
-        }
-        }
-        drawSolidGeometry(
-            mvp, floor,
-            0.016f + 0.028f * brightness,
-            0.015f + 0.021f * brightness,
-            0.023f + 0.033f * brightness);
-
-        if (panels.empty()) {
-        // Tall upholstered acoustic bays alternate depth and tone down both
-        // walls, creating parallax and scale well into the viewer's periphery.
-        int panelIndex = 0;
-        for (float z = -5.70f; z <= 7.85f; z += 1.05f, ++panelIndex) {
-            const float inset = panelIndex % 2 == 0 ? 0.0f : 0.055f;
-            appendTheaterBox(
-                panels, -8.03f + inset, -0.96f, z - 0.42f,
-                -7.90f + inset, 3.92f, z + 0.42f);
-            appendTheaterBox(
-                panels, 7.90f - inset, -0.96f, z - 0.42f,
-                8.03f - inset, 3.92f, z + 0.42f);
-            appendTheaterBox(
-                wallTrim, -7.88f + inset, -1.04f, z + 0.45f,
-                -7.80f + inset, 4.02f, z + 0.53f);
-            appendTheaterBox(
-                wallTrim, 7.80f - inset, -1.04f, z + 0.45f,
-                7.88f - inset, 4.02f, z + 0.53f);
-        }
-        }
-        drawSolidGeometry(
-            mvp, panels,
-            0.040f + 0.060f * brightness,
-            0.014f + 0.024f * brightness,
-            0.031f + 0.048f * brightness);
-        drawSolidGeometry(
-            mvp, wallTrim,
-            0.025f + 0.038f * brightness,
-            0.022f + 0.029f * brightness,
-            0.037f + 0.052f * brightness);
-
-        // Large ceiling coffers, proscenium layers, stage trim and rear exits.
-        if (architecturalTrim.empty()) {
-        for (float x = -7.2f; x <= 7.2f; x += 1.2f) {
-            appendTheaterBox(
-                architecturalTrim, x - 0.045f, 4.94f, -6.45f,
-                x + 0.045f, 5.05f, 8.45f);
-        }
-        for (float z = -5.55f; z <= 7.75f; z += 1.10f) {
-            appendTheaterBox(
-                architecturalTrim, -7.82f, 4.94f, z - 0.045f,
-                7.82f, 5.05f, z + 0.045f);
-        }
-        appendTheaterBox(architecturalTrim, -5.62f, -1.66f, -6.55f, -5.42f, 4.25f, -6.18f);
-        appendTheaterBox(architecturalTrim, 5.42f, -1.66f, -6.55f, 5.62f, 4.25f, -6.18f);
-        appendTheaterBox(architecturalTrim, -5.62f, 4.20f, -6.55f, 5.62f, 4.43f, -6.18f);
-        appendTheaterBox(architecturalTrim, -5.68f, -1.65f, -5.72f, 5.68f, -1.47f, -5.35f);
-        appendTheaterBox(architecturalTrim, -7.90f, -1.63f, 8.37f, -6.60f, 1.65f, 8.52f);
-        appendTheaterBox(architecturalTrim, 6.60f, -1.63f, 8.37f, 7.90f, 1.65f, 8.52f);
-        appendTheaterBox(architecturalTrim, -2.20f, 3.65f, 8.35f, 2.20f, 4.70f, 8.50f);
-        }
-        drawSolidGeometry(
-            mvp, architecturalTrim,
-            0.028f + 0.042f * brightness,
-            0.024f + 0.032f * brightness,
-            0.041f + 0.058f * brightness);
-
-        if (coolLights.empty()) {
-        // Continuous aisle tread markers make the stadium rake legible.
-        constexpr float stepZ[] = {-0.95f, 0.10f, 1.45f, 2.95f, 4.45f, 6.00f};
-        constexpr float stepY[] = {-1.395f, -1.115f, -0.785f, -0.445f, -0.095f, 0.275f};
-        for (int step = 0; step < 6; ++step) {
-            appendTheaterBox(
-                coolLights, -7.78f, stepY[step], stepZ[step] - 0.045f,
-                -6.78f, stepY[step] + 0.045f, stepZ[step] + 0.035f);
-            appendTheaterBox(
-                coolLights, 6.78f, stepY[step], stepZ[step] - 0.045f,
-                7.78f, stepY[step] + 0.045f, stepZ[step] + 0.035f);
-        }
-        }
-        drawSolidGeometry(
-            mvp, coolLights,
-            0.025f,
-            0.12f,
-            0.46f,
-            1.0f);
-
-        if (warmLights.empty()) {
-        for (float z : {-5.20f, -3.0f, -0.8f, 1.4f, 3.6f, 5.8f, 8.0f}) {
-            appendTheaterBox(
-                warmLights, -7.86f, 0.72f, z - 0.12f,
-                -7.73f, 1.34f, z + 0.12f);
-            appendTheaterBox(
-                warmLights, 7.73f, 0.72f, z - 0.12f,
-                7.86f, 1.34f, z + 0.12f);
-        }
-        for (float x : {-6.0f, -4.0f, -2.0f, 0.0f, 2.0f, 4.0f, 6.0f}) {
-            for (float z : {-4.8f, -1.8f, 1.2f, 4.2f, 7.2f}) {
-                appendTheaterHorizontalDisc(
-                    warmLights,
-                    {x, 4.925f, z},
-                    0.075f,
-                    12);
-            }
-        }
-        }
-        drawSolidGeometry(
-            mvp, warmLights,
-            0.46f,
-            0.16f,
-            0.042f,
-            1.0f);
-
-        // A proper depth attachment now handles all auditorium intersections.
-        drawTheaterScreenBacking(mvp, curvature);
-    }
-
     void renderEye(uint32_t eye, const XrView& view, bool passthroughActive) {
         auto& chain = swapchains_[eye];
         uint32_t imageIndex = 0;
@@ -3352,20 +2284,11 @@ private:
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                chain.images[imageIndex].image, 0);
-        ensureDepthBuffer(chain.width, chain.height);
         glViewport(0, 0, chain.width, chain.height);
         if (passthroughActive) {
             const float dimmingAlpha = 1.0f - std::clamp(
                 gPassthroughBrightness.load(), 0.0f, 1.0f);
             glClearColor(0.0f, 0.0f, 0.0f, dimmingAlpha);
-        } else if (gEnvironmentMode.load() == 1 && gVideoProjection.load() == 0) {
-            const float brightness = std::clamp(
-                gTheaterBrightness.load(), 0.0f, 1.0f);
-            glClearColor(
-                0.016f * brightness,
-                0.012f * brightness,
-                0.024f * brightness,
-                1.0f);
         } else {
             const float sceneBrightness = gSceneBrightness.load();
             glClearColor(
@@ -3374,33 +2297,18 @@ private:
                 0.035f * sceneBrightness,
                 1.0f);
         }
-        glClearDepthf(1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_DEPTH_TEST);
 
         const Mat4 mvp = multiply(projection(view.fov), viewFromPose(view.pose));
-        const int projectionMode = gVideoProjection.load();
-        const bool theaterActive =
-            gEnvironmentMode.load() == 1 && projectionMode == 0;
-        const float curvature = gScreenCurvature.load();
-        if (theaterActive) {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(GL_LEQUAL);
-            glDepthMask(GL_TRUE);
-            drawTheater(mvp, curvature);
-            glDisable(GL_DEPTH_TEST);
-        }
         const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
-        const float halfHeight = theaterActive
-            ? gTheaterImageHalfHeight.load()
-            : gScreenHalfHeight.load();
+        const float halfHeight = gScreenHalfHeight.load();
         const float halfWidth = halfHeight * aspect;
         const ScreenBasis basis =
             gMenuInteractive.load() && gImmersivePlaybackUi.load()
                 ? anchoredImmersiveMenuBasis_
-                : theaterActive
-                    ? theaterScreenBasis()
-                    : currentScreenBasis();
+                : currentScreenBasis();
+        const float curvature = gScreenCurvature.load();
         std::vector<float> videoVertices;
         videoVertices.reserve(kMaximumSurfaceVertices * 5);
         const auto appendVertex = [&videoVertices](
@@ -3411,6 +2319,7 @@ private:
             videoVertices.push_back(u);
             videoVertices.push_back(v);
         };
+        const int projectionMode = gVideoProjection.load();
         if (projectionMode == 0) {
             for (int segment = 0; segment < kScreenSegments; ++segment) {
                 const float u0 =
@@ -3421,26 +2330,14 @@ private:
                     static_cast<float>(kScreenSegments);
                 const float normalized0 = u0 * 2.0f - 1.0f;
                 const float normalized1 = u1 * 2.0f - 1.0f;
-                const auto videoPoint = [&](float normalized, float vertical) {
-                    return theaterActive
-                        ? theaterSurfacePoint(
-                            halfWidth,
-                            normalized,
-                            vertical,
-                            curvature,
-                            gTheaterImageOffsetX.load(),
-                            gTheaterImageOffsetY.load())
-                        : curvedScreenPoint(
-                            basis,
-                            halfWidth,
-                            normalized,
-                            vertical,
-                            curvature);
-                };
-                const Vec3 topLeft = videoPoint(normalized0, halfHeight);
-                const Vec3 bottomLeft = videoPoint(normalized0, -halfHeight);
-                const Vec3 bottomRight = videoPoint(normalized1, -halfHeight);
-                const Vec3 topRight = videoPoint(normalized1, halfHeight);
+                const Vec3 topLeft = curvedScreenPoint(
+                    basis, halfWidth, normalized0, halfHeight, curvature);
+                const Vec3 bottomLeft = curvedScreenPoint(
+                    basis, halfWidth, normalized0, -halfHeight, curvature);
+                const Vec3 bottomRight = curvedScreenPoint(
+                    basis, halfWidth, normalized1, -halfHeight, curvature);
+                const Vec3 topRight = curvedScreenPoint(
+                    basis, halfWidth, normalized1, halfHeight, curvature);
                 appendVertex(topLeft, u0, 1.0f);
                 appendVertex(bottomLeft, u0, 0.0f);
                 appendVertex(bottomRight, u1, 0.0f);
@@ -3547,14 +2444,6 @@ private:
         const GLsizei videoVertexCount =
             static_cast<GLsizei>(videoVertices.size() / 5);
         if (gHasVideo.load()) {
-            if (theaterActive) {
-                // Preserve the auditorium depth buffer so the proscenium acts
-                // as a clean physical mask when the user intentionally zooms
-                // the image beyond the screen aperture.
-                glEnable(GL_DEPTH_TEST);
-                glDepthFunc(GL_LEQUAL);
-                glDepthMask(GL_FALSE);
-            }
             glUseProgram(videoProgram_);
             glUniformMatrix4fv(glGetUniformLocation(videoProgram_, "uMvp"), 1, GL_FALSE, mvp.m);
             glUniformMatrix4fv(glGetUniformLocation(videoProgram_, "uTexTransform"), 1, GL_FALSE,
@@ -3600,20 +2489,6 @@ private:
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, videoTexture_);
             glUniform1i(glGetUniformLocation(videoProgram_, "uVideo"), 0);
             glDrawArrays(GL_TRIANGLES, 0, videoVertexCount);
-            if (theaterActive) {
-                glDepthMask(GL_TRUE);
-                glDisable(GL_DEPTH_TEST);
-            }
-        }
-
-        if (theaterActive) {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(GL_LEQUAL);
-            glDepthMask(GL_TRUE);
-            drawTheaterSeats(
-                mvp,
-                std::clamp(gTheaterBrightness.load(), 0.0f, 1.0f));
-            glDisable(GL_DEPTH_TEST);
         }
 
         if (gSubtitleWidth.load() > 0 && gSubtitleHeight.load() > 0) {
@@ -3795,24 +2670,6 @@ private:
                         : u1 * 2.0f - 1.0f;
                 const auto subtitlePoint =
                     [&](float normalizedHorizontal, float vertical) {
-                        if (theaterActive) {
-                            const float surfaceHalfWidth = isBitmapSubtitle
-                                ? halfWidth
-                                : subtitleHalfWidth;
-                            const float localHorizontal = isBitmapSubtitle
-                                ? normalizedHorizontal
-                                : normalizedHorizontal +
-                                    textHorizontalOffset /
-                                        std::max(subtitleHalfWidth, 0.0001f);
-                            return theaterSurfacePoint(
-                                surfaceHalfWidth,
-                                localHorizontal,
-                                vertical,
-                                curvature,
-                                gTheaterImageOffsetX.load(),
-                                gTheaterImageOffsetY.load(),
-                                subtitleForward);
-                        }
                         return isBitmapSubtitle
                             ? curvedScreenPoint(
                                 subtitleBasis,
@@ -3900,9 +2757,7 @@ private:
         const ScreenBasis basis =
             gMenuInteractive.load() && gImmersivePlaybackUi.load()
                 ? anchoredImmersiveMenuBasis_
-                : gEnvironmentMode.load() == 1 && gVideoProjection.load() == 0
-                    ? theaterScreenBasis()
-                    : currentScreenBasis();
+                : currentScreenBasis();
         const Vec3 lineEnd = pointerHit_ + basis.normal * 0.01f;
         const float line[] = {
             pointerOrigin_.x, pointerOrigin_.y, pointerOrigin_.z, 0, 0,
@@ -3989,21 +2844,17 @@ private:
         if (adaptiveAnalysisProgram_) glDeleteProgram(adaptiveAnalysisProgram_);
         if (subtitleProgram_) glDeleteProgram(subtitleProgram_);
         if (pointerProgram_) glDeleteProgram(pointerProgram_);
-        if (theaterProgram_) glDeleteProgram(theaterProgram_);
         if (videoTexture_) glDeleteTextures(1, &videoTexture_);
         if (subtitleTexture_) glDeleteTextures(1, &subtitleTexture_);
         if (adaptiveAnalysisTexture_) glDeleteTextures(1, &adaptiveAnalysisTexture_);
-        if (depthRenderbuffer_) glDeleteRenderbuffers(1, &depthRenderbuffer_);
         if (framebuffer_) glDeleteFramebuffers(1, &framebuffer_);
         if (adaptiveAnalysisFramebuffer_) glDeleteFramebuffers(
             1, &adaptiveAnalysisFramebuffer_);
         if (vertexBuffer_) glDeleteBuffers(1, &vertexBuffer_);
         if (vertexArray_) glDeleteVertexArrays(1, &vertexArray_);
         videoProgram_ = adaptiveAnalysisProgram_ =
-            subtitleProgram_ = pointerProgram_ = theaterProgram_ = 0;
+            subtitleProgram_ = pointerProgram_ = 0;
         videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ = 0;
-        depthRenderbuffer_ = 0;
-        depthBufferWidth_ = depthBufferHeight_ = 0;
         framebuffer_ = adaptiveAnalysisFramebuffer_ =
             vertexBuffer_ = vertexArray_ = 0;
         egl_.destroy();
@@ -4057,75 +2908,6 @@ Java_dev_dreamplayer_PlayerActivity_nativeSetPassthrough(
     }
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_dev_dreamplayer_PlayerActivity_nativeSetEnvironment(
-        JNIEnv*,
-        jclass,
-        jint mode,
-        jfloat theaterBrightness,
-        jfloat passthroughBrightness,
-        jfloat theaterOffsetX,
-        jfloat theaterOffsetY,
-        jfloat theaterHalfHeight) {
-    const int safeMode = std::clamp(static_cast<int>(mode), 0, 2);
-    gEnvironmentMode.store(safeMode);
-    gPassthroughRequested.store(safeMode == 2);
-    if (std::isfinite(theaterBrightness)) {
-        gTheaterBrightness.store(std::clamp(theaterBrightness, 0.0f, 1.0f));
-    }
-    if (std::isfinite(passthroughBrightness)) {
-        gPassthroughBrightness.store(
-            std::clamp(passthroughBrightness, 0.0f, 1.0f));
-    }
-    const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
-    const float maximumHeight = kTheaterScreenHalfHeight * 1.07f;
-    const float safeHalfHeight = std::isfinite(theaterHalfHeight)
-        ? std::clamp(theaterHalfHeight, 0.90f, maximumHeight)
-        : 2.15f;
-    const float safeHalfWidth = safeHalfHeight * aspect;
-    const float maximumX = std::abs(
-        kTheaterScreenHalfWidth - safeHalfWidth);
-    const float maximumY = std::abs(
-        kTheaterScreenHalfHeight - safeHalfHeight);
-    gTheaterImageHalfHeight.store(safeHalfHeight);
-    gTheaterImageOffsetX.store(
-        std::isfinite(theaterOffsetX)
-            ? std::clamp(theaterOffsetX, -maximumX, maximumX)
-            : 0.0f);
-    gTheaterImageOffsetY.store(
-        std::isfinite(theaterOffsetY)
-            ? std::clamp(theaterOffsetY, -maximumY, maximumY)
-            : 0.0f);
-}
-
-extern "C" JNIEXPORT jfloatArray JNICALL
-Java_dev_dreamplayer_PlayerActivity_nativeGetTheaterScreenTransform(
-        JNIEnv* env, jclass) {
-    const jfloat values[] = {
-        gTheaterImageOffsetX.load(),
-        gTheaterImageOffsetY.load(),
-        gTheaterImageHalfHeight.load(),
-    };
-    jfloatArray result = env->NewFloatArray(3);
-    if (result) env->SetFloatArrayRegion(result, 0, 3, values);
-    return result;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_dev_dreamplayer_PlayerActivity_nativeSetTheaterSeat(
-        JNIEnv*, jclass, jint row, jint column) {
-    gTheaterSeatRow.store(std::clamp(static_cast<int>(row), 0, 2));
-    gTheaterSeatColumn.store(std::clamp(static_cast<int>(column), -1, 1));
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_dev_dreamplayer_PlayerActivity_nativeRecenterTheater(JNIEnv*, jclass) {
-    gTheaterYawDegrees.store(gLatestHeadYawDegrees.load());
-    gTheaterAnchorX.store(gLatestHeadX.load());
-    gTheaterAnchorY.store(gLatestHeadY.load());
-    gTheaterAnchorZ.store(gLatestHeadZ.load());
-}
-
 extern "C" JNIEXPORT jboolean JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeIsPassthroughSupported(JNIEnv*, jclass) {
     return gPassthroughSupported.load() ? JNI_TRUE : JNI_FALSE;
@@ -4138,23 +2920,7 @@ Java_dev_dreamplayer_PlayerActivity_nativeRequestStop(JNIEnv*, jclass) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetVideoAspect(JNIEnv*, jclass, jfloat aspect) {
-    if (std::isfinite(aspect) && aspect > 0.1f) {
-        const float safeAspect = std::clamp(aspect, 0.8f, 2.4f);
-        gAspect.store(aspect);
-        const float maximumHeight = kTheaterScreenHalfHeight * 1.07f;
-        const float halfHeight = std::clamp(
-            gTheaterImageHalfHeight.load(), 0.90f, maximumHeight);
-        const float halfWidth = halfHeight * safeAspect;
-        const float maximumX = std::abs(
-            kTheaterScreenHalfWidth - halfWidth);
-        const float maximumY = std::abs(
-            kTheaterScreenHalfHeight - halfHeight);
-        gTheaterImageHalfHeight.store(halfHeight);
-        gTheaterImageOffsetX.store(std::clamp(
-            gTheaterImageOffsetX.load(), -maximumX, maximumX));
-        gTheaterImageOffsetY.store(std::clamp(
-            gTheaterImageOffsetY.load(), -maximumY, maximumY));
-    }
+    if (std::isfinite(aspect) && aspect > 0.1f) gAspect.store(aspect);
 }
 
 extern "C" JNIEXPORT void JNICALL
