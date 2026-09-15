@@ -55,6 +55,7 @@ class MediaStateStore(context: Context) :
         val projection: VideoProjection,
         val immersiveYawDegrees: Float,
         val immersivePitchDegrees: Float,
+        val rotationQuarterTurns: Int,
         val manuallySelected: Boolean,
     )
 
@@ -84,6 +85,7 @@ class MediaStateStore(context: Context) :
                 projection_mode INTEGER NOT NULL DEFAULT 0,
                 immersive_yaw REAL NOT NULL DEFAULT 0,
                 immersive_pitch REAL NOT NULL DEFAULT 0,
+                video_rotation INTEGER NOT NULL DEFAULT 0,
                 position_ms INTEGER,
                 duration_ms INTEGER,
                 screen_x REAL,
@@ -192,6 +194,12 @@ class MediaStateStore(context: Context) :
         }
         if (oldVersion < 16) {
             migrateSmbMediaIdentities(db)
+        }
+        if (oldVersion < 17) {
+            db.execSQL(
+                "ALTER TABLE media_state ADD COLUMN " +
+                    "video_rotation INTEGER NOT NULL DEFAULT 0"
+            )
         }
     }
 
@@ -494,6 +502,7 @@ class MediaStateStore(context: Context) :
                 "projection_mode",
                 "immersive_yaw",
                 "immersive_pitch",
+                "video_rotation",
             ),
             "media_id = ?",
             arrayOf(identity.id),
@@ -510,6 +519,8 @@ class MediaStateStore(context: Context) :
                     if (cursor.isNull(3)) 0f else cursor.getFloat(3),
                 immersivePitchDegrees =
                     if (cursor.isNull(4)) 0f else cursor.getFloat(4),
+                rotationQuarterTurns =
+                    if (cursor.isNull(5)) 0 else normalizeQuarterTurns(cursor.getInt(5)),
                 manuallySelected = cursor.getInt(1) != 0,
             )
         }
@@ -584,6 +595,7 @@ class MediaStateStore(context: Context) :
         projection: VideoProjection = VideoProjection.FLAT,
         immersiveYawDegrees: Float = 0f,
         immersivePitchDegrees: Float = 0f,
+        rotationQuarterTurns: Int = 0,
         manuallySelected: Boolean = true,
     ) {
         val identity = MediaIdentity.from(spec)
@@ -595,6 +607,7 @@ class MediaStateStore(context: Context) :
             put("projection_mode", projection.wireValue)
             put("immersive_yaw", immersiveYawDegrees)
             put("immersive_pitch", immersivePitchDegrees)
+            put("video_rotation", normalizeQuarterTurns(rotationQuarterTurns))
             put("stereo_manual", if (manuallySelected) 1 else 0)
             put("updated_at", System.currentTimeMillis())
         }
@@ -694,7 +707,9 @@ class MediaStateStore(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "media-state.db"
-        private const val DATABASE_VERSION = 16
+        private const val DATABASE_VERSION = 17
+
+        private fun normalizeQuarterTurns(value: Int): Int = ((value % 4) + 4) % 4
     }
 }
 
