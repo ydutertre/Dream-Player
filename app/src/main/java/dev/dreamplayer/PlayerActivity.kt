@@ -67,6 +67,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentStereoMode = StereoMode.MONO
     private var currentProjection = VideoProjection.FLAT
+    private var videoRotationQuarterTurns = 0
     private var immersiveYawDegrees = 0f
     private var immersivePitchDegrees = 0f
     private var pictureMode = PictureMode.AUTO
@@ -1481,6 +1482,7 @@ class PlayerActivity : Activity(), Player.Listener {
             savedProjection?.immersiveYawDegrees?.coerceIn(-180f, 180f) ?: 0f
         immersivePitchDegrees =
             savedProjection?.immersivePitchDegrees?.coerceIn(-80f, 80f) ?: 0f
+        videoRotationQuarterTurns = savedProjection?.rotationQuarterTurns ?: 0
         spec = newSpec.copy(stereoMode = currentStereoMode)
         if (newSpec.projectionExplicit && savedProjection == null) {
             persistProjectionSettings()
@@ -1497,6 +1499,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         nativeSetStereoMode(currentStereoMode.wireValue)
         nativeSetVideoProjection(currentProjection.wireValue)
+        nativeSetVideoRotation(videoRotationQuarterTurns)
         nativeSetImmersiveOrientation(
             immersiveYawDegrees,
             immersivePitchDegrees,
@@ -2938,7 +2941,12 @@ class PlayerActivity : Activity(), Player.Listener {
             StereoMode.HALF_SBS,
             StereoMode.HALF_OVER_UNDER -> fullAspect
         }
-        nativeSetVideoAspect(eyeAspect)
+        val displayedAspect = if (videoRotationQuarterTurns % 2 == 0) {
+            eyeAspect
+        } else {
+            1f / eyeAspect.coerceAtLeast(0.0001f)
+        }
+        nativeSetVideoAspect(displayedAspect)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -3139,7 +3147,16 @@ class PlayerActivity : Activity(), Player.Listener {
             currentProjection,
             immersiveYawDegrees,
             immersivePitchDegrees,
+            videoRotationQuarterTurns,
         )
+    }
+
+    private fun setVideoRotation(quarterTurns: Int) {
+        videoRotationQuarterTurns = ((quarterTurns % 4) + 4) % 4
+        nativeSetVideoRotation(videoRotationQuarterTurns)
+        persistProjectionSettings()
+        updateVideoAspect()
+        renderVrMenu()
     }
 
     private fun showControls(durationMs: Long) {
@@ -3640,7 +3657,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
-            id.startsWith("video_") -> {
+            id.startsWith("video_") && id.removePrefix("video_").toIntOrNull() != null -> {
                 val video = localVideos[id.removePrefix("video_").toInt()]
                 val selected = localPlaybackSpec(video)
                 startQueuedPlayback(
@@ -3982,6 +3999,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 swapEyes = !swapEyes
                 nativeSetSwapEyes(swapEyes)
                 renderVrMenu()
+            }
+            id == "video_rotate_left" -> {
+                setVideoRotation(videoRotationQuarterTurns - 1)
+            }
+            id == "video_rotation_reset" -> {
+                setVideoRotation(0)
+            }
+            id == "video_rotate_right" -> {
+                setVideoRotation(videoRotationQuarterTurns + 1)
             }
             id.startsWith("hdr_metadata_") -> {
                 hdrMetadataMode = when (id) {
@@ -6756,6 +6782,43 @@ class PlayerActivity : Activity(), Player.Listener {
                         )
                         if (currentProjection == VideoProjection.FLAT) {
                             projectionCurvatureSlider(535f)
+                            text(
+                                "Video rotation",
+                                1212f,
+                                603f,
+                                23f,
+                                Paint.Align.LEFT,
+                                colorTextMuted,
+                            )
+                            text(
+                                when (videoRotationQuarterTurns) {
+                                    1 -> "+90°"
+                                    2 -> "180°"
+                                    3 -> "−90°"
+                                    else -> "0°"
+                                },
+                                1860f,
+                                603f,
+                                21f,
+                                Paint.Align.RIGHT,
+                                colorTextMuted,
+                            )
+                            button(
+                                "video_rotate_left", "↶ 90°",
+                                RectF(1210f, 617f, 1418f, 677f),
+                                fontSize = 23f,
+                            )
+                            button(
+                                "video_rotation_reset", "Reset",
+                                RectF(1430f, 617f, 1638f, 677f),
+                                videoRotationQuarterTurns == 0,
+                                fontSize = 22f,
+                            )
+                            button(
+                                "video_rotate_right", "90° ↷",
+                                RectF(1650f, 617f, 1870f, 677f),
+                                fontSize = 23f,
+                            )
                         } else {
                             text(
                                 "Orientation",
@@ -8145,6 +8208,7 @@ class PlayerActivity : Activity(), Player.Listener {
         @JvmStatic private external fun nativeSetScreenTransform(x: Float, y: Float, z: Float, halfHeight: Float)
         @JvmStatic private external fun nativeGetScreenTransform(): FloatArray
         @JvmStatic private external fun nativeSetStereoMode(stereoMode: Int)
+        @JvmStatic private external fun nativeSetVideoRotation(quarterTurns: Int)
         @JvmStatic private external fun nativeSetVideoProjection(projection: Int)
         @JvmStatic private external fun nativeSetImmersiveOrientation(
             yawDegrees: Float,

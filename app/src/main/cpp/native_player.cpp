@@ -29,6 +29,8 @@ std::atomic<bool> gResumed{false};
 std::atomic<bool> gStop{false};
 std::atomic<float> gAspect{16.0f / 9.0f};
 std::atomic<int> gStereoMode{0};
+// Clockwise quarter turns applied independently within each stereo eye region.
+std::atomic<int> gVideoRotationQuarterTurns{0};
 // 0 = flat screen, 1 = equirectangular VR180, 2 = equirectangular VR360.
 std::atomic<int> gVideoProjection{0};
 std::atomic<float> gImmersiveYawDegrees{0.0f};
@@ -111,6 +113,12 @@ constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
 // its native aspect instead of stretching it to each video's display aspect.
 constexpr float kMenuAspect = 2.0f;
+// Rotating a landscape movie by 90 degrees produces a genuinely narrow
+// portrait surface (16:9 becomes 9:16, while scope content is narrower still).
+// Keep the bounds broad enough to preserve that aspect ratio rather than
+// widening the rotated picture as the former 0.8 minimum did.
+constexpr float kMinimumVideoAspect = 0.25f;
+constexpr float kMaximumVideoAspect = 2.4f;
 
 struct Mat4 { float m[16]{}; };
 
@@ -1110,6 +1118,7 @@ private:
             uniform mat4 uTexTransform;
             uniform int uMode;
             uniform int uEye;
+            uniform int uRotationQuarterTurns;
             uniform int uPictureMode;
             uniform int uTransfer;
             uniform int uPrimaries;
@@ -1315,6 +1324,13 @@ private:
             }
             void main() {
                 vec2 uv = vUv;
+                if (uRotationQuarterTurns == 1) {
+                    uv = vec2(1.0 - uv.y, uv.x);
+                } else if (uRotationQuarterTurns == 2) {
+                    uv = vec2(1.0 - uv.x, 1.0 - uv.y);
+                } else if (uRotationQuarterTurns == 3) {
+                    uv = vec2(uv.y, 1.0 - uv.x);
+                }
                 if (uMode == 1 || uMode == 3) uv.x = uv.x * 0.5 + float(uEye) * 0.5;
                 if (uMode == 2 || uMode == 4) uv.y = uv.y * 0.5 + (uEye == 0 ? 0.5 : 0.0);
                 vec2 transformed = (uTexTransform * vec4(uv, 0.0, 1.0)).xy;
@@ -1758,7 +1774,10 @@ private:
                     : currentScreenBasis();
             const float halfHeight = gScreenHalfHeight.load();
             const float videoHalfWidth =
-                halfHeight * std::clamp(gAspect.load(), 0.8f, 2.4f);
+                halfHeight * std::clamp(
+                    gAspect.load(),
+                    kMinimumVideoAspect,
+                    kMaximumVideoAspect);
             Vec3 hit{};
             float u = 0.0f;
             float v = 0.0f;
@@ -2301,7 +2320,10 @@ private:
         glDisable(GL_DEPTH_TEST);
 
         const Mat4 mvp = multiply(projection(view.fov), viewFromPose(view.pose));
-        const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
+        const float aspect = std::clamp(
+            gAspect.load(),
+            kMinimumVideoAspect,
+            kMaximumVideoAspect);
         const float halfHeight = gScreenHalfHeight.load();
         const float halfWidth = halfHeight * aspect;
         const ScreenBasis basis =
@@ -2451,6 +2473,11 @@ private:
             glUniform1i(glGetUniformLocation(videoProgram_, "uMode"), gStereoMode.load());
             const GLint sourceEye = static_cast<GLint>(gSwapEyes.load() ? 1u - eye : eye);
             glUniform1i(glGetUniformLocation(videoProgram_, "uEye"), sourceEye);
+            glUniform1i(
+                glGetUniformLocation(videoProgram_, "uRotationQuarterTurns"),
+                gVideoProjection.load() == 0
+                    ? gVideoRotationQuarterTurns.load()
+                    : 0);
             glUniform1i(glGetUniformLocation(videoProgram_, "uPictureMode"), gPictureMode.load());
             glUniform1i(glGetUniformLocation(videoProgram_, "uTransfer"), gVideoTransfer.load());
             glUniform1i(glGetUniformLocation(videoProgram_, "uPrimaries"), gVideoPrimaries.load());
@@ -2954,6 +2981,13 @@ Java_dev_dreamplayer_PlayerActivity_nativeGetScreenTransform(JNIEnv* env, jclass
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetStereoMode(JNIEnv*, jclass, jint stereoMode) {
     if (stereoMode >= 0 && stereoMode <= 4) gStereoMode.store(stereoMode);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetVideoRotation(
+    JNIEnv*, jclass, jint quarterTurns) {
+    const int normalized = (static_cast<int>(quarterTurns) % 4 + 4) % 4;
+    gVideoRotationQuarterTurns.store(normalized);
 }
 
 extern "C" JNIEXPORT void JNICALL
