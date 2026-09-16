@@ -872,6 +872,35 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativeZoomGesture(amount: Float, u: Float, v: Float) {
+        runOnUiThread {
+            if (
+                !amount.isFinite() ||
+                !mediaLoaded ||
+                !uiVisible ||
+                uiScreen != UiScreen.PLAYBACK ||
+                currentProjection != VideoProjection.FLAT ||
+                activeSlider != null
+            ) {
+                return@runOnUiThread
+            }
+            val px = u * UI_WIDTH
+            val py = v * UI_HEIGHT
+            val overToolbar = playbackToolbarBounds().contains(px, py)
+            val overPopover = playbackPopoverBounds(playbackPopover)?.contains(px, py) == true
+            val overControl = uiButtons.any { it.bounds.contains(px, py) }
+            if (overToolbar || overPopover || overControl) return@runOnUiThread
+
+            val transform = nativeGetScreenTransform()
+            if (transform.size != 4 || transform.any { !it.isFinite() }) return@runOnUiThread
+            val halfHeight = (transform[3] + amount * 0.012f).coerceIn(0.45f, 1.55f)
+            if (halfHeight == transform[3]) return@runOnUiThread
+            nativeSetScreenTransform(transform[0], transform[1], transform[2], halfHeight)
+            armControlsAutoHide()
+        }
+    }
+
+    @Suppress("unused") // Called from the OpenXR render thread.
     fun onNativeImmersiveOrientationChanged(yawDegrees: Float, pitchDegrees: Float) {
         runOnUiThread {
             if (

@@ -615,6 +615,7 @@ public:
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
         seekCallback_ = env_->GetMethodID(cls, "onNativeSeekGesture", "(IFF)V");
+        zoomCallback_ = env_->GetMethodID(cls, "onNativeZoomGesture", "(FFF)V");
         immersiveOrientationCallback_ = env_->GetMethodID(
             cls,
             "onNativeImmersiveOrientationChanged",
@@ -637,6 +638,7 @@ private:
     jobject activity_;
     jmethodID frameCallback_ = nullptr;
     jmethodID seekCallback_ = nullptr;
+    jmethodID zoomCallback_ = nullptr;
     jmethodID immersiveOrientationCallback_ = nullptr;
     float renderResolutionScale_ = 1.0f;
     EglState egl_;
@@ -712,6 +714,7 @@ private:
     int horizontalSeekDirection_ = 0;
     XrTime horizontalSeekStarted_ = 0;
     XrTime lastHorizontalSeekCallback_ = 0;
+    XrTime lastZoomCallback_ = 0;
     int draggingHand_ = -1;
     float dragYawOffset_ = 0.0f;
     float dragPitchOffset_ = 0.0f;
@@ -1579,6 +1582,17 @@ private:
         }
     }
 
+    void notifyZoom(float amount, float u, float v) {
+        if (zoomCallback_) {
+            env_->CallVoidMethod(
+                activity_,
+                zoomCallback_,
+                static_cast<jfloat>(amount),
+                static_cast<jfloat>(u),
+                static_cast<jfloat>(v));
+        }
+    }
+
     void notifyImmersiveOrientation(float yawDegrees, float pitchDegrees) {
         if (immersiveOrientationCallback_) {
             env_->CallVoidMethod(
@@ -1850,6 +1864,18 @@ private:
                     return;
                 }
                 if (!stick.isActive) resetHorizontalSeek();
+                if (
+                    gMenuInteractive.load() &&
+                    stick.isActive &&
+                    std::abs(stick.currentState.y) > 0.18f &&
+                    std::abs(stick.currentState.y) >
+                        std::abs(stick.currentState.x) * 1.15f &&
+                    (lastZoomCallback_ == 0 ||
+                     displayTime - lastZoomCallback_ > 16'000'000)
+                ) {
+                    notifyZoom(stick.currentState.y, u, v);
+                    lastZoomCallback_ = displayTime;
+                }
             }
             if (gMenuInteractive.load()) {
                 if (menuPointerHand_ == hand && isDown) {
