@@ -4,6 +4,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
+import android.provider.DocumentsContract
 import android.util.Log
 import java.io.File
 import java.util.Locale
@@ -18,11 +19,31 @@ class ExternalSubtitleRepository(private val context: Context) {
         when {
             spec.uri.startsWith("smb://", ignoreCase = true) -> discoverSmb(spec)
             Uri.parse(spec.uri).scheme.equals("file", ignoreCase = true) -> discoverFile(spec)
+            DocumentsContract.isTreeUri(Uri.parse(spec.uri)) -> discoverUsb(spec)
             else -> discoverMediaStore(spec)
         }
     }.onFailure { error ->
         Log.w(TAG, "External subtitle discovery failed for ${spec.uri}", error)
     }.getOrDefault(emptyList())
+
+    private fun discoverUsb(spec: PlaybackSpec): List<ExternalSubtitle> {
+        val repository = UsbStorageRepository(context)
+        val videoUri = Uri.parse(spec.uri)
+        val location = repository.matchingLocation(videoUri) ?: return emptyList()
+        val parent = repository.parentDirectory(location.treeUri, videoUri) ?: return emptyList()
+        val entries = repository.list(location.treeUri, parent, videosOnly = false)
+        val videoStem = stem(spec.title)
+        return buildList {
+            entries.filter { !it.isDirectory && isSrt(it.name) && stem(it.name).equals(videoStem, true) }
+                .forEach { add(ExternalSubtitle(it.uri.toString(), it.name)) }
+            entries.filter { it.isDirectory && isSubtitleDirectory(it.name) }.forEach { folder ->
+                runCatching { repository.list(location.treeUri, folder.uri, videosOnly = false) }
+                    .getOrDefault(emptyList())
+                    .filter { !it.isDirectory && isSrt(it.name) }
+                    .forEach { add(ExternalSubtitle(it.uri.toString(), it.name)) }
+            }
+        }.distinctBy { it.uri }.sortedBy { it.fileName.lowercase(Locale.ROOT) }
+    }
 
     private fun discoverSmb(spec: PlaybackSpec): List<ExternalSubtitle> {
         val credentials = spec.smb ?: return emptyList()

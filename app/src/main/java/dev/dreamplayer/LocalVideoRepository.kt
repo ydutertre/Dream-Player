@@ -16,7 +16,10 @@ data class LocalVideo(
 
 class LocalVideoRepository(private val context: Context) {
     fun list(): List<LocalVideo> {
-        val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        // Keep removable media out of Local Storage. USB devices are browsed
+        // directly through the document provider so files do not depend on
+        // MediaStore indexing or MIME-type detection.
+        val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val projection = arrayOf(
             MediaStore.Video.Media._ID,
             MediaStore.Video.Media.DISPLAY_NAME,
@@ -43,7 +46,9 @@ class LocalVideoRepository(private val context: Context) {
                     val id = cursor.getLong(idColumn)
                     add(
                         LocalVideo(
-                            uri = ContentUris.withAppendedId(collection, id),
+                            // Preserve the URI identity already used for resume/settings.
+                            uri = ContentUris.withAppendedId(
+                                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL), id),
                             name = cursor.getString(nameColumn) ?: "Video",
                             folder = cursor.getString(folderColumn)?.trimEnd('/')?.ifBlank { "Videos" } ?: "Videos",
                             size = cursor.getLong(sizeColumn),
