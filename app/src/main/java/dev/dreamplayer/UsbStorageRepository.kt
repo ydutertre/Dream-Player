@@ -3,6 +3,12 @@ package dev.dreamplayer
 import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.os.Build
+import android.os.Environment
+import android.os.storage.StorageManager
+import java.io.File
+import java.util.Locale
 
 data class UsbLocation(
     val treeUri: Uri,
@@ -21,13 +27,68 @@ data class UsbEntry(
 class UsbStorageRepository(private val context: Context) {
     private val preferences = context.getSharedPreferences("usb-storage", Context.MODE_PRIVATE)
 
-    fun locations(): List<UsbLocation> = context.contentResolver.persistedUriPermissions
+    fun locations(): List<UsbLocation> = (mountedLocations() + savedLocations())
+        .distinctBy { it.treeUri.toString() }
+
+    private fun savedLocations(): List<UsbLocation> = context.contentResolver.persistedUriPermissions
         .asSequence()
         .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) }
         .mapNotNull { permission -> location(permission.uri) }
         .distinctBy { it.treeUri.toString() }
         .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
         .toList()
+
+    private fun mountedLocations(): List<UsbLocation> {
+        val manager = context.getSystemService(StorageManager::class.java)
+        return manager.storageVolumes.filter {
+            !it.isPrimary && (it.state == Environment.MEDIA_MOUNTED || it.state == Environment.MEDIA_MOUNTED_READ_ONLY)
+        }.mapNotNull { volume ->
+            val id = if (Build.VERSION.SDK_INT >= 30) volume.mediaStoreVolumeName
+                else volume.uuid?.lowercase(Locale.ROOT)
+            id ?: return@mapNotNull null
+            val uri = Uri.Builder().scheme("usb-volume").authority(id).build()
+            UsbLocation(uri, uri, volume.getDescription(context))
+        }
+    }
+
+    private fun volumeDirectory(volume: String): File? {
+        if (Build.VERSION.SDK_INT < 30) return null
+        return context.getSystemService(StorageManager::class.java).storageVolumes
+            .firstOrNull { !it.isPrimary && it.mediaStoreVolumeName == volume }?.directory
+    }
+
+    // Use the same indexed media and playback URIs as the old Local Storage browser.
+    // Also include directly readable files/folders, so indexing is not mandatory.
+    private fun listMounted(treeUri: Uri, directoryUri: Uri, videosOnly: Boolean): List<UsbEntry> {
+        check(mountedLocations().any { it.treeUri == treeUri }) { "USB drive disconnected. Reconnect it and refresh." }
+        val volume = requireNotNull(treeUri.authority)
+        val relative = directoryUri.path.orEmpty().trim('/')
+        require(relative.split('/').none { it == ".." }) { "Invalid USB folder" }
+        val prefix = if (relative.isEmpty()) "" else "$relative/"
+        val entries = linkedMapOf<String, UsbEntry>()
+        val indexed = LocalVideoRepository(context).list(volume, rootFolderLabel = "")
+        indexed.forEach { video ->
+            val folder = video.folder
+            if (folder == relative) {
+                entries[video.name] = UsbEntry(video.uri, video.name, false, video.size, video.modifiedAtMs)
+            } else if (folder.startsWith(prefix) && folder.length > prefix.length) {
+                val child = folder.removePrefix(prefix).substringBefore('/')
+                val uri = treeUri.buildUpon().appendEncodedPath(Uri.encode(prefix + child, "/")).build()
+                entries.putIfAbsent(child, UsbEntry(uri, child, true, 0L, 0L))
+            }
+        }
+        val root = volumeDirectory(volume)
+        val directory = root?.let { File(it, relative) }
+        directory?.listFiles()?.forEach { file ->
+            if (file.isDirectory || !videosOnly || isVideoFileName(file.name)) {
+                val uri = if (file.isDirectory)
+                    treeUri.buildUpon().appendEncodedPath(Uri.encode(prefix + file.name, "/")).build()
+                else Uri.fromFile(file)
+                entries.putIfAbsent(file.name, UsbEntry(uri, file.name, file.isDirectory, file.length(), file.lastModified()))
+            }
+        }
+        return entries.values.toList()
+    }
 
     fun location(treeUri: Uri): UsbLocation? = runCatching {
         val rootId = DocumentsContract.getTreeDocumentId(treeUri)
@@ -49,6 +110,7 @@ class UsbStorageRepository(private val context: Context) {
     }
 
     fun list(treeUri: Uri, directoryUri: Uri, videosOnly: Boolean = true): List<UsbEntry> {
+        if (treeUri.scheme == "usb-volume") return listMounted(treeUri, directoryUri, videosOnly)
         context.contentResolver.query(directoryUri,
             arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID), null, null, null)?.use {
             check(it.moveToFirst()) { "USB drive disconnected or folder no longer available" }
@@ -107,14 +169,50 @@ class UsbStorageRepository(private val context: Context) {
     }
 
     fun parentDirectory(treeUri: Uri, documentUri: Uri): Uri? = runCatching {
+        if (treeUri.scheme == "usb-volume") {
+            if (documentUri == treeUri) return null
+            preferences.getString("parent:$documentUri", null)?.let { return Uri.parse(it) }
+            if (documentUri.scheme == "usb-volume") {
+                val path = documentUri.path.orEmpty().trim('/').substringBeforeLast('/', "")
+                return treeUri.buildUpon().path(path.ifEmpty { null }).build()
+            }
+            if (documentUri.scheme == "file") {
+                val root = volumeDirectory(requireNotNull(treeUri.authority)) ?: return null
+                val parent = File(requireNotNull(documentUri.path)).parentFile ?: return null
+                if (!parent.toPath().startsWith(root.toPath())) return null
+                return treeUri.buildUpon().path(parent.relativeTo(root).path.replace('\\', '/')).build()
+            }
+            return context.contentResolver.query(documentUri,
+                arrayOf(MediaStore.MediaColumns.RELATIVE_PATH), null, null, null)?.use {
+                if (!it.moveToFirst()) null else treeUri.buildUpon().path(it.getString(0)?.trim('/')).build()
+            }
+        }
         val rootId = DocumentsContract.getTreeDocumentId(treeUri)
         if (DocumentsContract.getDocumentId(documentUri) == rootId) return null
         preferences.getString("parent:$documentUri", null)?.let(Uri::parse)
     }.getOrNull()
 
-    fun name(documentUri: Uri): String = displayName(documentUri)
+    fun name(documentUri: Uri): String = if (documentUri.scheme == "usb-volume")
+        documentUri.lastPathSegment.orEmpty() else displayName(documentUri)
 
     fun matchingLocation(documentUri: Uri): UsbLocation? {
+        if (!DocumentsContract.isTreeUri(documentUri)) {
+            val mounted = mountedLocations()
+            if (documentUri.scheme == "file") {
+                val file = File(documentUri.path ?: return null).canonicalFile
+                return mounted.firstOrNull { location ->
+                    volumeDirectory(location.treeUri.authority.orEmpty())?.canonicalFile?.let {
+                        file.toPath().startsWith(it.toPath())
+                    } == true
+                }
+            }
+            if (documentUri.authority != MediaStore.AUTHORITY) return null
+            val volume = runCatching {
+                context.contentResolver.query(documentUri, arrayOf(MediaStore.MediaColumns.VOLUME_NAME),
+                    null, null, null)?.use { if (it.moveToFirst()) it.getString(0) else null }
+            }.getOrNull()
+            return mounted.firstOrNull { it.treeUri.authority == volume }
+        }
         val treeId = runCatching {
             DocumentsContract.getTreeDocumentId(documentUri)
         }.getOrNull() ?: return null

@@ -1840,6 +1840,12 @@ class PlayerActivity : Activity(), Player.Listener {
             return
         }
 
+        if (parsed.scheme == "file" && parsed.path.orEmpty().startsWith("/storage/") &&
+            !parsed.path.orEmpty().startsWith("/storage/emulated/")) {
+            resolveRecentUsb(recent, parsed, generation)
+            return
+        }
+
         // A URL or document provider without a browsable folder still retains its
         // previous direct-open behavior, with adjacent-file controls disabled.
         transientMessage = null
@@ -1866,9 +1872,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
                     val video = videos.firstOrNull { it.uri.toString() == recent.uri }
                     if (video == null) {
-                        transientMessage = "Could not find ${recent.title} in the local library"
-                        hoveredButton = null
-                        renderVrMenu()
+                        resolveRecentUsb(recent, Uri.parse(recent.uri), generation)
                         return@runOnUiThread
                     }
                     localVideos = videos
@@ -1911,7 +1915,7 @@ class PlayerActivity : Activity(), Player.Listener {
             runCatching {
                 val repository = UsbStorageRepository(this)
                 val location = repository.matchingLocation(uri)
-                    ?: error("USB access is missing. Add the USB folder again.")
+                    ?: error("USB drive unavailable. Reconnect the drive and open USB Media.")
                 val directory = repository.parentDirectory(location.treeUri, uri)
                     ?: error("Open this file from USB Media once to restore its folder.")
                 val entries = repository.list(location.treeUri, directory)
@@ -2238,16 +2242,36 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun showUsbLocations() {
-        usbBrowseGeneration++
+        val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO
+            else Manifest.permission.READ_EXTERNAL_STORAGE
+        if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(permission), REQUEST_USB_MEDIA_PERMISSION)
+            return
+        }
+        val generation = ++usbBrowseGeneration
         usbBrowseBusy = false
         recentResolveGeneration++
-        usbLocations = UsbStorageRepository(this).locations()
+        usbLocations = emptyList()
         uiScreen = UiScreen.USB_LOCATIONS
         browserScrollOffset = 0f
         browserSearchQuery = ""
-        transientMessage = null
+        transientMessage = "Looking for USB drives..."
         hoveredButton = null
         renderVrMenu()
+        io.execute {
+            runCatching { UsbStorageRepository(this).locations() }
+                .onSuccess { locations -> runOnUiThread {
+                    if (generation != usbBrowseGeneration || isDestroyed || isFinishing) return@runOnUiThread
+                    usbLocations = locations
+                    transientMessage = null
+                    renderVrMenu()
+                } }
+                .onFailure { error -> runOnUiThread {
+                    if (generation != usbBrowseGeneration || isDestroyed || isFinishing) return@runOnUiThread
+                    transientMessage = "Could not list USB drives: ${error.message}"
+                    renderVrMenu()
+                } }
+        }
     }
 
     private fun requestUsbLocation() {
@@ -2768,6 +2792,14 @@ class PlayerActivity : Activity(), Player.Listener {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_USB_MEDIA_PERMISSION) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) showUsbLocations()
+            else {
+                transientMessage = "Video permission is required to browse USB media"
+                renderVrMenu()
+            }
+            return
+        }
         if (requestCode == REQUEST_MEDIA_PERMISSION) {
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) loadLocalVideos()
             else {
@@ -3678,6 +3710,7 @@ class PlayerActivity : Activity(), Player.Listener {
             }
             id == "usb_locations_back" -> showLibrary()
             id == "usb_add_location" -> requestUsbLocation()
+            id == "usb_rescan" -> showUsbLocations()
             id == "usb_refresh" -> if (!usbBrowseBusy) usbDirectoryUri?.let { browseUsb(it, usbDirectoryName) }
             id.startsWith("usb_location_") -> {
                 if (usbBrowseBusy) return
@@ -6283,16 +6316,18 @@ class PlayerActivity : Activity(), Player.Listener {
                 text("USB Media", 1024f, 135f, 64f)
                 scrollableList(usbLocations.size, 98f, 80f) { index, bounds ->
                     browserEntryButton("usb_location_$index", usbLocations[index].name,
-                        "Saved location — connect the drive to browse",
+                        if (usbLocations[index].treeUri.scheme == "usb-volume") "Connected drive"
+                        else "Saved folder access",
                         RectF(230f, bounds.top, 1818f, bounds.bottom), true)
                 }
                 if (usbLocations.isEmpty()) {
-                    text("Connect a USB drive, then select Add USB folder.", 1024f, 425f, 36f)
-                    text("Choose the drive or a movie folder in Android's picker.",
+                    text("Connect a USB drive, then select Refresh.", 1024f, 425f, 36f)
+                    text("Connected drives appear here automatically.",
                         1024f, 485f, 30f, color = colorTextMuted)
                 }
                 button("usb_locations_back", "Back", RectF(230f, 885f, 530f, 950f), fontSize = 34f)
-                button("usb_add_location", "Add USB folder", RectF(580f, 885f, 1080f, 950f), fontSize = 34f)
+                button("usb_rescan", "Refresh", RectF(580f, 885f, 980f, 950f), fontSize = 34f)
+                button("usb_add_location", "Grant folder access", RectF(1080f, 885f, 1730f, 950f), fontSize = 32f)
             }
             UiScreen.USB_FILES -> {
                 canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
@@ -8376,6 +8411,7 @@ class PlayerActivity : Activity(), Player.Listener {
     companion object {
         private const val REQUEST_VIDEO = 4001
         private const val REQUEST_USB_TREE = 4003
+        private const val REQUEST_USB_MEDIA_PERMISSION = 4004
         private const val JOYSTICK_SEEK_STEP_MS = 10_000L
         private const val REMOTE_MIN_BUFFER_MS = 30_000
         private const val REMOTE_MAX_BUFFER_MS = 120_000
