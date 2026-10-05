@@ -663,6 +663,9 @@ private:
     bool fbPassthroughUsable_ = false;
     bool passthroughRunning_ = false;
     XrSpace space_ = XR_NULL_HANDLE;
+    XrSpace headSpace_ = XR_NULL_HANDLE;
+    XrQuaternionf simulatorHeadOrientation_{0.0f, 0.0f, 0.0f, 1.0f};
+    bool simulatorHeadValid_ = false;
     XrActionSet actionSet_ = XR_NULL_HANDLE;
     XrAction aimAction_ = XR_NULL_HANDLE;
     XrAction selectAction_ = XR_NULL_HANDLE;
@@ -689,6 +692,9 @@ private:
     GLuint adaptiveAnalysisProgram_ = 0;
     GLuint subtitleProgram_ = 0;
     GLuint pointerProgram_ = 0;
+    GLuint fovMaskProgram_ = 0;
+    GLint fovMaskTangents_ = -1;
+    GLint fovMaskRotation_ = -1;
     GLuint vertexBuffer_ = 0;
     GLuint vertexArray_ = 0;
     float textureTransform_[16]{};
@@ -842,6 +848,8 @@ private:
         spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
         checkXr(xrCreateReferenceSpace(session_, &spaceInfo, &space_), "xrCreateReferenceSpace");
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        checkXr(xrCreateReferenceSpace(session_, &spaceInfo, &headSpace_), "create head reference space");
         initializeActions();
 
         uint32_t count = 0;
@@ -1463,6 +1471,34 @@ private:
             makeProgram(adaptiveAnalysisVertex, adaptiveAnalysisFragment);
         subtitleProgram_ = makeProgram(vertex, subtitleFragment);
         pointerProgram_ = makeProgram(vertex, pointerFragment);
+        const char* maskVertex = R"glsl(#version 300 es
+            out vec2 vNdc;
+            void main() {
+                vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+                vNdc = p * 2.0 - 1.0;
+                gl_Position = vec4(vNdc, 0.0, 1.0);
+            }
+        )glsl";
+        const char* maskFragment = R"glsl(#version 300 es
+            precision highp float;
+            in vec2 vNdc;
+            uniform vec4 uTangents;
+            uniform mat3 uEyeToHead;
+            out vec4 fragColor;
+            void main() {
+                vec2 uv = (vNdc + 1.0) * 0.5;
+                vec3 eyeRay = vec3(mix(uTangents.x, uTangents.y, uv.x),
+                                   mix(uTangents.z, uTangents.w, uv.y), -1.0);
+                vec3 ray = uEyeToHead * eyeRay;
+                // One common angular aperture at infinity, with no IPD parallax.
+                if (ray.z < 0.0 && abs(ray.x) <= -ray.z * 0.7002075382 &&
+                    abs(ray.y) <= -ray.z * 0.6494075932) discard;
+                fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            }
+        )glsl";
+        fovMaskProgram_ = makeProgram(maskVertex, maskFragment);
+        fovMaskTangents_ = glGetUniformLocation(fovMaskProgram_, "uTangents");
+        fovMaskRotation_ = glGetUniformLocation(fovMaskProgram_, "uEyeToHead");
         glGenFramebuffers(1, &framebuffer_);
         glGenFramebuffers(1, &adaptiveAnalysisFramebuffer_);
         glGenTextures(1, &adaptiveAnalysisTexture_);
@@ -2277,6 +2313,16 @@ private:
             checkXr(xrLocateViews(session_, &locate, &viewState,
                 static_cast<uint32_t>(views_.size()), &count, views_.data()), "xrLocateViews");
             updateHeadRelativeState(count);
+            simulatorHeadValid_ = false;
+            if (gMetaGlassesFovEnabled.load()) {
+                XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+                if (XR_SUCCEEDED(xrLocateSpace(headSpace_, space_,
+                        state.predictedDisplayTime, &head)) &&
+                    (head.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                    simulatorHeadOrientation_ = head.pose.orientation;
+                    simulatorHeadValid_ = true;
+                }
+            }
             updatePointer(state.predictedDisplayTime);
             if (gMenuInteractive.load()) notifyFrame(state.predictedDisplayTime);
             int64_t videoTimestampNanos = 0;
@@ -2798,35 +2844,25 @@ private:
 
         if (pointerVisible_) drawPointer(mvp);
 
-        // Crop in angular space using each eye's actual asymmetric projection.
-        // Opaque black also masks passthrough. No video rescale or extra render pass.
-        if (gMetaGlassesFovEnabled.load()) {
-            const float horizontal = std::tan(35.0f * kPi / 180.0f);
-            const float vertical = std::tan(33.0f * kPi / 180.0f);
-            const float left = std::tan(view.fov.angleLeft);
-            const float right = std::tan(view.fov.angleRight);
-            const float bottom = std::tan(view.fov.angleDown);
-            const float top = std::tan(view.fov.angleUp);
-            const auto edge = [](float tangent, float minimum, float maximum, int size) {
-                return static_cast<int>(std::lround(std::clamp(
-                    (tangent - minimum) / (maximum - minimum), 0.0f, 1.0f) * size));
+        // Transform each eye's rays into the SAME true head reference frame.
+        // Eye-local crops incorrectly diverge on runtimes with canted eye views.
+        if (gMetaGlassesFovEnabled.load() && simulatorHeadValid_) {
+            const auto& head = simulatorHeadOrientation_;
+            const XrQuaternionf inverseHead{-head.x, -head.y, -head.z, head.w};
+            const auto axis = [&](const Vec3& value) {
+                return rotateVector(inverseHead, rotateVector(view.pose.orientation, value));
             };
-            const int x0 = edge(-horizontal, left, right, chain.width);
-            const int x1 = edge(horizontal, left, right, chain.width);
-            const int y0 = edge(-vertical, bottom, top, chain.height);
-            const int y1 = edge(vertical, bottom, top, chain.height);
-            glEnable(GL_SCISSOR_TEST);
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            const auto black = [](int x, int y, int width, int height) {
-                if (width <= 0 || height <= 0) return;
-                glScissor(x, y, width, height);
-                glClear(GL_COLOR_BUFFER_BIT);
-            };
-            black(0, 0, x0, chain.height);
-            black(x1, 0, chain.width - x1, chain.height);
-            black(x0, 0, x1 - x0, y0);
-            black(x0, y1, x1 - x0, chain.height - y1);
-            glDisable(GL_SCISSOR_TEST);
+            const Vec3 x = axis({1.0f, 0.0f, 0.0f});
+            const Vec3 y = axis({0.0f, 1.0f, 0.0f});
+            const Vec3 z = axis({0.0f, 0.0f, 1.0f});
+            const float eyeToHead[]{x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z};
+            glDisable(GL_BLEND);
+            glUseProgram(fovMaskProgram_);
+            glUniform4f(fovMaskTangents_,
+                std::tan(view.fov.angleLeft), std::tan(view.fov.angleRight),
+                std::tan(view.fov.angleDown), std::tan(view.fov.angleUp));
+            glUniformMatrix3fv(fovMaskRotation_, 1, GL_FALSE, eyeToHead);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
         }
 
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2912,6 +2948,7 @@ private:
         sessionRunning_ = false;
         for (auto& chain : swapchains_) if (chain.handle) xrDestroySwapchain(chain.handle);
         for (auto& aimSpace : aimSpaces_) if (aimSpace) xrDestroySpace(aimSpace);
+        if (headSpace_) xrDestroySpace(headSpace_);
         if (space_) xrDestroySpace(space_);
         if (session_) xrDestroySession(session_);
         if (actionSet_) xrDestroyActionSet(actionSet_);
@@ -2919,6 +2956,7 @@ private:
         swapchains_.clear();
         aimSpaces_.fill(XR_NULL_HANDLE);
         space_ = XR_NULL_HANDLE;
+        headSpace_ = XR_NULL_HANDLE;
         session_ = XR_NULL_HANDLE;
         actionSet_ = XR_NULL_HANDLE;
         aimAction_ = XR_NULL_HANDLE;
@@ -2929,6 +2967,7 @@ private:
         if (adaptiveAnalysisProgram_) glDeleteProgram(adaptiveAnalysisProgram_);
         if (subtitleProgram_) glDeleteProgram(subtitleProgram_);
         if (pointerProgram_) glDeleteProgram(pointerProgram_);
+        if (fovMaskProgram_) glDeleteProgram(fovMaskProgram_);
         if (videoTexture_) glDeleteTextures(1, &videoTexture_);
         if (subtitleTexture_) glDeleteTextures(1, &subtitleTexture_);
         if (adaptiveAnalysisTexture_) glDeleteTextures(1, &adaptiveAnalysisTexture_);
@@ -2939,6 +2978,7 @@ private:
         if (vertexArray_) glDeleteVertexArrays(1, &vertexArray_);
         videoProgram_ = adaptiveAnalysisProgram_ =
             subtitleProgram_ = pointerProgram_ = 0;
+        fovMaskProgram_ = 0;
         videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ = 0;
         framebuffer_ = adaptiveAnalysisFramebuffer_ =
             vertexBuffer_ = vertexArray_ = 0;
