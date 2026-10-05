@@ -70,6 +70,7 @@ std::atomic<float> gHdrMaxFallNits{0.0f};
 std::atomic<int> gGamutMappingMode{0};
 std::atomic<float> gSceneBrightness{0.5f};
 std::atomic<bool> gPassthroughRequested{false};
+std::atomic<bool> gMetaGlassesFovEnabled{false};
 std::atomic<float> gPassthroughBrightness{1.0f};
 std::atomic<bool> gPassthroughSupported{false};
 std::atomic<bool> gSwapEyes{false};
@@ -2797,6 +2798,37 @@ private:
 
         if (pointerVisible_) drawPointer(mvp);
 
+        // Crop in angular space using each eye's actual asymmetric projection.
+        // Opaque black also masks passthrough. No video rescale or extra render pass.
+        if (gMetaGlassesFovEnabled.load()) {
+            const float horizontal = std::tan(35.0f * kPi / 180.0f);
+            const float vertical = std::tan(33.0f * kPi / 180.0f);
+            const float left = std::tan(view.fov.angleLeft);
+            const float right = std::tan(view.fov.angleRight);
+            const float bottom = std::tan(view.fov.angleDown);
+            const float top = std::tan(view.fov.angleUp);
+            const auto edge = [](float tangent, float minimum, float maximum, int size) {
+                return static_cast<int>(std::lround(std::clamp(
+                    (tangent - minimum) / (maximum - minimum), 0.0f, 1.0f) * size));
+            };
+            const int x0 = edge(-horizontal, left, right, chain.width);
+            const int x1 = edge(horizontal, left, right, chain.width);
+            const int y0 = edge(-vertical, bottom, top, chain.height);
+            const int y1 = edge(vertical, bottom, top, chain.height);
+            glEnable(GL_SCISSOR_TEST);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            const auto black = [](int x, int y, int width, int height) {
+                if (width <= 0 || height <= 0) return;
+                glScissor(x, y, width, height);
+                glClear(GL_COLOR_BUFFER_BIT);
+            };
+            black(0, 0, x0, chain.height);
+            black(x1, 0, chain.width - x1, chain.height);
+            black(x0, 0, x1 - x0, y0);
+            black(x0, y1, x1 - x0, chain.height - y1);
+            glDisable(GL_SCISSOR_TEST);
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glFlush();
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -2950,6 +2982,12 @@ Java_dev_dreamplayer_PlayerActivity_nativeRun(
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetResumed(JNIEnv*, jclass, jboolean resumed) {
     gResumed.store(resumed == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetMetaGlassesFov(
+    JNIEnv*, jclass, jboolean enabled) {
+    gMetaGlassesFovEnabled.store(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL

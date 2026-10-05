@@ -83,6 +83,7 @@ class PlayerActivity : Activity(), Player.Listener {
         VideoTransfer.HLG to defaultCinemaTuning(VideoTransfer.HLG),
     )
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
+    private var metaGlassesFovEnabled = false
     private var passthroughEnabled = false
     private var passthroughBrightness = DEFAULT_PASSTHROUGH_BRIGHTNESS
     private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
@@ -561,6 +562,8 @@ class PlayerActivity : Activity(), Player.Listener {
             .sanitized(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, DEFAULT_SCENE_BRIGHTNESS)
         passthroughEnabled = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getBoolean(PREF_PASSTHROUGH_ENABLED, false)
+        metaGlassesFovEnabled = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_META_GLASSES_FOV, false)
         passthroughBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_PASSTHROUGH_BRIGHTNESS, DEFAULT_PASSTHROUGH_BRIGHTNESS)
             .sanitized(0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS)
@@ -4193,6 +4196,11 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
+            id == "environment_meta_fov" -> {
+                metaGlassesFovEnabled = !metaGlassesFovEnabled
+                applyEnvironmentSettings()
+                renderVrMenu()
+            }
             id == "environment_dark" -> {
                 passthroughEnabled = false
                 applyEnvironmentSettings()
@@ -7731,9 +7739,16 @@ class PlayerActivity : Activity(), Player.Listener {
                             435f,
                             labelFontSize = 18f,
                         )
+                        button(
+                            "environment_meta_fov",
+                            "Meta glasses FOV: ${if (metaGlassesFovEnabled) "On" else "Off"}",
+                            RectF(975f, 480f, 1510f, 538f),
+                            metaGlassesFovEnabled,
+                            fontSize = 21f,
+                        )
                         text(
-                            "Passthrough is global and does not change movie picture settings.",
-                            975f, 535f, 20f, Paint.Align.LEFT, colorTextMuted,
+                            "70° horizontal × 66° vertical · follows your head",
+                            975f, 568f, 19f, Paint.Align.LEFT, colorTextMuted,
                         )
                         button(
                             "environment_back", "Back",
@@ -8186,9 +8201,11 @@ class PlayerActivity : Activity(), Player.Listener {
             0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS,
         )
         nativeSetPassthrough(passthroughEnabled, passthroughBrightness)
+        nativeSetMetaGlassesFov(metaGlassesFovEnabled)
         if (persist) {
             getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
                 .putBoolean(PREF_PASSTHROUGH_ENABLED, passthroughEnabled)
+                .putBoolean(PREF_META_GLASSES_FOV, metaGlassesFovEnabled)
                 .putFloat(PREF_PASSTHROUGH_BRIGHTNESS, passthroughBrightness)
                 .apply()
         }
@@ -8495,6 +8512,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_BROWSER_SORT_ASCENDING = "sort-ascending"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_PASSTHROUGH_ENABLED = "passthrough-enabled"
+        private const val PREF_META_GLASSES_FOV = "meta-glasses-fov-enabled"
         private const val PREF_PASSTHROUGH_BRIGHTNESS = "passthrough-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
@@ -8630,6 +8648,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
         @JvmStatic private external fun nativeSetPassthrough(enabled: Boolean, brightness: Float)
+        @JvmStatic private external fun nativeSetMetaGlassesFov(enabled: Boolean)
         @JvmStatic private external fun nativeIsPassthroughSupported(): Boolean
         @JvmStatic private external fun nativeRequestStop()
         @JvmStatic private external fun nativeSetVideoAspect(aspect: Float)
