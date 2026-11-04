@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Build
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.util.Log
 import android.view.KeyEvent
 import android.view.Surface
@@ -67,6 +68,7 @@ class PlayerActivity : Activity(), Player.Listener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var currentStereoMode = StereoMode.MONO
     private var currentProjection = VideoProjection.FLAT
+    private var videoRotationQuarterTurns = 0
     private var immersiveYawDegrees = 0f
     private var immersivePitchDegrees = 0f
     private var pictureMode = PictureMode.AUTO
@@ -81,6 +83,7 @@ class PlayerActivity : Activity(), Player.Listener {
         VideoTransfer.HLG to defaultCinemaTuning(VideoTransfer.HLG),
     )
     private var sceneBrightness = DEFAULT_SCENE_BRIGHTNESS
+    private var metaGlassesFovEnabled = false
     private var passthroughEnabled = false
     private var passthroughBrightness = DEFAULT_PASSTHROUGH_BRIGHTNESS
     private var toneMapPeakNits = DEFAULT_TONE_MAP_PEAK_NITS
@@ -174,6 +177,15 @@ class PlayerActivity : Activity(), Player.Listener {
     private var pointerUiX = 0f
     private var pointerUiY = 0f
     private var localFolderListScrollOffset = 0f
+    private var usbLocations: List<UsbLocation> = emptyList()
+    private var usbLocation: UsbLocation? = null
+    private var usbDirectoryUri: Uri? = null
+    private var usbDirectoryName = "USB Media"
+    private var usbEntries: List<UsbEntry> = emptyList()
+    private var usbBrowserItems: List<UsbBrowserItem> = emptyList()
+    private val usbNavigationStack = ArrayDeque<UsbNavigationState>()
+    private var usbBrowseGeneration = 0
+    private var usbBrowseBusy = false
     private var smbServers: List<SmbServer> = emptyList()
     private var smbServerListScrollOffset = 0f
     private var smbCredentials = SmbCredentials("", "", "", "", "")
@@ -306,7 +318,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private enum class UiScreen {
-        LIBRARY, LOCAL_FOLDERS, LOCAL_FILES,
+        LIBRARY, LOCAL_FOLDERS, LOCAL_FILES, USB_LOCATIONS, USB_FILES,
         SMB_SERVERS, SMB_LOGIN, SMB_SHARES, SMB_FILES, SMB_KEYBOARD,
         SFTP_PROFILES, SFTP_LOGIN, SFTP_TRUST, FTP_WARNING,
         SFTP_FILES, SFTP_KEYBOARD,
@@ -424,6 +436,15 @@ class PlayerActivity : Activity(), Player.Listener {
             val searchQuery: String,
         ) : BrowserReturnState
 
+        data class Usb(
+            val location: UsbLocation,
+            val directoryUri: Uri,
+            val directoryName: String,
+            val entries: List<UsbEntry>,
+            val scrollOffset: Float,
+            val searchQuery: String,
+        ) : BrowserReturnState
+
         data class Smb(
             val credentials: SmbCredentials,
             val path: String,
@@ -447,9 +468,23 @@ class PlayerActivity : Activity(), Player.Listener {
         val searchQuery: String,
     )
 
+    private data class UsbNavigationState(
+        val directoryUri: Uri,
+        val directoryName: String,
+        val entries: List<UsbEntry>,
+        val scrollOffset: Float,
+        val searchQuery: String,
+    )
+
     private data class LocalBrowserItem(
         val sourceIndex: Int,
         val video: LocalVideo,
+        val metadata: MediaStateStore.BrowserMetadata?,
+    )
+
+    private data class UsbBrowserItem(
+        val sourceIndex: Int,
+        val entry: UsbEntry,
         val metadata: MediaStateStore.BrowserMetadata?,
     )
 
@@ -527,6 +562,8 @@ class PlayerActivity : Activity(), Player.Listener {
             .sanitized(SCENE_BRIGHTNESS_MIN, SCENE_BRIGHTNESS_MAX, DEFAULT_SCENE_BRIGHTNESS)
         passthroughEnabled = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getBoolean(PREF_PASSTHROUGH_ENABLED, false)
+        metaGlassesFovEnabled = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_META_GLASSES_FOV, false)
         passthroughBrightness = getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE)
             .getFloat(PREF_PASSTHROUGH_BRIGHTNESS, DEFAULT_PASSTHROUGH_BRIGHTNESS)
             .sanitized(0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS)
@@ -871,6 +908,35 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     @Suppress("unused") // Called from the OpenXR render thread.
+    fun onNativeZoomGesture(amount: Float, u: Float, v: Float) {
+        runOnUiThread {
+            if (
+                !amount.isFinite() ||
+                !mediaLoaded ||
+                !uiVisible ||
+                uiScreen != UiScreen.PLAYBACK ||
+                currentProjection != VideoProjection.FLAT ||
+                activeSlider != null
+            ) {
+                return@runOnUiThread
+            }
+            val px = u * UI_WIDTH
+            val py = v * UI_HEIGHT
+            val overToolbar = playbackToolbarBounds().contains(px, py)
+            val overPopover = playbackPopoverBounds(playbackPopover)?.contains(px, py) == true
+            val overControl = uiButtons.any { it.bounds.contains(px, py) }
+            if (overToolbar || overPopover || overControl) return@runOnUiThread
+
+            val transform = nativeGetScreenTransform()
+            if (transform.size != 4 || transform.any { !it.isFinite() }) return@runOnUiThread
+            val halfHeight = (transform[3] + amount * 0.012f).coerceIn(0.45f, 1.55f)
+            if (halfHeight == transform[3]) return@runOnUiThread
+            nativeSetScreenTransform(transform[0], transform[1], transform[2], halfHeight)
+            armControlsAutoHide()
+        }
+    }
+
+    @Suppress("unused") // Called from the OpenXR render thread.
     fun onNativeImmersiveOrientationChanged(yawDegrees: Float, pitchDegrees: Float) {
         runOnUiThread {
             if (
@@ -906,6 +972,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun isBrowserListScreen(): Boolean = when (uiScreen) {
         UiScreen.LOCAL_FOLDERS,
         UiScreen.LOCAL_FILES,
+        UiScreen.USB_LOCATIONS,
+        UiScreen.USB_FILES,
         UiScreen.SMB_SERVERS,
         UiScreen.SMB_SHARES,
         UiScreen.SMB_FILES,
@@ -921,6 +989,9 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun localPlaybackSpec(video: LocalVideo) =
         PlaybackSpec(video.uri.toString(), video.name, StereoMode.MONO)
+
+    private fun usbPlaybackSpec(entry: UsbEntry) =
+        PlaybackSpec(entry.uri.toString(), entry.name, StereoMode.MONO)
 
     private fun smbPlaybackSpec(entry: SmbEntry): PlaybackSpec {
         val uri = Uri.Builder()
@@ -984,7 +1055,38 @@ class PlayerActivity : Activity(), Player.Listener {
 
     private fun rebuildBrowserItems() {
         localBrowserItems = buildVisibleLocalVideos()
+        usbBrowserItems = buildVisibleUsbEntries()
         smbBrowserItems = buildVisibleSmbEntries()
+    }
+
+    private fun buildVisibleUsbEntries(): List<UsbBrowserItem> {
+        val query = browserSearchQuery.trim()
+        return usbEntries.withIndex()
+            .asSequence()
+            .filter { query.isBlank() || it.value.name.contains(query, ignoreCase = true) }
+            .map { indexed ->
+                val metadata = if (indexed.value.isDirectory) null else {
+                    browserMetadata[MediaIdentity.from(usbPlaybackSpec(indexed.value)).id]
+                }
+                UsbBrowserItem(indexed.index, indexed.value, metadata)
+            }
+            .sortedWith { first, second ->
+                when {
+                    first.entry.isDirectory && !second.entry.isDirectory -> -1
+                    !first.entry.isDirectory && second.entry.isDirectory -> 1
+                    else -> compareBrowserItems(
+                        first.entry.name,
+                        second.entry.name,
+                        first.entry.modifiedAtMs.takeIf { it > 0L },
+                        second.entry.modifiedAtMs.takeIf { it > 0L },
+                        first.metadata?.durationMs,
+                        second.metadata?.durationMs,
+                        first.metadata?.lastPlayedAt,
+                        second.metadata?.lastPlayedAt,
+                    )
+                }
+            }
+            .toList()
     }
 
     private fun buildVisibleLocalVideos(): List<LocalBrowserItem> {
@@ -1047,6 +1149,8 @@ class PlayerActivity : Activity(), Player.Listener {
     private fun browserItemCount(): Int = when (uiScreen) {
         UiScreen.LOCAL_FOLDERS -> localVideos.map { it.folder }.distinct().size
         UiScreen.LOCAL_FILES -> localBrowserItems.size
+        UiScreen.USB_LOCATIONS -> usbLocations.size
+        UiScreen.USB_FILES -> usbBrowserItems.size
         UiScreen.SMB_SERVERS -> smbServers.size
         UiScreen.SMB_SHARES -> smbShares.size
         UiScreen.SMB_FILES -> smbBrowserItems.size
@@ -1481,6 +1585,7 @@ class PlayerActivity : Activity(), Player.Listener {
             savedProjection?.immersiveYawDegrees?.coerceIn(-180f, 180f) ?: 0f
         immersivePitchDegrees =
             savedProjection?.immersivePitchDegrees?.coerceIn(-80f, 80f) ?: 0f
+        videoRotationQuarterTurns = savedProjection?.rotationQuarterTurns ?: 0
         spec = newSpec.copy(stereoMode = currentStereoMode)
         if (newSpec.projectionExplicit && savedProjection == null) {
             persistProjectionSettings()
@@ -1497,6 +1602,7 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         nativeSetStereoMode(currentStereoMode.wireValue)
         nativeSetVideoProjection(currentProjection.wireValue)
+        nativeSetVideoRotation(videoRotationQuarterTurns)
         nativeSetImmersiveOrientation(
             immersiveYawDegrees,
             immersivePitchDegrees,
@@ -1698,6 +1804,7 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun showLibrary() {
+        usbBrowseGeneration++
         nativeSetVideoAvailable(false)
         recentMedia = mediaStateStore.listRecent(RECENT_MEDIA_LIMIT)
         uiScreen = UiScreen.LIBRARY
@@ -1728,7 +1835,17 @@ class PlayerActivity : Activity(), Player.Listener {
             return
         }
         if (parsed.scheme.equals("content", ignoreCase = true)) {
+            if (DocumentsContract.isTreeUri(parsed)) {
+                resolveRecentUsb(recent, parsed, generation)
+                return
+            }
             resolveRecentLocal(recent, generation)
+            return
+        }
+
+        if (parsed.scheme == "file" && parsed.path.orEmpty().startsWith("/storage/") &&
+            !parsed.path.orEmpty().startsWith("/storage/emulated/")) {
+            resolveRecentUsb(recent, parsed, generation)
             return
         }
 
@@ -1758,9 +1875,7 @@ class PlayerActivity : Activity(), Player.Listener {
                     if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
                     val video = videos.firstOrNull { it.uri.toString() == recent.uri }
                     if (video == null) {
-                        transientMessage = "Could not find ${recent.title} in the local library"
-                        hoveredButton = null
-                        renderVrMenu()
+                        resolveRecentUsb(recent, Uri.parse(recent.uri), generation)
                         return@runOnUiThread
                     }
                     localVideos = videos
@@ -1793,6 +1908,44 @@ class PlayerActivity : Activity(), Player.Listener {
                     hoveredButton = null
                     renderVrMenu()
                 } }
+        }
+    }
+
+    private fun resolveRecentUsb(recent: MediaStateStore.RecentMedia, uri: Uri, generation: Int) {
+        transientMessage = "Opening ${recent.title}..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                val repository = UsbStorageRepository(this)
+                val location = repository.matchingLocation(uri)
+                    ?: error("USB drive unavailable. Reconnect the drive and open USB Media.")
+                val directory = repository.parentDirectory(location.treeUri, uri)
+                    ?: error("Open this file from USB Media once to restore its folder.")
+                val entries = repository.list(location.treeUri, directory)
+                val selected = entries.firstOrNull { it.uri == uri && !it.isDirectory }
+                    ?: error("File unavailable. Reconnect the USB drive.")
+                val directoryName = repository.name(directory).ifBlank { location.name }
+                Triple(location, Pair(directory, directoryName), Pair(entries, selected))
+            }.onSuccess { (location, folder, result) -> runOnUiThread {
+                if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                val (directory, directoryName) = folder
+                usbLocation = location
+                usbDirectoryUri = directory
+                usbDirectoryName = directoryName
+                usbEntries = result.first
+                usbNavigationStack.clear()
+                browserSearchQuery = ""
+                refreshBrowserMetadata()
+                transientMessage = null
+                startQueuedPlayback(usbPlaybackSpec(result.second),
+                    usbBrowserItems.filterNot { it.entry.isDirectory }.map { usbPlaybackSpec(it.entry) },
+                    BrowserReturnState.Usb(location, directory, usbDirectoryName, usbEntries,
+                        recentScrollOffset(usbBrowserItems.indexOfFirst { it.entry.uri == uri }, usbBrowserItems.size), ""))
+            } }.onFailure { error -> runOnUiThread {
+                if (!recentResolutionIsCurrent(generation)) return@runOnUiThread
+                transientMessage = error.message ?: "USB storage unavailable"
+                renderVrMenu()
+            } }
         }
     }
 
@@ -2057,6 +2210,17 @@ class PlayerActivity : Activity(), Player.Listener {
                 uiScreen = UiScreen.LOCAL_FILES
                 renderVrMenu()
             }
+            is BrowserReturnState.Usb -> {
+                usbLocation = destination.location
+                usbDirectoryUri = destination.directoryUri
+                usbDirectoryName = destination.directoryName
+                usbEntries = destination.entries
+                browserSearchQuery = destination.searchQuery
+                rebuildBrowserItems()
+                browserScrollOffset = destination.scrollOffset
+                uiScreen = UiScreen.USB_FILES
+                renderVrMenu()
+            }
             is BrowserReturnState.Smb -> {
                 smbCredentials = destination.credentials
                 smbPath = destination.path
@@ -2077,6 +2241,111 @@ class PlayerActivity : Activity(), Player.Listener {
                 renderVrMenu()
             }
             null -> showLibrary()
+        }
+    }
+
+    private fun showUsbLocations() {
+        val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO
+            else Manifest.permission.READ_EXTERNAL_STORAGE
+        if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(permission), REQUEST_USB_MEDIA_PERMISSION)
+            return
+        }
+        val generation = ++usbBrowseGeneration
+        usbBrowseBusy = false
+        recentResolveGeneration++
+        usbLocations = emptyList()
+        uiScreen = UiScreen.USB_LOCATIONS
+        browserScrollOffset = 0f
+        browserSearchQuery = ""
+        transientMessage = "Looking for USB drives..."
+        hoveredButton = null
+        renderVrMenu()
+        io.execute {
+            runCatching { UsbStorageRepository(this).locations() }
+                .onSuccess { locations -> runOnUiThread {
+                    if (generation != usbBrowseGeneration || isDestroyed || isFinishing) return@runOnUiThread
+                    usbLocations = locations
+                    transientMessage = null
+                    renderVrMenu()
+                } }
+                .onFailure { error -> runOnUiThread {
+                    if (generation != usbBrowseGeneration || isDestroyed || isFinishing) return@runOnUiThread
+                    transientMessage = "Could not list USB drives: ${error.message}"
+                    renderVrMenu()
+                } }
+        }
+    }
+
+    private fun requestUsbLocation() {
+        try {
+            startActivityForResult(
+                Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+                    )
+                },
+                REQUEST_USB_TREE,
+            )
+        } catch (error: android.content.ActivityNotFoundException) {
+            transientMessage = "The headset does not provide a folder picker for USB access."
+            renderVrMenu()
+        }
+    }
+
+    private fun openUsbLocation(location: UsbLocation) {
+        usbLocation = location
+        usbNavigationStack.clear()
+        browserSearchQuery = ""
+        browseUsb(location.rootUri, location.name)
+    }
+
+    private fun browseUsb(
+        directoryUri: Uri,
+        directoryName: String,
+        rollbackNavigationOnFailure: Boolean = false,
+    ) {
+        val location = usbLocation ?: return
+        val generation = ++usbBrowseGeneration
+        usbBrowseBusy = true
+        transientMessage = "Reading $directoryName..."
+        renderVrMenu()
+        io.execute {
+            runCatching {
+                val repository = UsbStorageRepository(this)
+                val entries = repository.list(location.treeUri, directoryUri)
+                repository.rememberParents(entries, directoryUri)
+                val name = repository.name(directoryUri).ifBlank { directoryName }
+                if (directoryUri == location.rootUri) repository.remember(location.copy(name = name))
+                Pair(entries, name)
+            }
+                .onSuccess { (entries, name) -> runOnUiThread {
+                    if (generation != usbBrowseGeneration || isDestroyed || isFinishing) return@runOnUiThread
+                    usbBrowseBusy = false
+                    usbDirectoryUri = directoryUri
+                    usbDirectoryName = name
+                    usbEntries = entries
+                    browserSearchQuery = ""
+                    refreshBrowserMetadata()
+                    browserScrollOffset = 0f
+                    transientMessage = null
+                    uiScreen = UiScreen.USB_FILES
+                    hoveredButton = null
+                    renderVrMenu()
+                } }
+                .onFailure { error -> runOnUiThread {
+                    if (generation != usbBrowseGeneration || isDestroyed || isFinishing) return@runOnUiThread
+                    usbBrowseBusy = false
+                    if (rollbackNavigationOnFailure && usbNavigationStack.isNotEmpty()) {
+                        usbNavigationStack.removeLast()
+                    }
+                    transientMessage = "USB storage error: " +
+                        error.message.orEmpty().ifBlank { "Drive unavailable" }
+                    hoveredButton = null
+                    renderVrMenu()
+                } }
         }
     }
 
@@ -2526,6 +2795,14 @@ class PlayerActivity : Activity(), Player.Listener {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_USB_MEDIA_PERMISSION) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) showUsbLocations()
+            else {
+                transientMessage = "Video permission is required to browse USB media"
+                renderVrMenu()
+            }
+            return
+        }
         if (requestCode == REQUEST_MEDIA_PERMISSION) {
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) loadLocalVideos()
             else {
@@ -2549,6 +2826,37 @@ class PlayerActivity : Activity(), Player.Listener {
     @Deprecated("Activity result API retained because this activity must stay a native VR Activity")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_USB_TREE) {
+            if (resultCode != RESULT_OK) {
+                showUsbLocations()
+                return
+            }
+            val treeUri = data?.data ?: run {
+                showUsbLocations()
+                return
+            }
+            runCatching {
+                contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }.onFailure { error ->
+                showUsbLocations()
+                transientMessage = "Could not retain USB access: ${error.message.orEmpty()}"
+                renderVrMenu()
+                return
+            }
+            val location = UsbStorageRepository(this).location(treeUri)
+            if (location == null) {
+                showUsbLocations()
+                transientMessage = "That storage location could not be opened"
+                renderVrMenu()
+                return
+            }
+            usbLocations = UsbStorageRepository(this).locations()
+            openUsbLocation(location)
+            return
+        }
         if (requestCode != REQUEST_VIDEO || resultCode != RESULT_OK) {
             if (!mediaLoaded) showLibrary()
             return
@@ -2938,7 +3246,12 @@ class PlayerActivity : Activity(), Player.Listener {
             StereoMode.HALF_SBS,
             StereoMode.HALF_OVER_UNDER -> fullAspect
         }
-        nativeSetVideoAspect(eyeAspect)
+        val displayedAspect = if (videoRotationQuarterTurns % 2 == 0) {
+            eyeAspect
+        } else {
+            1f / eyeAspect.coerceAtLeast(0.0001f)
+        }
+        nativeSetVideoAspect(displayedAspect)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -3139,7 +3452,16 @@ class PlayerActivity : Activity(), Player.Listener {
             currentProjection,
             immersiveYawDegrees,
             immersivePitchDegrees,
+            videoRotationQuarterTurns,
         )
+    }
+
+    private fun setVideoRotation(quarterTurns: Int) {
+        videoRotationQuarterTurns = ((quarterTurns % 4) + 4) % 4
+        nativeSetVideoRotation(videoRotationQuarterTurns)
+        persistProjectionSettings()
+        updateVideoAspect()
+        renderVrMenu()
     }
 
     private fun showControls(durationMs: Long) {
@@ -3225,7 +3547,11 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun openBrowserSearch() {
-        if (uiScreen != UiScreen.LOCAL_FILES && uiScreen != UiScreen.SMB_FILES) return
+        if (
+            uiScreen != UiScreen.LOCAL_FILES &&
+            uiScreen != UiScreen.USB_FILES &&
+            uiScreen != UiScreen.SMB_FILES
+        ) return
         browserSortPopoverOpen = false
         browserSearchReturnScreen = uiScreen
         browserSearchDraft = browserSearchQuery
@@ -3238,7 +3564,11 @@ class PlayerActivity : Activity(), Player.Listener {
     }
 
     private fun openBrowserSort() {
-        if (uiScreen != UiScreen.LOCAL_FILES && uiScreen != UiScreen.SMB_FILES) return
+        if (
+            uiScreen != UiScreen.LOCAL_FILES &&
+            uiScreen != UiScreen.USB_FILES &&
+            uiScreen != UiScreen.SMB_FILES
+        ) return
         browserSortPopoverOpen = !browserSortPopoverOpen
         hoveredButton = null
         renderVrMenu()
@@ -3270,6 +3600,7 @@ class PlayerActivity : Activity(), Player.Listener {
             id.startsWith("recent_") ->
                 playRecent(id.removePrefix("recent_").toInt())
             id == "open_local" -> openLocalBrowser()
+            id == "open_usb" -> showUsbLocations()
             id == "open_smb" -> discoverSmbServers()
             id == "open_sftp" -> showSftpProfiles()
             id == "sftp_profiles_back" -> {
@@ -3379,6 +3710,80 @@ class PlayerActivity : Activity(), Player.Listener {
                     sftpProfiles.filterNot { it.id == sftpProfile.id }
                 sftpProfileStore.save(sftpProfiles)
                 showSftpProfiles()
+            }
+            id == "usb_locations_back" -> showLibrary()
+            id == "usb_add_location" -> requestUsbLocation()
+            id == "usb_rescan" -> showUsbLocations()
+            id == "usb_refresh" -> if (!usbBrowseBusy) usbDirectoryUri?.let { browseUsb(it, usbDirectoryName) }
+            id.startsWith("usb_location_") -> {
+                if (usbBrowseBusy) return
+                val location = usbLocations[id.removePrefix("usb_location_").toInt()]
+                openUsbLocation(location)
+            }
+            id == "usb_files_back" -> {
+                usbBrowseGeneration++
+                usbBrowseBusy = false
+                val parent = if (usbNavigationStack.isEmpty()) null
+                else usbNavigationStack.removeLast()
+                if (parent != null) {
+                    usbDirectoryUri = parent.directoryUri
+                    usbDirectoryName = parent.directoryName
+                    usbEntries = parent.entries
+                    browserSearchQuery = parent.searchQuery
+                    rebuildBrowserItems()
+                    browserScrollOffset = parent.scrollOffset
+                    transientMessage = null
+                    hoveredButton = null
+                    renderVrMenu()
+                } else {
+                    val location = usbLocation
+                    val directory = usbDirectoryUri
+                    val parent = if (location != null && directory != null)
+                        UsbStorageRepository(this).parentDirectory(location.treeUri, directory) else null
+                    if (parent != null) browseUsb(parent, location?.name ?: "USB Media")
+                    else showUsbLocations()
+                }
+            }
+            id.startsWith("usb_entry_") -> {
+                if (usbBrowseBusy) return
+                val entry = usbEntries[id.removePrefix("usb_entry_").toInt()]
+                if (entry.isDirectory) {
+                    val currentDirectory = usbDirectoryUri ?: return
+                    usbNavigationStack.addLast(
+                        UsbNavigationState(
+                            currentDirectory,
+                            usbDirectoryName,
+                            usbEntries.toList(),
+                            browserScrollOffset,
+                            browserSearchQuery,
+                        )
+                    )
+                    browseUsb(
+                        entry.uri,
+                        entry.name,
+                        rollbackNavigationOnFailure = true,
+                    )
+                } else {
+                    val location = usbLocation ?: return
+                    val directory = usbDirectoryUri ?: return
+                    val selected = usbPlaybackSpec(entry)
+                    startQueuedPlayback(
+                        selected,
+                        usbBrowserItems.asSequence()
+                            .map { it.entry }
+                            .filterNot { it.isDirectory }
+                            .map(::usbPlaybackSpec)
+                            .toList(),
+                        BrowserReturnState.Usb(
+                            location = location,
+                            directoryUri = directory,
+                            directoryName = usbDirectoryName,
+                            entries = usbEntries.toList(),
+                            scrollOffset = browserScrollOffset,
+                            searchQuery = browserSearchQuery,
+                        ),
+                    )
+                }
             }
             id == "sftp_trust_cancel" -> {
                 pendingSftpHostKey = null
@@ -3640,7 +4045,7 @@ class PlayerActivity : Activity(), Player.Listener {
                 hoveredButton = null
                 renderVrMenu()
             }
-            id.startsWith("video_") -> {
+            id.startsWith("video_") && id.removePrefix("video_").toIntOrNull() != null -> {
                 val video = localVideos[id.removePrefix("video_").toInt()]
                 val selected = localPlaybackSpec(video)
                 startQueuedPlayback(
@@ -3789,6 +4194,11 @@ class PlayerActivity : Activity(), Player.Listener {
             id == "environment_back" -> {
                 playbackPopover = PlaybackPopover.SETTINGS
                 hoveredButton = null
+                renderVrMenu()
+            }
+            id == "environment_meta_fov" -> {
+                metaGlassesFovEnabled = !metaGlassesFovEnabled
+                applyEnvironmentSettings()
                 renderVrMenu()
             }
             id == "environment_dark" -> {
@@ -3982,6 +4392,15 @@ class PlayerActivity : Activity(), Player.Listener {
                 swapEyes = !swapEyes
                 nativeSetSwapEyes(swapEyes)
                 renderVrMenu()
+            }
+            id == "video_rotate_left" -> {
+                setVideoRotation(videoRotationQuarterTurns - 1)
+            }
+            id == "video_rotation_reset" -> {
+                setVideoRotation(0)
+            }
+            id == "video_rotate_right" -> {
+                setVideoRotation(videoRotationQuarterTurns + 1)
             }
             id.startsWith("hdr_metadata_") -> {
                 hdrMetadataMode = when (id) {
@@ -5677,6 +6096,8 @@ class PlayerActivity : Activity(), Player.Listener {
             val parsed = Uri.parse(item.uri)
             val source = if (parsed.scheme.equals("smb", ignoreCase = true)) {
                 "SMB  •  ${parsed.host.orEmpty()}/${item.smbShare.orEmpty()}"
+            } else if (DocumentsContract.isTreeUri(parsed)) {
+                "USB Media"
             } else {
                 "Local"
             }
@@ -5865,13 +6286,14 @@ class PlayerActivity : Activity(), Player.Listener {
                 canvas.drawRoundRect(885f, 60f, 1958f, 955f, 42f, 42f, panelPaint)
                 text("Dream Player", 468f, 190f, 76f)
                 text("Choose a source", 468f, 252f, 36f, color = colorTextMuted)
-                button("open_local", "Local video library", RectF(155f, 295f, 780f, 405f), fontSize = 38f)
-                button("open_smb", "Network shares (SMB)", RectF(155f, 435f, 780f, 545f), fontSize = 38f)
-                button("open_sftp", "Internet server (FTP/SFTP)", RectF(155f, 575f, 780f, 685f), fontSize = 38f)
+                button("open_local", "Local Storage", RectF(155f, 280f, 780f, 380f), fontSize = 38f)
+                button("open_usb", "USB Media", RectF(155f, 395f, 780f, 495f), fontSize = 38f)
+                button("open_smb", "Network Storage (SMB)", RectF(155f, 510f, 780f, 610f), fontSize = 36f)
+                button("open_sftp", "Internet Storage (FTP/SFTP)", RectF(155f, 625f, 780f, 725f), fontSize = 33f)
                 text(
                     "Browse without leaving VR.",
                     468f,
-                    750f,
+                    778f,
                     29f,
                     color = colorTextMuted,
                 )
@@ -5897,9 +6319,47 @@ class PlayerActivity : Activity(), Player.Listener {
                     }
                 }
             }
+            UiScreen.USB_LOCATIONS -> {
+                canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
+                text("USB Media", 1024f, 135f, 64f)
+                scrollableList(usbLocations.size, 98f, 80f) { index, bounds ->
+                    browserEntryButton("usb_location_$index", usbLocations[index].name,
+                        if (usbLocations[index].treeUri.scheme == "usb-volume") "Connected drive"
+                        else "Saved folder access",
+                        RectF(230f, bounds.top, 1818f, bounds.bottom), true)
+                }
+                if (usbLocations.isEmpty()) {
+                    text("Connect a USB drive, then select Refresh.", 1024f, 425f, 36f)
+                    text("Connected drives appear here automatically.",
+                        1024f, 485f, 30f, color = colorTextMuted)
+                }
+                button("usb_locations_back", "Back", RectF(230f, 885f, 530f, 950f), fontSize = 34f)
+                button("usb_rescan", "Refresh", RectF(580f, 885f, 980f, 950f), fontSize = 34f)
+                button("usb_add_location", "Grant folder access", RectF(1080f, 885f, 1730f, 950f), fontSize = 32f)
+            }
+            UiScreen.USB_FILES -> {
+                canvas.drawRoundRect(130f, 55f, 1918f, 975f, 42f, 42f, panelPaint)
+                text(middleEllipsize(usbDirectoryName, 39), 180f, 128f, 43f, Paint.Align.LEFT)
+                browserTools()
+                scrollableList(usbBrowserItems.size, 98f, 80f) { index, bounds ->
+                    val item = usbBrowserItems[index]
+                    val details = if (item.entry.isDirectory) "" else listOfNotNull(
+                        item.metadata?.durationMs?.let(::formatTime),
+                        item.entry.size.takeIf { it > 0L }?.let(::formatBytes),
+                    ).joinToString("  •  ")
+                    browserEntryButton("usb_entry_${item.sourceIndex}", item.entry.name, details,
+                        RectF(230f, bounds.top, 1818f, bounds.bottom), item.entry.isDirectory)
+                }
+                if (usbBrowserItems.isEmpty()) text(
+                    if (browserSearchQuery.isBlank()) "No videos or folders found."
+                    else "No names match your search.", 1024f, 450f, 42f)
+                button("usb_files_back", "Up", RectF(230f, 885f, 530f, 950f), fontSize = 34f)
+                button("usb_refresh", "Refresh", RectF(570f, 885f, 900f, 950f), fontSize = 34f)
+                text("Joystick ↑/↓ to scroll", 1780f, 930f, 28f, Paint.Align.RIGHT, colorTextMuted)
+            }
             UiScreen.LOCAL_FOLDERS -> {
                 canvas.drawRoundRect(170f, 55f, 1878f, 975f, 42f, 42f, panelPaint)
-                text("Local videos", 1024f, 135f, 66f)
+                text("Local Storage", 1024f, 135f, 66f)
                 val folders = localVideos.map { it.folder }.distinct().sortedWith(String.CASE_INSENSITIVE_ORDER)
                 scrollableList(folders.size, 98f, 80f) { index, bounds ->
                     val folder = folders[index]
@@ -6756,6 +7216,43 @@ class PlayerActivity : Activity(), Player.Listener {
                         )
                         if (currentProjection == VideoProjection.FLAT) {
                             projectionCurvatureSlider(535f)
+                            text(
+                                "Video rotation",
+                                1212f,
+                                603f,
+                                23f,
+                                Paint.Align.LEFT,
+                                colorTextMuted,
+                            )
+                            text(
+                                when (videoRotationQuarterTurns) {
+                                    1 -> "+90°"
+                                    2 -> "180°"
+                                    3 -> "−90°"
+                                    else -> "0°"
+                                },
+                                1860f,
+                                603f,
+                                21f,
+                                Paint.Align.RIGHT,
+                                colorTextMuted,
+                            )
+                            button(
+                                "video_rotate_left", "↶ 90°",
+                                RectF(1210f, 617f, 1418f, 677f),
+                                fontSize = 23f,
+                            )
+                            button(
+                                "video_rotation_reset", "Reset",
+                                RectF(1430f, 617f, 1638f, 677f),
+                                videoRotationQuarterTurns == 0,
+                                fontSize = 22f,
+                            )
+                            button(
+                                "video_rotate_right", "90° ↷",
+                                RectF(1650f, 617f, 1870f, 677f),
+                                fontSize = 23f,
+                            )
                         } else {
                             text(
                                 "Orientation",
@@ -7242,9 +7739,16 @@ class PlayerActivity : Activity(), Player.Listener {
                             435f,
                             labelFontSize = 18f,
                         )
+                        button(
+                            "environment_meta_fov",
+                            "Meta glasses FOV: ${if (metaGlassesFovEnabled) "On" else "Off"}",
+                            RectF(975f, 480f, 1510f, 538f),
+                            metaGlassesFovEnabled,
+                            fontSize = 21f,
+                        )
                         text(
-                            "Passthrough is global and does not change movie picture settings.",
-                            975f, 535f, 20f, Paint.Align.LEFT, colorTextMuted,
+                            "70° horizontal × 66° vertical · follows your head",
+                            975f, 568f, 19f, Paint.Align.LEFT, colorTextMuted,
                         )
                         button(
                             "environment_back", "Back",
@@ -7437,7 +7941,7 @@ class PlayerActivity : Activity(), Player.Listener {
 
         if (
             browserSortPopoverOpen &&
-            (uiScreen == UiScreen.LOCAL_FILES || uiScreen == UiScreen.SMB_FILES)
+            (uiScreen == UiScreen.LOCAL_FILES || uiScreen == UiScreen.USB_FILES || uiScreen == UiScreen.SMB_FILES)
         ) {
             browserSortPopover()
         }
@@ -7697,9 +8201,11 @@ class PlayerActivity : Activity(), Player.Listener {
             0f, 1f, DEFAULT_PASSTHROUGH_BRIGHTNESS,
         )
         nativeSetPassthrough(passthroughEnabled, passthroughBrightness)
+        nativeSetMetaGlassesFov(metaGlassesFovEnabled)
         if (persist) {
             getSharedPreferences(PICTURE_PREFS, Context.MODE_PRIVATE).edit()
                 .putBoolean(PREF_PASSTHROUGH_ENABLED, passthroughEnabled)
+                .putBoolean(PREF_META_GLASSES_FOV, metaGlassesFovEnabled)
                 .putFloat(PREF_PASSTHROUGH_BRIGHTNESS, passthroughBrightness)
                 .apply()
         }
@@ -7921,6 +8427,8 @@ class PlayerActivity : Activity(), Player.Listener {
 
     companion object {
         private const val REQUEST_VIDEO = 4001
+        private const val REQUEST_USB_TREE = 4003
+        private const val REQUEST_USB_MEDIA_PERMISSION = 4004
         private const val JOYSTICK_SEEK_STEP_MS = 10_000L
         private const val REMOTE_MIN_BUFFER_MS = 30_000
         private const val REMOTE_MAX_BUFFER_MS = 120_000
@@ -8004,6 +8512,7 @@ class PlayerActivity : Activity(), Player.Listener {
         private const val PREF_BROWSER_SORT_ASCENDING = "sort-ascending"
         private const val PREF_SCENE_BRIGHTNESS = "scene-brightness"
         private const val PREF_PASSTHROUGH_ENABLED = "passthrough-enabled"
+        private const val PREF_META_GLASSES_FOV = "meta-glasses-fov-enabled"
         private const val PREF_PASSTHROUGH_BRIGHTNESS = "passthrough-brightness"
         private const val PREF_TONE_MAP_PEAK_NITS = "tone-map-peak-nits"
         private const val PREF_ADAPTIVE_TONE_MAP_ENABLED = "adaptive-tone-map-enabled"
@@ -8139,12 +8648,14 @@ class PlayerActivity : Activity(), Player.Listener {
         )
         @JvmStatic private external fun nativeSetResumed(resumed: Boolean)
         @JvmStatic private external fun nativeSetPassthrough(enabled: Boolean, brightness: Float)
+        @JvmStatic private external fun nativeSetMetaGlassesFov(enabled: Boolean)
         @JvmStatic private external fun nativeIsPassthroughSupported(): Boolean
         @JvmStatic private external fun nativeRequestStop()
         @JvmStatic private external fun nativeSetVideoAspect(aspect: Float)
         @JvmStatic private external fun nativeSetScreenTransform(x: Float, y: Float, z: Float, halfHeight: Float)
         @JvmStatic private external fun nativeGetScreenTransform(): FloatArray
         @JvmStatic private external fun nativeSetStereoMode(stereoMode: Int)
+        @JvmStatic private external fun nativeSetVideoRotation(quarterTurns: Int)
         @JvmStatic private external fun nativeSetVideoProjection(projection: Int)
         @JvmStatic private external fun nativeSetImmersiveOrientation(
             yawDegrees: Float,

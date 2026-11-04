@@ -29,6 +29,8 @@ std::atomic<bool> gResumed{false};
 std::atomic<bool> gStop{false};
 std::atomic<float> gAspect{16.0f / 9.0f};
 std::atomic<int> gStereoMode{0};
+// Clockwise quarter turns applied independently within each stereo eye region.
+std::atomic<int> gVideoRotationQuarterTurns{0};
 // 0 = flat screen, 1 = equirectangular VR180, 2 = equirectangular VR360.
 std::atomic<int> gVideoProjection{0};
 std::atomic<float> gImmersiveYawDegrees{0.0f};
@@ -68,6 +70,7 @@ std::atomic<float> gHdrMaxFallNits{0.0f};
 std::atomic<int> gGamutMappingMode{0};
 std::atomic<float> gSceneBrightness{0.5f};
 std::atomic<bool> gPassthroughRequested{false};
+std::atomic<bool> gMetaGlassesFovEnabled{false};
 std::atomic<float> gPassthroughBrightness{1.0f};
 std::atomic<bool> gPassthroughSupported{false};
 std::atomic<bool> gSwapEyes{false};
@@ -111,6 +114,12 @@ constexpr int kAdaptiveAnalysisHeight = 18;
 // PlayerActivity renders menus into a 2048x1024 bitmap. Keep that texture at
 // its native aspect instead of stretching it to each video's display aspect.
 constexpr float kMenuAspect = 2.0f;
+// Rotating a landscape movie by 90 degrees produces a genuinely narrow
+// portrait surface (16:9 becomes 9:16, while scope content is narrower still).
+// Keep the bounds broad enough to preserve that aspect ratio rather than
+// widening the rotated picture as the former 0.8 minimum did.
+constexpr float kMinimumVideoAspect = 0.25f;
+constexpr float kMaximumVideoAspect = 2.4f;
 
 struct Mat4 { float m[16]{}; };
 
@@ -607,6 +616,7 @@ public:
         jclass cls = env_->GetObjectClass(activity_);
         frameCallback_ = env_->GetMethodID(cls, "onNativeFrame", "(J)V");
         seekCallback_ = env_->GetMethodID(cls, "onNativeSeekGesture", "(IFF)V");
+        zoomCallback_ = env_->GetMethodID(cls, "onNativeZoomGesture", "(FFF)V");
         immersiveOrientationCallback_ = env_->GetMethodID(
             cls,
             "onNativeImmersiveOrientationChanged",
@@ -629,6 +639,7 @@ private:
     jobject activity_;
     jmethodID frameCallback_ = nullptr;
     jmethodID seekCallback_ = nullptr;
+    jmethodID zoomCallback_ = nullptr;
     jmethodID immersiveOrientationCallback_ = nullptr;
     float renderResolutionScale_ = 1.0f;
     EglState egl_;
@@ -652,6 +663,9 @@ private:
     bool fbPassthroughUsable_ = false;
     bool passthroughRunning_ = false;
     XrSpace space_ = XR_NULL_HANDLE;
+    XrSpace headSpace_ = XR_NULL_HANDLE;
+    XrQuaternionf simulatorHeadOrientation_{0.0f, 0.0f, 0.0f, 1.0f};
+    bool simulatorHeadValid_ = false;
     XrActionSet actionSet_ = XR_NULL_HANDLE;
     XrAction aimAction_ = XR_NULL_HANDLE;
     XrAction selectAction_ = XR_NULL_HANDLE;
@@ -678,6 +692,9 @@ private:
     GLuint adaptiveAnalysisProgram_ = 0;
     GLuint subtitleProgram_ = 0;
     GLuint pointerProgram_ = 0;
+    GLuint fovMaskProgram_ = 0;
+    GLint fovMaskTangents_ = -1;
+    GLint fovMaskRotation_ = -1;
     GLuint vertexBuffer_ = 0;
     GLuint vertexArray_ = 0;
     float textureTransform_[16]{};
@@ -704,6 +721,7 @@ private:
     int horizontalSeekDirection_ = 0;
     XrTime horizontalSeekStarted_ = 0;
     XrTime lastHorizontalSeekCallback_ = 0;
+    XrTime lastZoomCallback_ = 0;
     int draggingHand_ = -1;
     float dragYawOffset_ = 0.0f;
     float dragPitchOffset_ = 0.0f;
@@ -830,6 +848,8 @@ private:
         spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
         checkXr(xrCreateReferenceSpace(session_, &spaceInfo, &space_), "xrCreateReferenceSpace");
+        spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        checkXr(xrCreateReferenceSpace(session_, &spaceInfo, &headSpace_), "create head reference space");
         initializeActions();
 
         uint32_t count = 0;
@@ -1110,6 +1130,7 @@ private:
             uniform mat4 uTexTransform;
             uniform int uMode;
             uniform int uEye;
+            uniform int uRotationQuarterTurns;
             uniform int uPictureMode;
             uniform int uTransfer;
             uniform int uPrimaries;
@@ -1315,6 +1336,13 @@ private:
             }
             void main() {
                 vec2 uv = vUv;
+                if (uRotationQuarterTurns == 1) {
+                    uv = vec2(1.0 - uv.y, uv.x);
+                } else if (uRotationQuarterTurns == 2) {
+                    uv = vec2(1.0 - uv.x, 1.0 - uv.y);
+                } else if (uRotationQuarterTurns == 3) {
+                    uv = vec2(uv.y, 1.0 - uv.x);
+                }
                 if (uMode == 1 || uMode == 3) uv.x = uv.x * 0.5 + float(uEye) * 0.5;
                 if (uMode == 2 || uMode == 4) uv.y = uv.y * 0.5 + (uEye == 0 ? 0.5 : 0.0);
                 vec2 transformed = (uTexTransform * vec4(uv, 0.0, 1.0)).xy;
@@ -1443,6 +1471,34 @@ private:
             makeProgram(adaptiveAnalysisVertex, adaptiveAnalysisFragment);
         subtitleProgram_ = makeProgram(vertex, subtitleFragment);
         pointerProgram_ = makeProgram(vertex, pointerFragment);
+        const char* maskVertex = R"glsl(#version 300 es
+            out vec2 vNdc;
+            void main() {
+                vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+                vNdc = p * 2.0 - 1.0;
+                gl_Position = vec4(vNdc, 0.0, 1.0);
+            }
+        )glsl";
+        const char* maskFragment = R"glsl(#version 300 es
+            precision highp float;
+            in vec2 vNdc;
+            uniform vec4 uTangents;
+            uniform mat3 uEyeToHead;
+            out vec4 fragColor;
+            void main() {
+                vec2 uv = (vNdc + 1.0) * 0.5;
+                vec3 eyeRay = vec3(mix(uTangents.x, uTangents.y, uv.x),
+                                   mix(uTangents.z, uTangents.w, uv.y), -1.0);
+                vec3 ray = uEyeToHead * eyeRay;
+                // One common angular aperture at infinity, with no IPD parallax.
+                if (ray.z < 0.0 && abs(ray.x) <= -ray.z * 0.7002075382 &&
+                    abs(ray.y) <= -ray.z * 0.6494075932) discard;
+                fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            }
+        )glsl";
+        fovMaskProgram_ = makeProgram(maskVertex, maskFragment);
+        fovMaskTangents_ = glGetUniformLocation(fovMaskProgram_, "uTangents");
+        fovMaskRotation_ = glGetUniformLocation(fovMaskProgram_, "uEyeToHead");
         glGenFramebuffers(1, &framebuffer_);
         glGenFramebuffers(1, &adaptiveAnalysisFramebuffer_);
         glGenTextures(1, &adaptiveAnalysisTexture_);
@@ -1558,6 +1614,17 @@ private:
                 activity_,
                 seekCallback_,
                 static_cast<jint>(direction),
+                static_cast<jfloat>(u),
+                static_cast<jfloat>(v));
+        }
+    }
+
+    void notifyZoom(float amount, float u, float v) {
+        if (zoomCallback_) {
+            env_->CallVoidMethod(
+                activity_,
+                zoomCallback_,
+                static_cast<jfloat>(amount),
                 static_cast<jfloat>(u),
                 static_cast<jfloat>(v));
         }
@@ -1758,7 +1825,10 @@ private:
                     : currentScreenBasis();
             const float halfHeight = gScreenHalfHeight.load();
             const float videoHalfWidth =
-                halfHeight * std::clamp(gAspect.load(), 0.8f, 2.4f);
+                halfHeight * std::clamp(
+                    gAspect.load(),
+                    kMinimumVideoAspect,
+                    kMaximumVideoAspect);
             Vec3 hit{};
             float u = 0.0f;
             float v = 0.0f;
@@ -1831,6 +1901,18 @@ private:
                     return;
                 }
                 if (!stick.isActive) resetHorizontalSeek();
+                if (
+                    gMenuInteractive.load() &&
+                    stick.isActive &&
+                    std::abs(stick.currentState.y) > 0.18f &&
+                    std::abs(stick.currentState.y) >
+                        std::abs(stick.currentState.x) * 1.15f &&
+                    (lastZoomCallback_ == 0 ||
+                     displayTime - lastZoomCallback_ > 16'000'000)
+                ) {
+                    notifyZoom(stick.currentState.y, u, v);
+                    lastZoomCallback_ = displayTime;
+                }
             }
             if (gMenuInteractive.load()) {
                 if (menuPointerHand_ == hand && isDown) {
@@ -2231,6 +2313,16 @@ private:
             checkXr(xrLocateViews(session_, &locate, &viewState,
                 static_cast<uint32_t>(views_.size()), &count, views_.data()), "xrLocateViews");
             updateHeadRelativeState(count);
+            simulatorHeadValid_ = false;
+            if (gMetaGlassesFovEnabled.load()) {
+                XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+                if (XR_SUCCEEDED(xrLocateSpace(headSpace_, space_,
+                        state.predictedDisplayTime, &head)) &&
+                    (head.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                    simulatorHeadOrientation_ = head.pose.orientation;
+                    simulatorHeadValid_ = true;
+                }
+            }
             updatePointer(state.predictedDisplayTime);
             if (gMenuInteractive.load()) notifyFrame(state.predictedDisplayTime);
             int64_t videoTimestampNanos = 0;
@@ -2301,7 +2393,10 @@ private:
         glDisable(GL_DEPTH_TEST);
 
         const Mat4 mvp = multiply(projection(view.fov), viewFromPose(view.pose));
-        const float aspect = std::clamp(gAspect.load(), 0.8f, 2.4f);
+        const float aspect = std::clamp(
+            gAspect.load(),
+            kMinimumVideoAspect,
+            kMaximumVideoAspect);
         const float halfHeight = gScreenHalfHeight.load();
         const float halfWidth = halfHeight * aspect;
         const ScreenBasis basis =
@@ -2451,6 +2546,11 @@ private:
             glUniform1i(glGetUniformLocation(videoProgram_, "uMode"), gStereoMode.load());
             const GLint sourceEye = static_cast<GLint>(gSwapEyes.load() ? 1u - eye : eye);
             glUniform1i(glGetUniformLocation(videoProgram_, "uEye"), sourceEye);
+            glUniform1i(
+                glGetUniformLocation(videoProgram_, "uRotationQuarterTurns"),
+                gVideoProjection.load() == 0
+                    ? gVideoRotationQuarterTurns.load()
+                    : 0);
             glUniform1i(glGetUniformLocation(videoProgram_, "uPictureMode"), gPictureMode.load());
             glUniform1i(glGetUniformLocation(videoProgram_, "uTransfer"), gVideoTransfer.load());
             glUniform1i(glGetUniformLocation(videoProgram_, "uPrimaries"), gVideoPrimaries.load());
@@ -2744,6 +2844,27 @@ private:
 
         if (pointerVisible_) drawPointer(mvp);
 
+        // Transform each eye's rays into the SAME true head reference frame.
+        // Eye-local crops incorrectly diverge on runtimes with canted eye views.
+        if (gMetaGlassesFovEnabled.load() && simulatorHeadValid_) {
+            const auto& head = simulatorHeadOrientation_;
+            const XrQuaternionf inverseHead{-head.x, -head.y, -head.z, head.w};
+            const auto axis = [&](const Vec3& value) {
+                return rotateVector(inverseHead, rotateVector(view.pose.orientation, value));
+            };
+            const Vec3 x = axis({1.0f, 0.0f, 0.0f});
+            const Vec3 y = axis({0.0f, 1.0f, 0.0f});
+            const Vec3 z = axis({0.0f, 0.0f, 1.0f});
+            const float eyeToHead[]{x.x, x.y, x.z, y.x, y.y, y.z, z.x, z.y, z.z};
+            glDisable(GL_BLEND);
+            glUseProgram(fovMaskProgram_);
+            glUniform4f(fovMaskTangents_,
+                std::tan(view.fov.angleLeft), std::tan(view.fov.angleRight),
+                std::tan(view.fov.angleDown), std::tan(view.fov.angleUp));
+            glUniformMatrix3fv(fovMaskRotation_, 1, GL_FALSE, eyeToHead);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glFlush();
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -2827,6 +2948,7 @@ private:
         sessionRunning_ = false;
         for (auto& chain : swapchains_) if (chain.handle) xrDestroySwapchain(chain.handle);
         for (auto& aimSpace : aimSpaces_) if (aimSpace) xrDestroySpace(aimSpace);
+        if (headSpace_) xrDestroySpace(headSpace_);
         if (space_) xrDestroySpace(space_);
         if (session_) xrDestroySession(session_);
         if (actionSet_) xrDestroyActionSet(actionSet_);
@@ -2834,6 +2956,7 @@ private:
         swapchains_.clear();
         aimSpaces_.fill(XR_NULL_HANDLE);
         space_ = XR_NULL_HANDLE;
+        headSpace_ = XR_NULL_HANDLE;
         session_ = XR_NULL_HANDLE;
         actionSet_ = XR_NULL_HANDLE;
         aimAction_ = XR_NULL_HANDLE;
@@ -2844,6 +2967,7 @@ private:
         if (adaptiveAnalysisProgram_) glDeleteProgram(adaptiveAnalysisProgram_);
         if (subtitleProgram_) glDeleteProgram(subtitleProgram_);
         if (pointerProgram_) glDeleteProgram(pointerProgram_);
+        if (fovMaskProgram_) glDeleteProgram(fovMaskProgram_);
         if (videoTexture_) glDeleteTextures(1, &videoTexture_);
         if (subtitleTexture_) glDeleteTextures(1, &subtitleTexture_);
         if (adaptiveAnalysisTexture_) glDeleteTextures(1, &adaptiveAnalysisTexture_);
@@ -2854,6 +2978,7 @@ private:
         if (vertexArray_) glDeleteVertexArrays(1, &vertexArray_);
         videoProgram_ = adaptiveAnalysisProgram_ =
             subtitleProgram_ = pointerProgram_ = 0;
+        fovMaskProgram_ = 0;
         videoTexture_ = subtitleTexture_ = adaptiveAnalysisTexture_ = 0;
         framebuffer_ = adaptiveAnalysisFramebuffer_ =
             vertexBuffer_ = vertexArray_ = 0;
@@ -2897,6 +3022,12 @@ Java_dev_dreamplayer_PlayerActivity_nativeRun(
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetResumed(JNIEnv*, jclass, jboolean resumed) {
     gResumed.store(resumed == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetMetaGlassesFov(
+    JNIEnv*, jclass, jboolean enabled) {
+    gMetaGlassesFovEnabled.store(enabled == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2954,6 +3085,13 @@ Java_dev_dreamplayer_PlayerActivity_nativeGetScreenTransform(JNIEnv* env, jclass
 extern "C" JNIEXPORT void JNICALL
 Java_dev_dreamplayer_PlayerActivity_nativeSetStereoMode(JNIEnv*, jclass, jint stereoMode) {
     if (stereoMode >= 0 && stereoMode <= 4) gStereoMode.store(stereoMode);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_dreamplayer_PlayerActivity_nativeSetVideoRotation(
+    JNIEnv*, jclass, jint quarterTurns) {
+    const int normalized = (static_cast<int>(quarterTurns) % 4 + 4) % 4;
+    gVideoRotationQuarterTurns.store(normalized);
 }
 
 extern "C" JNIEXPORT void JNICALL
